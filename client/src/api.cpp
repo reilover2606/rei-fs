@@ -2,6 +2,10 @@
 
 #include <openssl/evp.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
 #include <vector>
 
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -10,6 +14,25 @@
 #include <httplib.h>
 
 namespace reifs {
+
+namespace {
+
+// Optional request log for diagnostics: REIFS_CLIENT_LOG=/path/to/file.
+void log_request(const std::string& method, const std::string& path, int status,
+                 double seconds, const std::string& note) {
+  static const char* file = std::getenv("REIFS_CLIENT_LOG");
+  if (!file || !*file) return;
+  static std::mutex mutex;
+  std::lock_guard lock(mutex);
+  std::ofstream out(file, std::ios::app);
+  std::time_t now = std::time(nullptr);
+  char stamp[32];
+  std::strftime(stamp, sizeof stamp, "%H:%M:%S", std::localtime(&now));
+  out << stamp << " " << method << " " << path << " -> " << status << " in " << seconds
+      << " s" << (note.empty() ? "" : " (" + note + ")") << "\n";
+}
+
+}  // namespace
 
 std::string fingerprint_of(const unsigned char* der, std::size_t size) {
   unsigned char md[EVP_MAX_MD_SIZE];
@@ -106,7 +129,12 @@ json Api::get(const std::string& path) { return request("GET", path, nullptr); }
 json Api::post(const std::string& path, const json& body) { return request("POST", path, &body); }
 
 json Api::request(const std::string& method, const std::string& path, const json* body) {
+  auto started = std::chrono::steady_clock::now();
+  auto elapsed = [&] {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  };
   std::lock_guard lock(mutex_);
+  double waited_for_lock = elapsed();
   ensure_client();
   httplib::Headers headers;
   if (!token_.empty()) headers.emplace("Authorization", "Bearer " + token_);
@@ -115,11 +143,17 @@ json Api::request(const std::string& method, const std::string& path, const json
                             : client_->Post(path, headers, body->dump(), "application/json");
   if (!res) {
     auto err = res.error();
+    log_request(method, path, 0, elapsed(), httplib::to_string(err));
     client_.reset();  // start over with a fresh connection next time
     if (err == httplib::Error::SSLServerVerification)
       throw UntrustedCertificate(seen_);
     throw ApiError(0, "connection error: " + httplib::to_string(err));
   }
+  log_request(method, path, res->status, elapsed(),
+              std::to_string(res->body.size()) + " bytes" +
+                  (waited_for_lock > 0.5 ? ", waited " + std::to_string(waited_for_lock) +
+                                               " s for another request"
+                                         : ""));
   json payload;
   try {
     payload = json::parse(res->body);

@@ -119,6 +119,19 @@ class _Planner:
         self.nodes = [n for n in conn.execute("SELECT * FROM nodes ORDER BY name")
                       if n["owner_id"] == self.me or n["owner_id"] in peers_]
         self.peer_online = {pid: bool(p["online"]) for pid, p in peers_.items()}
+        # Preloaded once instead of queried per file (hundreds of thousands of files).
+        self.holding: dict[int, set[str]] = {}
+        for fid, node_id in conn.execute("SELECT file_id, node_id FROM copies"):
+            self.holding.setdefault(fid, set()).add(node_id)
+        self.names_on: dict[str, dict[str, set[str]]] = {}  # case-insensitive nodes
+        for n in self.nodes:
+            if not n["case_sensitive"]:
+                by_key: dict[str, set[str]] = {}
+                for vkey, vpath in conn.execute(
+                        "SELECT f.vkey, f.vpath FROM copies c JOIN files f ON f.id = c.file_id"
+                        " WHERE c.node_id = ?", (n["id"],)):
+                    by_key.setdefault(vkey, set()).add(vpath)
+                self.names_on[n["id"]] = by_key
         # Space already promised to open/approved proposals.
         self.reserved: Counter = Counter()
         for r in conn.execute(
@@ -128,8 +141,7 @@ class _Planner:
             self.reserved[r["dst_node"]] += r["size"] or 0
 
     def choose(self, f: UnderFile, exclude: set[str]) -> tuple[str | None, str]:
-        holding = {r[0] for r in self.conn.execute(
-            "SELECT node_id FROM copies WHERE file_id = ?", (f.file_id,))} | exclude
+        holding = self.holding.get(f.file_id, set()) | exclude
         issues = paths.decode_issues(f.issues)
         rejected: Counter = Counter()
         candidates = []
@@ -145,10 +157,8 @@ class _Planner:
             if n["restricted_names"] and issues & paths.RESTRICTED_NAME_ISSUES:
                 rejected["its name is not allowed on the other backup nodes"] += 1
                 continue
-            if not n["case_sensitive"] and self.conn.execute(
-                    "SELECT 1 FROM copies c JOIN files x ON x.id = c.file_id"
-                    " WHERE c.node_id = ? AND x.vkey = ? AND x.vpath != ? LIMIT 1",
-                    (n["id"], f.vkey, f.vpath)).fetchone():
+            if not n["case_sensitive"] and \
+                    self.names_on[n["id"]].get(f.vkey, set()) - {f.vpath}:
                 rejected["a file differing only in case is on the other backup nodes"] += 1
                 continue
             free = n["free_bytes"]
@@ -186,41 +196,55 @@ def plan(conn: sqlite3.Connection, cfg: Config) -> PlanReport:
                 conn.execute("UPDATE wanted SET status = 'done' WHERE id = ?", (w["id"],))
             else:
                 active.setdefault(w["file_id"], set()).add(w["dst_node"])
-        declined = {}
-        for r in conn.execute("SELECT file_id, data FROM wanted WHERE reason = ? AND"
-                              " status = 'rejected' ORDER BY id", (REASON,)):
-            declined[r["file_id"]] = json.loads(r["data"]).get("hash")
-        reasons: Counter = Counter()
-        for f in under:
-            report.under_replicated += 1
-            if len(f.good_nodes) == 1:
-                report.single_copy += 1
-            if owners.get(f.good_nodes[0]) != me:
-                continue  # the server holding the first good copy proposes
-            report.responsible += 1
-            pending = active.get(f.file_id, set())
-            need = f.goal - len(f.good_nodes) - len(pending)
-            if need <= 0:
-                report.already_proposed += 1
-                continue
-            if declined.get(f.file_id) == f.hash:
-                report.declined += 1
-                continue
-            chosen: set[str] = set()
-            source = next((n for n in f.good_nodes if owners.get(n) == me), f.good_nodes[0])
-            for _ in range(need):
-                dst, why = planner.choose(f, pending | chosen)
-                if dst is None:
-                    report.no_destination += 1
-                    reasons[why] += 1
-                    if len(report.examples) < 20:
-                        report.examples.append((f.vpath, why))
-                    break
-                chosen.add(dst)
-                index.add_wanted(conn, "copy", f.file_id, source, dst, REASON,
-                                 {"hash": f.hash, "goal": f.goal})
-                report.proposed += 1
-        report.reasons = dict(reasons)
+    declined = {}
+    for r in conn.execute("SELECT file_id, data FROM wanted WHERE reason = ? AND"
+                          " status = 'rejected' ORDER BY id", (REASON,)):
+        declined[r["file_id"]] = json.loads(r["data"]).get("hash")
+    reasons: Counter = Counter()
+    pending_rows: list[tuple] = []
+
+    def flush() -> None:
+        # Proposals are written in chunks so the database is never locked
+        # for long (scans, syncs and the API keep writing meanwhile).
+        if pending_rows:
+            with db.transaction(conn):
+                for args in pending_rows:
+                    index.add_wanted(conn, *args)
+            pending_rows.clear()
+
+    for f in under:
+        report.under_replicated += 1
+        if len(f.good_nodes) == 1:
+            report.single_copy += 1
+        if owners.get(f.good_nodes[0]) != me:
+            continue  # the server holding the first good copy proposes
+        report.responsible += 1
+        pending = active.get(f.file_id, set())
+        need = f.goal - len(f.good_nodes) - len(pending)
+        if need <= 0:
+            report.already_proposed += 1
+            continue
+        if declined.get(f.file_id) == f.hash:
+            report.declined += 1
+            continue
+        chosen: set[str] = set()
+        source = next((n for n in f.good_nodes if owners.get(n) == me), f.good_nodes[0])
+        for _ in range(need):
+            dst, why = planner.choose(f, pending | chosen)
+            if dst is None:
+                report.no_destination += 1
+                reasons[why] += 1
+                if len(report.examples) < 20:
+                    report.examples.append((f.vpath, why))
+                break
+            chosen.add(dst)
+            pending_rows.append(("copy", f.file_id, source, dst, REASON,
+                                 {"hash": f.hash, "goal": f.goal}))
+            report.proposed += 1
+        if len(pending_rows) >= 2000:
+            flush()
+    flush()
+    report.reasons = dict(reasons)
     report.finished = db.now()
     db.set_meta_tx(conn, "last_plan", json.dumps(report.to_dict()))
     return report

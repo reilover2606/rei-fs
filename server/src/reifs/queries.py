@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import threading
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -122,10 +123,11 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     return out + sorted(files, key=lambda e: e.name)
 
 
-def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
-         node: str | None = None, issues_only: bool = False,
-         under_replicated: bool = False,
-         policy: GoalPolicy = DEFAULT_POLICY) -> list[FileInfo]:
+def find_ids(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
+             node: str | None = None, issues_only: bool = False,
+             under_replicated: bool = False,
+             policy: GoalPolicy = DEFAULT_POLICY) -> list[int]:
+    """Ids of matching files, in path order (cheap: no per-file details)."""
     q = "SELECT DISTINCT f.id, f.vpath FROM files f"
     where, args = [], []
     if tag:
@@ -142,17 +144,27 @@ def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None =
         q += " WHERE " + " AND ".join(where)
     q += " ORDER BY f.vpath"
     pat = pattern.casefold() if pattern else None
+    cov = coverage(conn, policy) if under_replicated else None
     out = []
     for r in conn.execute(q, args):
         if pat:
             target = r["vpath"] if "/" in pat else paths.basename(r["vpath"])
             if not fnmatch.fnmatchcase(target.casefold(), pat):
                 continue
-        info = file_info(conn, r["id"], policy)
-        if under_replicated and info.good_copies >= info.goal:
+        if cov is not None and not cov.is_under(r["id"], policy.copies):
             continue
-        out.append(info)
+        out.append(r["id"])
     return out
+
+
+def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
+         node: str | None = None, issues_only: bool = False,
+         under_replicated: bool = False, policy: GoalPolicy = DEFAULT_POLICY,
+         limit: int | None = None) -> list[FileInfo]:
+    ids = find_ids(conn, pattern, tag, node, issues_only, under_replicated, policy)
+    if limit is not None:
+        ids = ids[:limit]
+    return [file_info(conn, fid, policy) for fid in ids]
 
 
 @dataclass
@@ -170,9 +182,36 @@ class Status:
     open_wanted: int
 
 
-def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Status:
-    # Per file: size of the current version and number of good copies, in SQL
-    # so it stays fast for tens of thousands of files.
+@dataclass
+class Coverage:
+    """How many good copies each file has, against its goal."""
+    bytes: int
+    good: dict[int, int]     # file id -> good copies (files with a present copy)
+    goals: dict[int, int]
+    satisfied: int
+    under_replicated: int
+    single_copy: int
+
+    def is_under(self, fid: int, default_goal: int) -> bool:
+        return self.good.get(fid, 0) < self.goals.get(fid, default_goal)
+
+
+# Computing coverage reads every copy (about half a second per 100k files),
+# and clients poll status every couple of seconds. Everything it depends on
+# (copies, deletion marks, tags) is recorded in the change log, so the log's
+# last sequence number is a perfect cache key.
+_coverage_cache: dict[str, tuple[tuple, Coverage]] = {}
+_coverage_lock = threading.Lock()
+
+
+def coverage(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Coverage:
+    seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+    db_file = conn.execute("PRAGMA database_list").fetchone()[2] or ":memory:"
+    key = (seq, policy)
+    with _coverage_lock:
+        hit = _coverage_cache.get(db_file)
+        if hit is not None and hit[0] == key and not conn.in_transaction:
+            return hit[1]
     rows = conn.execute("""
         WITH cur AS (
             SELECT file_id, hash, size FROM (
@@ -187,18 +226,33 @@ def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Sta
                    AND c.hash = cur.hash AND c.marked_delete = 0) AS good
         FROM cur
     """).fetchall()
-    one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
     file_tags: dict[int, list[str]] = {}
     if policy.tag_copies:
         for fid, tag in conn.execute("SELECT file_id, tag FROM tags WHERE present = 1"):
             file_tags.setdefault(fid, []).append(tag)
-    goals = {r["file_id"]: policy.goal(file_tags.get(r["file_id"], ())) for r in rows}
+    good = {r["file_id"]: r["good"] for r in rows}
+    goals = {fid: policy.goal(file_tags.get(fid, ())) for fid in good}
+    cov = Coverage(
+        bytes=sum(r["size"] for r in rows), good=good, goals=goals,
+        satisfied=sum(1 for fid, g in good.items() if g >= goals[fid]),
+        under_replicated=sum(1 for fid, g in good.items() if g < goals[fid]),
+        single_copy=sum(1 for fid, g in good.items() if g == 1 and goals[fid] > 1),
+    )
+    if not conn.in_transaction:  # never cache uncommitted state
+        with _coverage_lock:
+            _coverage_cache[db_file] = (key, cov)
+    return cov
+
+
+def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Status:
+    cov = coverage(conn, policy)
+    one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
     return Status(
         files=one("SELECT COUNT(*) FROM files"),
-        bytes=sum(r["size"] for r in rows),
-        satisfied=sum(1 for r in rows if r["good"] >= goals[r["file_id"]]),
-        under_replicated=sum(1 for r in rows if r["good"] < goals[r["file_id"]]),
-        single_copy=sum(1 for r in rows if r["good"] == 1 and goals[r["file_id"]] > 1),
+        bytes=cov.bytes,
+        satisfied=cov.satisfied,
+        under_replicated=cov.under_replicated,
+        single_copy=cov.single_copy,
         divergent=one("SELECT COUNT(*) FROM decisions WHERE kind = 'divergent' AND status = 'open'"),
         missing_copies=one("SELECT COUNT(*) FROM copies WHERE state = 'missing'"),
         marked_delete=one("SELECT COUNT(*) FROM copies WHERE marked_delete = 1"),

@@ -166,6 +166,16 @@ void Context::set_status(json s) {
   status_ = std::move(s);
 }
 
+std::string Context::poll_error() const {
+  std::lock_guard lock(status_mutex_);
+  return poll_error_;
+}
+
+void Context::set_poll_error(const std::string& e) {
+  std::lock_guard lock(status_mutex_);
+  poll_error_ = e;
+}
+
 // --- the application -------------------------------------------------------------
 
 namespace {
@@ -316,6 +326,7 @@ class App {
                  std::chrono::steady_clock::now()};
     }
     ctx_.api = api_.get();
+    ctx_.connected_at = std::chrono::steady_clock::now();
     build_main();
     page_ = 1;
     start_poller();
@@ -462,14 +473,8 @@ class App {
     });
   }
 
-  void set_poll_error(const std::string& e) {
-    std::lock_guard lock(poll_error_mutex_);
-    poll_error_ = e;
-  }
-  std::string poll_error() {
-    std::lock_guard lock(poll_error_mutex_);
-    return poll_error_;
-  }
+  void set_poll_error(const std::string& e) { ctx_.set_poll_error(e); }
+  std::string poll_error() { return ctx_.poll_error(); }
 
   void stop_poller() {
     {
@@ -491,8 +496,6 @@ class App {
   int holder_index_ = 0;
   int tab_ = 0;
   std::string host_, port_str_, password_, login_message_;
-  std::string poll_error_;
-  std::mutex poll_error_mutex_;
   Notice notice_;
   std::thread poller_;
   std::atomic<bool> poller_running_{false};

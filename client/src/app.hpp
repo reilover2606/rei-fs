@@ -1,6 +1,7 @@
 // Application shell: login page, tabs, status bar, dialogs.
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -54,10 +55,15 @@ struct Context {
 
   json status() const;
   void set_status(json s);
+  // Last error of the status poll ("" when fine), and when polling started.
+  std::string poll_error() const;
+  void set_poll_error(const std::string& e);
+  std::chrono::steady_clock::time_point connected_at = std::chrono::steady_clock::now();
 
  private:
   mutable std::mutex status_mutex_;
   json status_ = json::object();
+  std::string poll_error_;
 };
 
 class View {
