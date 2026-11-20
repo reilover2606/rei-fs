@@ -11,3 +11,4 @@ client/subprojects/*/
 !client/subprojects/packagefiles/
 client/subprojects/packagecache/
 client/subprojects/.wraplock
+build-asan/
