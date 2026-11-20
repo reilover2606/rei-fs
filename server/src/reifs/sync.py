@@ -121,12 +121,12 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
     fields = (name, d.get("kind", "storage"), d["owner_id"], d.get("owner_since") or "",
               d.get("case_sensitive"), d.get("restricted_names"), int(d.get("priority") or 0),
               int(d.get("replication_target", 1)), int(d.get("online") or 0),
-              d.get("free_bytes"), d.get("total_bytes"))
+              d.get("free_bytes"), d.get("total_bytes"), d.get("ssh_root"))
     if row is None:
         conn.execute(
             "INSERT INTO nodes(name, kind, owner_id, owner_since, case_sensitive,"
-            " restricted_names, priority, replication_target, online, free_bytes, total_bytes, id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*fields, d["id"]))
+            " restricted_names, priority, replication_target, online, free_bytes, total_bytes,"
+            " ssh_root, id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*fields, d["id"]))
         return
     if row["owner_id"] != origin and (d.get("owner_since") or "") <= (row["owner_since"] or ""):
         return  # stale announcement from a former owner
@@ -136,7 +136,8 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
     conn.execute(
         "UPDATE nodes SET name = ?, kind = ?, owner_id = ?, owner_since = ?,"
         " case_sensitive = ?, restricted_names = ?, priority = ?, replication_target = ?,"
-        " online = ?, free_bytes = ?, total_bytes = ? WHERE id = ?", (*fields, d["id"]))
+        " online = ?, free_bytes = ?, total_bytes = ?, ssh_root = ? WHERE id = ?",
+        (*fields, d["id"]))
 
 
 def _authoritative(conn, me: str, origin: str, node_id: str) -> bool:

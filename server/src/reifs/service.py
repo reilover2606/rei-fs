@@ -341,6 +341,19 @@ def sync_peer(conn, server_id: str, poke: bool = False) -> int:
             if not data.get("more"):
                 break
         deliver_outbox(conn, server_id, client)
+        try:  # what the peer offers (SSH access, its public key)
+            info = client.request("GET", "/api/peer/info")
+            ssh_offer = info.get("ssh") or {}
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE servers SET ssh_enabled = ?, ssh_host = ?, ssh_port = ?, ssh_user = ?,"
+                    " ssh_pubkey = ? WHERE id = ?",
+                    (int(bool(ssh_offer.get("enabled"))), ssh_offer.get("host") or None,
+                     ssh_offer.get("port"), ssh_offer.get("user"), ssh_offer.get("public_key"),
+                     server_id))
+        except peers.PeerError as e:
+            if e.status != 404:  # older peers do not have it
+                raise
         with db.transaction(conn):
             conn.execute("UPDATE servers SET online = 1, last_sync = ?, last_error = NULL"
                          " WHERE id = ?", (db.now(), server_id))

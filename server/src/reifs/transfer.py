@@ -74,7 +74,12 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
     style = cfg.rsync.path_style
     scratch = Path(dst_root) / SCRATCH
     source = remote.url() if remote else rsync_path(src_root, style).rstrip("/\\") + "/"
-    daemon_opts = ["--contimeout=20", "--timeout=300"] if remote else []
+    if remote is None:
+        daemon_opts = []
+    elif getattr(remote, "password", None) is None:  # over SSH
+        daemon_opts = ["-e", ssh_command(cfg, remote), "--timeout=300"]
+    else:  # rsync daemon
+        daemon_opts = ["--contimeout=20", "--timeout=300"]
     return [
         cfg.rsync.path,
         "--times",
@@ -91,6 +96,18 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
         source,
         rsync_path(dst_root, style).rstrip("/\\") + "/",
     ]
+
+
+def ssh_command(cfg: Config, remote) -> str:
+    """The -e value for rsync over SSH (rsync splits it, honouring quotes)."""
+    from . import ssh  # local import: ssh imports config only, but keep transfer light
+
+    style = cfg.rsync.path_style
+    key = rsync_path(ssh.key_path(cfg.home), style)
+    known = rsync_path(ssh.known_hosts(cfg.home), style)
+    return (f'{cfg.ssh.command} -p {int(remote.port)} -i "{key}" -o BatchMode=yes'
+            f' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+            f' -o UserKnownHostsFile="{known}" -o ConnectTimeout=20')
 
 
 def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: list[str],
@@ -115,7 +132,7 @@ def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: lis
             f.write(b"\0".join(p.encode("utf-8") for p in rel_paths) + b"\0")
         cmd = build_command(cfg, src_root, dst_root, list_file, remote)
         env = None
-        if remote is not None:
+        if remote is not None and getattr(remote, "password", None) is not None:
             env = dict(os.environ, RSYNC_PASSWORD=remote.password)
         with tempfile.TemporaryFile(dir=tmp_dir) as err:
             try:

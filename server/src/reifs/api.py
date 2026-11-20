@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries,
-               replication, sync, tags, tls)
+               replication, ssh, sync, tags, tls)
 from .config import Config
 from .paths import to_physical
 from .service import Syncer, Worker
@@ -169,12 +169,15 @@ class Api:
         r("POST", r"/api/peers/requests/(?P<id>\d+)/(?P<action>accept|reject)",
           self.pair_request_action, "client")
         r("POST", r"/api/peers/(?P<peer>[^/]+)/unpair", self.unpair_peer, "client")
+        r("POST", r"/api/peers/(?P<peer>[^/]+)/transport", self.set_transport, "client")
+        r("POST", r"/api/peers/authorize", self.ssh_authorize, "client")
         # server-to-server
         r("GET", r"/api/peer/hello", self.peer_hello, "public")
         r("POST", r"/api/peer/pair-request", self.peer_pair_request, "public")
         r("POST", r"/api/peer/pair-confirm", self.peer_pair_confirm, "public")
         r("POST", r"/api/peer/pair-reject", self.peer_pair_reject, "public")
         r("GET", r"/api/peer/changes", self.peer_changes, "peer")
+        r("GET", r"/api/peer/info", self.peer_info, "peer")
         r("POST", r"/api/peer/mark", self.peer_mark, "peer")
         r("POST", r"/api/peer/wanted", self.peer_wanted, "peer")
         r("POST", r"/api/peer/poke", self.peer_poke, "peer")
@@ -574,10 +577,13 @@ class Api:
                             " ORDER BY id").fetchall()
         return {
             "self": {"id": nodes.self_id(conn), "name": self.cfg.server.name,
-                     "fingerprint": peers.my_fingerprint(self.cfg)},
+                     "fingerprint": peers.my_fingerprint(self.cfg),
+                     "ssh_enabled": self.cfg.ssh.enabled,
+                     "ssh_public_key": ssh.ensure_key(self.cfg.home, self.cfg.server.name)},
             "peers": [{"id": r["id"], "name": r["name"], "address": r["address"],
                        "online": bool(r["online"]), "last_sync": r["last_sync"] or "",
                        "last_error": r["last_error"] or "", "fingerprint": r["fingerprint"],
+                       "transport": r["transport"], "ssh_offered": bool(r["ssh_enabled"]),
                        "outbox": conn.execute("SELECT COUNT(*) FROM outbox WHERE server_id = ?",
                                               (r["id"],)).fetchone()[0]}
                       for r in rows],
@@ -614,6 +620,25 @@ class Api:
             self.syncer.request_daemon_update()
         return {"ok": True}
 
+    def set_transport(self, conn, q, body, peer, **_):
+        row = peers.find_peer(conn, unquote(peer))
+        transport = body.get("transport")
+        if transport not in ("daemon", "ssh"):
+            raise ApiError(400, "transport must be 'daemon' or 'ssh'")
+        if transport == "ssh" and not row["ssh_enabled"]:
+            raise ApiError(409, f"{row['name']} does not offer SSH ([ssh] enabled there)")
+        with db.transaction(conn):
+            conn.execute("UPDATE servers SET transport = ? WHERE id = ?", (transport, row["id"]))
+        return {"ok": True, "transport": transport}
+
+    def ssh_authorize(self, conn, q, body, **_):
+        lines, rrsync, missing = ssh.authorize_lines(conn)
+        out = {"lines": lines, "restricted": bool(rrsync), "missing": missing}
+        if body.get("apply"):
+            path, added = ssh.install(lines)
+            out.update(file=str(path), added=added)
+        return out
+
     def sync_now(self, conn, q, body, **_):
         if self.syncer is None:
             raise ApiError(503, "sync not running")
@@ -639,6 +664,10 @@ class Api:
     def peer_pair_reject(self, conn, q, body, **_):
         peers.receive_pair_reject(conn, body)
         return {"ok": True}
+
+    def peer_info(self, conn, q, body, **_):
+        return {"id": nodes.self_id(conn), "name": self.cfg.server.name,
+                "rsync_port": self.cfg.rsync.daemon_port, "ssh": ssh.offer(self.cfg)}
 
     def peer_changes(self, conn, q, body, caller=None, **_):
         return sync.export_changes(conn, int(q.get("since", 0)),

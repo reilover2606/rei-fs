@@ -541,6 +541,18 @@ def cmd_peer(args) -> None:
         peers.unpair(conn, row["id"])
         print(f"Unpaired from {row['name']!r}.")
         return
+    if args.action == "transport":
+        row = peers.find_peer(conn, args.target or "")
+        if args.value not in ("daemon", "ssh"):
+            raise CliError("use 'reifs peer transport NAME daemon|ssh'")
+        if args.value == "ssh" and not row["ssh_enabled"]:
+            raise CliError(f"{row['name']} does not offer SSH: set [ssh] enabled = true there "
+                           "(and sync)")
+        with db.transaction(conn):
+            conn.execute("UPDATE servers SET transport = ? WHERE id = ?", (args.value, row["id"]))
+        print(f"Files from {row['name']} are now pulled over "
+              f"{'SSH' if args.value == 'ssh' else 'its rsync daemon'}.")
+        return
     if args.action == "sync":
         from .service import sync_peer
 
@@ -553,8 +565,10 @@ def cmd_peer(args) -> None:
             print(f"{p['name']}: {n} change(s) applied ({state})")
         return
     rows = [[p["name"], p["address"], "online" if p["online"] else "offline",
+             p["transport"] + ("" if p["transport"] == "ssh" or not p["ssh_enabled"]
+                               else " (ssh offered)"),
              (p["last_sync"] or "")[:19], p["last_error"] or ""] for p in peers.paired_peers(conn)]
-    print(table(rows, ["SERVER", "ADDRESS", "STATE", "LAST SYNC", "LAST ERROR"])
+    print(table(rows, ["SERVER", "ADDRESS", "STATE", "TRANSPORT", "LAST SYNC", "LAST ERROR"])
           if rows else "Not paired with any server.")
     reqs = conn.execute("SELECT * FROM pair_requests WHERE status = 'pending' ORDER BY id"
                         ).fetchall()
@@ -564,6 +578,35 @@ def cmd_peer(args) -> None:
                       r["name"], r["address"], r["fingerprint"][:23] + "..."] for r in reqs],
                     ["ID", "DIRECTION", "SERVER", "ADDRESS", "FINGERPRINT"]))
         print("Accept an incoming request with 'reifs peer accept ID'.")
+
+
+def cmd_ssh(args) -> None:
+    from . import ssh
+
+    cfg, conn = open_server(args.home)
+    if args.action == "key":
+        print(ssh.ensure_key(cfg.home, cfg.server.name))
+        return
+    lines, rrsync, missing = ssh.authorize_lines(conn)
+    if not cfg.ssh.enabled:
+        print("note: [ssh] enabled is false in config.toml, so peers will not pull over SSH "
+              "from this server until you enable it.")
+    if missing:
+        print(f"no SSH key known yet for: {', '.join(missing)} (they appear after a sync)")
+    if not lines:
+        print("Nothing to authorize.")
+        return
+    if not rrsync:
+        print("warning: 'rrsync' was not found, so these keys are NOT restricted to read-only "
+              "rsync (install it, it comes with rsync, then run this again).")
+    if args.apply:
+        path, added = ssh.install(lines, Path(args.file) if args.file else None)
+        print(f"Added {added} key(s) to {path}.")
+    else:
+        print("Add these lines to ~/.ssh/authorized_keys of the account in [ssh] user "
+              "(or run 'reifs ssh authorize --apply'):")
+        for line in lines:
+            print(line)
 
 
 def cmd_node_adopt(args) -> None:
@@ -693,10 +736,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("peer", help="other servers: list, pair, accept, reject, remove, sync")
     s.add_argument("action", nargs="?", default="list",
-                   choices=["list", "pair", "accept", "reject", "remove", "sync"])
+                   choices=["list", "pair", "accept", "reject", "remove", "sync", "transport"])
     s.add_argument("target", nargs="?", help="address (pair), request id, or server name")
+    s.add_argument("value", nargs="?", help="daemon|ssh (with transport)")
     s.add_argument("-y", "--yes", action="store_true", help="pair without asking")
     s.set_defaults(func=cmd_peer)
+
+    s = sub.add_parser("ssh", help="rsync over SSH: show this server's key, authorize peers")
+    s.add_argument("action", choices=["key", "authorize"])
+    s.add_argument("--apply", action="store_true", help="append to authorized_keys")
+    s.add_argument("--file", help="authorized_keys file (default ~/.ssh/authorized_keys)")
+    s.set_defaults(func=cmd_ssh)
 
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)

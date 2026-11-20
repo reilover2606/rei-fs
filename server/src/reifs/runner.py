@@ -62,7 +62,7 @@ class Prepared:
     src_hash: str
     size: int
     src_stat: tuple[int, int] | None
-    remote: peers.RemoteSource | None = None  # source on a paired server
+    remote: peers.RemoteSource | peers.SshSource | None = None  # on a paired server
 
 
 def run_jobs(conn: sqlite3.Connection, cfg: Config, job_ids: list[int] | None = None,
@@ -110,7 +110,11 @@ class _Runner:
         for node in self.nodes.values():
             peer = reachable.get(node["owner_id"])
             if peer is not None and node["online"]:
-                src = peers.remote_source(peer, node["id"])
+                # The transport chosen for that server: its rsync daemon or SSH.
+                if peer["transport"] == "ssh":
+                    src = peers.ssh_source(peer, node)
+                else:
+                    src = peers.remote_source(peer, node["id"])
                 if src is not None:
                     self.remote[node["id"]] = src
         q = "SELECT * FROM jobs WHERE status IN ('pending', 'waiting')"

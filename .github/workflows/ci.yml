@@ -21,6 +21,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+          enable-cache: false
       - name: Install rsync (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y rsync openssh-server openssh-client
@@ -46,6 +47,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+          enable-cache: false
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y g++ meson ninja-build libssl-dev pkg-config
@@ -97,3 +99,13 @@ jobs:
           echo "server: $FP"; echo "client: $SEEN"
           test "$SEEN" = "$FP"
           cat "$RUNNER_TEMP/serve.log"
+      - name: Stop the server
+        if: always()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            taskkill //F //IM python.exe //T || true
+            taskkill //F //IM rsync.exe //T || true
+          else
+            pkill -f "reifs serve" || true
+          fi
