@@ -127,7 +127,7 @@ def _apply_missing(conn, row, data, option) -> str:
         ) or others
         index.forget_copy(conn, fid, node_id)
         index.add_wanted(conn, "copy", fid, source[0]["node_id"], node_id, "restore")
-        return "queued a copy back to the node (see 'reifs wanted')"
+        return "queued a copy back to the node"
     index.forget_copy(conn, fid, node_id)
     if option == "delete":
         n = conn.execute(
@@ -147,7 +147,7 @@ def _apply_rename(conn, row, data, option) -> str:
         index.add_wanted(conn, "rename", row["file_id"], node_id, node_id, "rename",
                          {"from": data["from"], "to": data["to"]})
         n += 1
-    return f"queued {n} rename(s) (see 'reifs wanted')"
+    return f"queued {n} rename(s)"
 
 
 def _apply_divergent(conn, row, data, option) -> str:
@@ -165,7 +165,7 @@ def _apply_divergent(conn, row, data, option) -> str:
     for r in stale:
         index.add_wanted(conn, "overwrite", fid, current[0]["node_id"], r["node_id"],
                          "update stale copy", {"hash": version.hash})
-    return f"queued {len(stale)} overwrite(s) (see 'reifs wanted')"
+    return f"queued {len(stale)} overwrite(s)"
 
 
 def _apply_conflict(conn, row, data, option) -> str:

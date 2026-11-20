@@ -25,6 +25,7 @@ from typing import Callable
 
 from . import db, fsops, index, jobs, paths, transfer
 from .config import Config
+from .control import StopFn, check
 from .hashing import hash_file
 from .nodes import discover
 
@@ -64,16 +65,28 @@ class Prepared:
 
 
 def run_jobs(conn: sqlite3.Connection, cfg: Config, job_ids: list[int] | None = None,
-             progress: ProgressFn | None = None) -> list[JobReport]:
-    """Run every runnable job (or the given ones). Caller holds the server lock."""
-    return _Runner(conn, cfg, progress).run(job_ids)
+             progress: ProgressFn | None = None, stop: StopFn | None = None) -> list[JobReport]:
+    """Run every runnable job (or the given ones). Caller holds the server lock.
+
+    ``stop`` is polled between items and while rsync runs; when it returns
+    True the run is interrupted like Ctrl-C (``control.Stopped`` is raised).
+    """
+    return _Runner(conn, cfg, progress, stop).run(job_ids)
 
 
 class _Runner:
-    def __init__(self, conn: sqlite3.Connection, cfg: Config, progress: ProgressFn | None):
+    def __init__(self, conn: sqlite3.Connection, cfg: Config, progress: ProgressFn | None,
+                 stop: StopFn | None = None):
         self.conn = conn
         self.cfg = cfg
-        self.progress = progress or (lambda _msg: None)
+        self.stop = stop
+        user_progress = progress or (lambda _msg: None)
+
+        def progress_and_check(msg: str) -> None:
+            user_progress(msg)
+            check(stop)
+
+        self.progress = progress_and_check
         self.roots: dict[str, Path] = {}
         self.nodes: dict[str, sqlite3.Row] = {}
         self.full: set[str] = set()
@@ -113,6 +126,7 @@ class _Runner:
         max_bytes = max(1, self.cfg.transfers.batch_mb) * 1024 * 1024
         try:
             for item in items:
+                check(self.stop)
                 if item["op"] == "rename":
                     self._rename(item, rep)
                     continue

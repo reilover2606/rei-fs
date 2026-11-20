@@ -27,6 +27,7 @@ from typing import Callable, Iterator
 
 from . import db, fsops, index, paths
 from .config import Config, ScanSection
+from .control import Stopped, StopFn, check
 from .hashing import hash_file
 from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
 
@@ -161,6 +162,7 @@ def scan_node(
     *,
     verify: bool = False,
     progress: ProgressFn | None = None,
+    stop: StopFn | None = None,
 ) -> ScanResult:
     node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if node is None:
@@ -204,6 +206,7 @@ def scan_node(
     pending, last_commit = 0, time.monotonic()
     try:
         for vpath, phys, size, mtime_ns in walker.walk():
+            check(stop)
             stats.seen += 1
             seen.add(vpath)
             if _process_file(conn, node_id, scan_id, vpath, phys, size, mtime_ns,
@@ -222,7 +225,7 @@ def scan_node(
                 conn.execute("COMMIT")  # keep the progress made so far
             except sqlite3.Error:
                 conn.execute("ROLLBACK")
-        finish("aborted" if isinstance(exc, KeyboardInterrupt) else "failed")
+        finish("aborted" if isinstance(exc, (KeyboardInterrupt, Stopped)) else "failed")
         raise
 
     # --- phase 2: vanished copies, renames, pruning ---------------------------
@@ -415,7 +418,7 @@ def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
 
 def scan_all(
     conn: sqlite3.Connection, cfg: Config, names: list[str] | None = None, *,
-    verify: bool = False, progress: ProgressFn | None = None,
+    verify: bool = False, progress: ProgressFn | None = None, stop: StopFn | None = None,
 ):
     """Discover owned nodes, then scan the online ones (optionally filtered)."""
     from .nodes import discover
@@ -427,5 +430,5 @@ def scan_all(
         if wanted and loc.name not in wanted and loc.node_id not in wanted:
             continue
         results.append(scan_node(conn, cfg, loc.node_id, loc.root,
-                                 verify=verify, progress=progress))
+                                 verify=verify, progress=progress, stop=stop))
     return disc, results

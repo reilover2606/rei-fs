@@ -433,6 +433,45 @@ def cmd_unmark(args) -> None:
     print(f"Removed the deletion mark from {n} cop(ies).")
 
 
+def cmd_serve(args) -> None:
+    import logging
+
+    from . import api, tls
+    from .service import Worker
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cfg, conn = open_server(args.home)
+    conn.close()
+    if not cfg.server.password_hash:
+        print("warning: no admin password set; clients cannot log in ('reifs passwd')",
+              file=sys.stderr)
+    worker = Worker(cfg)
+    server = api.make_server(cfg, worker, args.listen)
+    cert, _ = tls.paths(cfg.home)
+    host, port = server.server_address[:2]
+    print(f"rei-fs server {cfg.server.name!r} listening on https://{host}:{port}")
+    print(f"certificate fingerprint (SHA-256): {tls.fingerprint(cert)}")
+    print("Compare it with what the client shows the first time it connects.", flush=True)
+    worker.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down (finishing the current file)...", file=sys.stderr)
+    finally:
+        server.server_close()
+        worker.close()
+
+
+def cmd_fingerprint(args) -> None:
+    from . import tls
+
+    cfg, conn = open_server(args.home)
+    conn.close()
+    cert, _ = tls.ensure_certificate(cfg.home, cfg.server.name)
+    print(tls.fingerprint(cert))
+
+
 def cmd_status(args) -> None:
     cfg, conn = open_server(args.home)
     s = queries.status(conn)
@@ -571,6 +610,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--all", action="store_true")
     s.set_defaults(func=cmd_unmark)
 
+    s = sub.add_parser("serve", help="run the server: HTTPS API for the client + background work")
+    s.add_argument("--listen", help="HOST:PORT (default: [server] listen in config.toml)")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(func=cmd_serve)
+
+    s = sub.add_parser("fingerprint", help="show the TLS certificate fingerprint")
+    s.set_defaults(func=cmd_fingerprint)
+
     s = sub.add_parser("status", help="summary of the index")
     s.set_defaults(func=cmd_status)
     return p
@@ -583,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args.func(args)
     except (CliError, ConfigError, nodes.NodeError, decisions.DecisionError,
-            tags.TagError, jobs.JobError, LockError, ValueError) as e:
+            tags.TagError, jobs.JobError, LockError, ValueError, OSError) as e:
         print(f"reifs: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
