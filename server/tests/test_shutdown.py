@@ -179,3 +179,56 @@ def test_second_ctrl_c_forces_exit(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def _serve_env(tmp_path, **extra):
+    root = tmp_path / "root"
+    cfg = init_server(tmp_path / "home", "srv", root)
+    cfg.discovery.paths = [str(tmp_path / "none")]
+    cfg.save()
+    return dict(os.environ, REIFS_HOME=str(tmp_path / "home"), **extra)
+
+
+def test_ctrl_c_works_when_sigint_was_inherited_as_ignored(tmp_path):
+    """A server started as a background job inherits 'ignore SIGINT'; Ctrl+C
+    must still stop it (it installs its own handler)."""
+    env = _serve_env(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "reifs", "serve", "--listen", "127.0.0.1:0"], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+    try:
+        assert proc.stdout.readline()          # it is up
+        time.sleep(1)
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=15)
+        assert b"shutting down" in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_watchdog_ends_a_stuck_shutdown_and_shows_stacks(tmp_path):
+    env = _serve_env(tmp_path, REIFS_SHUTDOWN_SECONDS="5")
+    code = (
+        "import sys, time\n"
+        "from reifs import service\n"
+        "service.Worker.close = lambda self, timeout=30: time.sleep(120)\n"
+        "from reifs.cli import main\n"
+        "sys.exit(main(['serve', '--listen', '127.0.0.1:0']))\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+    try:
+        time.sleep(4)
+        t0 = time.time()
+        proc.send_signal(signal.SIGINT)
+        err = proc.communicate(timeout=30)[1].decode()
+        assert time.time() - t0 < 15
+        assert proc.returncode == 1
+        assert "forcing exit" in err
+        assert "most recent call first" in err and "in cmd_serve" in err  # stacks shown
+    finally:
+        if proc.poll() is None:
+            proc.kill()

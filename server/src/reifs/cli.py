@@ -481,42 +481,70 @@ def cmd_serve(args) -> None:
     print(f"rei-fs server {cfg.server.name!r} listening on https://{host}:{port}")
     print(f"certificate fingerprint (SHA-256): {tls.fingerprint(cert)}")
     print("Compare it with what the client shows the first time it connects.", flush=True)
+    import faulthandler
     import signal
+    import threading
 
-    def on_term(signum, frame):  # shut down cleanly (stops the rsync daemon too)
+    def on_signal(signum, frame):
+        # Our own handlers: a SIGINT inherited as "ignored" (a background job
+        # of a script, some launchers) would otherwise make Ctrl+C do nothing.
         raise KeyboardInterrupt
 
-    try:
-        signal.signal(signal.SIGTERM, on_term)
-    except (ValueError, OSError):
-        pass
+    for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, on_signal)
+            except (ValueError, OSError):
+                pass
+    if hasattr(signal, "SIGUSR1"):
+        try:  # kill -USR1 PID: show where every thread is (for diagnosing hangs)
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+        except (ValueError, OSError, RuntimeError):
+            pass
+    print("Press Ctrl+C to stop.", flush=True)
     worker.start()
     syncer.start()
+
+    def force_exit(code: int) -> None:
+        from . import transfer
+
+        transfer.kill_all()
+        syncer.daemon.stop()
+        sys.stderr.flush()
+        os._exit(code)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down... (Ctrl+C again to force)", file=sys.stderr, flush=True)
+    # Shutdown must always end: show what is stuck after a few seconds, and
+    # exit regardless after a few more (also covers threads that would block
+    # the interpreter's own exit).
+    limit = float(os.environ.get("REIFS_SHUTDOWN_SECONDS") or 20)
+    faulthandler.dump_traceback_later(max(1.0, limit * 0.4), exit=False)
+
+    def watchdog() -> None:
+        print(f"shutdown did not finish in {limit:g} s (thread stacks above); forcing exit",
+              file=sys.stderr, flush=True)
+        force_exit(1)
+
+    timer = threading.Timer(limit, watchdog)
+    timer.daemon = True
+    timer.start()
     try:
         server.server_close()
+        server.api.pool.shutdown(wait=False, cancel_futures=True)
         worker.close(timeout=10)   # stops the current scan or transfer
         syncer.close(timeout=5)
     except KeyboardInterrupt:
         # A second Ctrl+C (or SIGTERM): do not wait for anything.
-        from . import transfer
-
         print("forcing exit", file=sys.stderr, flush=True)
-        transfer.kill_all()
-        syncer.daemon.stop()
-        os._exit(130)
+        force_exit(130)
+    faulthandler.cancel_dump_traceback_later()
     if worker.thread.is_alive() or syncer.thread.is_alive():
-        # Something did not stop in time; the threads are daemons, but the
-        # children we started must not outlive us.
-        from . import transfer
-
         print("some work did not stop in time; ending it", file=sys.stderr, flush=True)
-        transfer.kill_all()
-        syncer.daemon.stop()
-        os._exit(1)
+        force_exit(1)
 
 
 def cmd_fingerprint(args) -> None:
