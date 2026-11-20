@@ -133,7 +133,7 @@ Element file_details(const json& f) {
 Element list_panel(const std::string& heading, Component menu, size_t count,
                    const std::string& empty_text) {
   Element body = count == 0 ? text(empty_text) | dim | center
-                            : menu->Render() | vscroll_indicator | frame;
+                            : menu->Render() | vscroll_indicator | yframe;  // vertical only: clip long rows on the right
   return vbox({text(heading) | bold, separator(), body | flex}) | flex;
 }
 
@@ -339,7 +339,9 @@ class OverviewView : public View {
       right.push_back(hbox({text(fit("last error", 26)),
                             paragraph(act.value("last_error", "")) | color(Color::Red)}));
     std::string goal = std::to_string(replication_.value("copies", 2)) + " copies of every file";
-    for (auto& [tag, n] : replication_.value("tag_copies", json::object()).items())
+    // Keep the json alive for the loop: .items() on a temporary dangles (C++20).
+    json tag_copies = replication_.value("tag_copies", json::object());
+    for (auto& [tag, n] : tag_copies.items())
       goal += ", " + n.dump() + " for '" + tag + "'";
     Elements backup = {text("Backups (goal: " + goal + ")") | bold, separator()};
     bool autom = replication_.value("auto_replicate", false);
@@ -359,7 +361,8 @@ class OverviewView : public View {
       int nodest = lp.value("no_destination", 0);
       backup.push_back(line("  no possible destination", std::to_string(nodest), Color::Red,
                             nodest > 0));
-      for (auto& [reason, n] : lp.value("reasons", json::object()).items())
+      json reasons = lp.value("reasons", json::object());  // not a temporary: see above
+      for (auto& [reason, n] : reasons.items())
         backup.push_back(hbox({text("      " + n.dump() + "  "), paragraph(reason) | dim}));
     } else {
       backup.push_back(text("not planned yet (p: plan now)") | dim);
@@ -522,7 +525,13 @@ class SearchView : public View {
     mopt.on_change = [this] { load_detail(); };
     menu_ = Menu(&labels_, &selected_, mopt);
     auto form = Container::Horizontal({query_input_, tag_input_, issues, under, button});
-    auto layout = Container::Vertical({form, menu_});
+    // Focusable line holding the keyboard focus while not typing, so that the
+    // number keys keep switching tabs ("/" starts typing a search).
+    hint_ = Renderer([this](bool focused) {
+      auto line = text(" / to type a search   tags: " + tags_line_);
+      return focused ? line | bold : line | dim;
+    });
+    auto layout = Container::Vertical({hint_, form, menu_});
     root_ = Renderer(layout, [=, this] {
       auto form_el = hbox({
           query_input_->Render() | border | flex,
@@ -533,7 +542,7 @@ class SearchView : public View {
       std::string heading = results_.empty() ? "results"
                                               : std::to_string(total_) + " result(s)" +
                                                     (truncated_ ? " (first 1000 shown)" : "");
-      return vbox({form_el, text(" tags: " + tags_line_) | dim,
+      return vbox({form_el, hint_->Render(),
                    with_detail(list_panel(heading, menu_, labels_.size(),
                                           "type a pattern and/or a tag, then Enter"),
                                detail_) |
@@ -545,7 +554,8 @@ class SearchView : public View {
   Component component() override { return root_; }
   bool typing() const override { return query_input_->Focused() || tag_input_->Focused(); }
   std::string help() const override {
-    return "Enter: search  Esc/↓: results  t/T: tag/untag  c/m: copy/move  C/M: copy/move all";
+    return "/: type a search  Enter: search  Esc: leave the fields  t/T: tag  c/m: copy/move  "
+           "C/M: all results";
   }
 
   void refresh() override {
@@ -557,9 +567,17 @@ class SearchView : public View {
       if (tags_line_.empty()) tags_line_ = "(none)";
     });
     if (searched_) search();
+    leave_inputs();  // arriving on the tab: number keys still switch tabs
   }
 
  private:
+  void leave_inputs() {
+    if (!results_.empty())
+      menu_->TakeFocus();
+    else
+      hint_->TakeFocus();
+  }
+
   void search() {
     std::string q = "/api/find?q=" + url_encode(query_) + "&tag=" + url_encode(tag_);
     if (issues_) q += "&issues=1";
@@ -578,7 +596,7 @@ class SearchView : public View {
     }
     selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
     load_detail();
-    if (!results_.empty()) menu_->TakeFocus();
+    leave_inputs();
   }
 
   void load_detail() {
@@ -601,8 +619,11 @@ class SearchView : public View {
 
   bool on_event(const Event& e) {
     if (e == Event::Escape && typing()) {
-      // Leave the text fields so the global keys (tabs, q) work again.
-      if (!results_.empty()) menu_->TakeFocus();  // F1-F8 work in any case
+      leave_inputs();  // the global keys (tabs, q) work again
+      return true;
+    }
+    if (key(e, "/") && !typing()) {
+      query_input_->TakeFocus();
       return true;
     }
     if (!menu_->Focused() || results_.empty()) return false;
@@ -642,7 +663,7 @@ class SearchView : public View {
   std::vector<std::string> labels_;
   int selected_ = 0;
   Element detail_ = text("");
-  Component query_input_, tag_input_, menu_, root_;
+  Component query_input_, tag_input_, hint_, menu_, root_;
 };
 
 // --- several servers ---------------------------------------------------------------

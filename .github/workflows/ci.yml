@@ -50,7 +50,7 @@ jobs:
           enable-cache: false
       - name: Install build tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y g++ meson ninja-build libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y g++ meson ninja-build libssl-dev pkg-config tmux
       - name: Install build tools (Windows, MSYS2 UCRT64)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -70,6 +70,10 @@ jobs:
           meson setup build
           ninja -C build
           meson test -C build --print-errorlogs
+          # Same with AddressSanitizer/UBSan: catches use of freed memory.
+          meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false -Dbuildtype=debug
+          ninja -C build-asan
+          meson test -C build-asan --print-errorlogs
       - name: Build and unit tests (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
@@ -98,6 +102,11 @@ jobs:
           SEEN=$(./$BIN --fingerprint 127.0.0.1:7499)
           echo "server: $FP"; echo "client: $SEEN"
           test "$SEEN" = "$FP"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Drive the real terminal UI (first connection, every tab, dialogs).
+            tests/tui_smoke.sh build-asan/rei-fs 7499 secret
+            tests/tui_smoke.sh build/rei-fs 7499 secret
+          fi
           cat "$RUNNER_TEMP/serve.log"
       - name: Stop the server
         if: always()

@@ -32,7 +32,9 @@ ninja -C build
 
 Use Windows Terminal for proper colours and Unicode.
 
-Run the tests with `meson test -C build`. To also test against a live
+Run the tests with `meson test -C build`. `tests/tui_smoke.sh BINARY PORT
+PASSWORD` drives the real UI in tmux against a running server (CI runs it with
+an AddressSanitizer build). To also test against a live
 server, set `REIFS_TEST_PORT` and `REIFS_TEST_PASSWORD` (server on
 127.0.0.1).
 
@@ -53,14 +55,13 @@ new one. Settings live in `~/.config/rei-fs-client/client.json`
 ### Tabs and keys
 
 `1`-`9` or `F1`-`F9` switch tabs, `?` shows help, `q` quits. In the Search
-tab the number keys type into the fields: press `Esc` (or `↓`) to get to the
-results, or use `F1`-`F8`.
+tab, press `/` to type a search (`Esc` leaves the fields).
 
 | Tab | What it shows | Keys |
 |---|---|---|
 | Overview | Copies, activity, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
 | Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move |
-| Search | Find by name/path glob, tag, problems | `C`/`M` copy/move all results |
+| Search | Find by name/path glob, tag, problems | `/` type a search, `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
