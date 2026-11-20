@@ -9,7 +9,7 @@ description = "Decentralized file and backup manager (server)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["cryptography>=41"]
 classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",

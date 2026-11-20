@@ -10,8 +10,16 @@ uv sync                      # or: pip install -e .
 uv run reifs init --name desktop --root ~/rei
 uv run reifs passwd
 uv run reifs scan
-uv run reifs status
+uv run reifs serve           # HTTPS API for the client + background work
 ```
+
+`reifs serve` listens on `[server] listen` (default `0.0.0.0:7420`). It
+creates a self-signed certificate on first start and prints its
+fingerprint (also shown by `reifs fingerprint`). It also scans every
+`scan.interval_minutes`, scans drives when they are plugged in, and runs
+jobs in the background. Certificates are made with the `cryptography`
+package. On Termux, install it with `pkg install python-cryptography` (or
+have the `openssl` command available).
 
 Run the tests with `uv run pytest`.
 
@@ -36,6 +44,8 @@ Run the tests with `uv run pytest`.
 | `reifs wanted [list\|approve\|reject] [ID...\|--all]` | Proposed jobs from decisions |
 | `reifs marked [--node N]` / `reifs unmark VPATH... \| --all` | Copies marked for deletion |
 | `reifs status` | Summary: copies, divergent, missing, non-portable... |
+| `reifs serve [--listen HOST:PORT]` | Run the API for the client and the background worker |
+| `reifs fingerprint` | Show the TLS certificate fingerprint |
 
 The server home defaults to `~/.config/rei-fs` (Linux) or
 `%LOCALAPPDATA%\rei-fs` (Windows). Override it with `--home` or `REIFS_HOME`.

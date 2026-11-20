@@ -1,6 +1,7 @@
 # rei-fs design
 
-Status: approved. Milestones 1 (index) and 2 (jobs) are implemented.
+Status: approved. Milestones 1 (index), 2 (jobs) and 3 (API and client) are
+implemented.
 
 ## 1. Goals
 
@@ -277,24 +278,58 @@ mDNS on the LAN). The user must accept it in the client on **both** sides.
 After that, the servers exchange rsync credentials and API tokens. Paired
 servers obey each other's send/receive requests without further prompts.
 
-## 8. Client (milestone 3)
+## 8. Client and API (milestone 3)
 
-* C++20, TUI with FTXUI, built with meson/ninja. Dependencies come from
-  WrapDB (ftxui, nlohmann_json, cpp-httplib with OpenSSL).
-* Connects to one server at a time over HTTPS (JSON API). The server has a
-  self-signed certificate that the client pins the first time it connects.
-* There is a single admin user. The password is stored in the server config
-  as an scrypt hash and is the same on all servers.
-* Views:
-  * virtual tree browser (copies per file, flags);
-  * search by name, tag, size and date;
-  * file details (locations, versions, tags);
-  * decision stack;
-  * wanted jobs;
-  * jobs with progress, resume and cancel;
-  * nodes;
-  * pairing requests;
-  * copies marked for deletion.
+### 8.1 Server side
+
+`reifs serve` runs:
+
+* **The HTTPS JSON API** (stdlib `http.server`, one thread per connection,
+  with the TLS handshake in that thread). The certificate is self-signed
+  (ECDSA P-256), created on first start in `<home>/tls/`.
+* **A background worker**: a single thread that performs every scan and
+  job run, one at a time, under the server lock. It scans all nodes every
+  `scan.interval_minutes`, polls for attached drives every 30 s (scanning a
+  storage node when it comes online), and runs pending/waiting jobs every
+  minute and right after jobs are created, approved or retried. A stop
+  request interrupts the current scan or run between files (progress is
+  kept, as with Ctrl-C).
+
+Authentication: `POST /api/login {password}` checks the scrypt hash in the
+config and returns a random bearer token (12 h sliding expiry, in memory;
+a restarted server forgets tokens and the client logs in again). Failed
+logins are delayed by one second.
+
+Endpoints (all JSON, under `/api`):
+
+| Method and path | Purpose |
+|---|---|
+| `POST login`, `POST logout` | Session |
+| `GET status` | Index summary, activity of the worker |
+| `GET nodes`, `POST nodes/<name>` | Nodes; set priority / backup target |
+| `POST scan {nodes?, verify?}`, `POST stop` | Queue a scan; stop current work |
+| `GET tree?path=`, `GET file?path=` | Browse the virtual tree; file details |
+| `GET find?q=&tag=&node=&issues=1&under=1` | Search (max 1000 results) |
+| `GET tags`, `POST tags {action, tag, paths, recursive}` | Tags |
+| `GET decisions`, `POST decisions/<id> {option}` | Decision stack |
+| `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |
+| `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
+| `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |
+| `GET marked?node=`, `POST unmark {paths, node, all}` | Deletion marks |
+
+### 8.2 Client
+
+* C++20, FTXUI 6, cpp-httplib (OpenSSL) and nlohmann_json, built with
+  meson/ninja. Dependencies come from the system or from the wraps in
+  `client/subprojects/`.
+* Trust on first use: on the first connection the client shows the SHA-256
+  fingerprint of the server certificate for the user to compare with
+  `reifs fingerprint`, then pins it per `host:port`. A changed fingerprint
+  is refused with a warning unless the user explicitly trusts the new one.
+  The CA chain and host name are not used.
+* Tabs: Overview, Tree, Search, Decisions, Wanted, Jobs, Nodes, Marked. A
+  background thread polls `GET status` every 2 s for the status bar and the
+  live Jobs view.
 
 ## 9. Server configuration
 
