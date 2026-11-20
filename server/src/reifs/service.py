@@ -116,11 +116,15 @@ class Worker:
 
     def _main(self) -> None:
         conn = db.open_existing(self.cfg.db_path)
-        last_scan = 0.0 if self.cfg.scan.interval_minutes > 0 else float("inf")
-        last_discovery = 0.0
-        last_jobs = 0.0
-        last_plan = 0.0
-        last_plan_check = 0.0
+        # -inf: everything runs once right away. (Not 0.0: monotonic time
+        # counts from boot, so on a machine booted less than an hour ago the
+        # first hourly scan would otherwise wait.)
+        never = float("-inf")
+        last_scan = never
+        last_discovery = never
+        last_jobs = never
+        last_plan = never
+        last_plan_check = never
         planned_at_seq = None
         online: set[str] | None = None
         try:

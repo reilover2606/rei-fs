@@ -15,7 +15,7 @@ from conftest import write
 from test_peers import cluster, free_port, pair  # noqa: F401  (fixture)
 
 SSHD = shutil.which("sshd") or ("/usr/sbin/sshd" if os.path.exists("/usr/sbin/sshd") else None)
-pytestmark = pytest.mark.skipif(
+needs_sshd = pytest.mark.skipif(
     sys.platform == "win32" or SSHD is None or shutil.which("ssh") is None
     or shutil.which("rsync") is None or shutil.which("ssh-keygen") is None,
     reason="needs sshd, ssh, ssh-keygen and rsync (POSIX)")
@@ -23,6 +23,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def sshd(tmp_path):
+    if SSHD is None:
+        pytest.skip("no sshd")
     d = tmp_path / "sshd"
     d.mkdir()
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / "hostkey")],
@@ -56,6 +58,7 @@ LogLevel ERROR
     proc.wait(5)
 
 
+@needs_sshd
 def test_pull_over_ssh_with_read_only_key(cluster, sshd):  # noqa: F811
     port, authorized = sshd
     a, b = cluster("alpha"), cluster("beta")
@@ -121,7 +124,8 @@ def test_transport_requires_offer(cluster):  # noqa: F811
 def test_key_and_authorized_lines(tmp_path):
     line = ssh.ensure_key(tmp_path, "srv")
     assert line.startswith("ssh-ed25519 ") and line == ssh.ensure_key(tmp_path, "srv")
-    assert oct(os.stat(ssh.key_path(tmp_path)).st_mode & 0o777) == "0o600"
+    if sys.platform != "win32":
+        assert oct(os.stat(ssh.key_path(tmp_path)).st_mode & 0o777) == "0o600"
     restricted = ssh.authorized_line(line, "beta", "/usr/bin/rrsync")
     assert restricted.startswith('restrict,command="/usr/bin/rrsync -ro /" ssh-ed25519 ')
     assert ssh.authorized_line(line, "beta", None).startswith("restrict ssh-ed25519 ")

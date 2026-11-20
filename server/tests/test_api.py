@@ -205,3 +205,25 @@ def test_unknown_endpoint(server):
     _, client, _ = server
     login(client)
     client.get("/api/nope", expect=404)
+
+
+def test_worker_scans_at_start_even_soon_after_boot(env, monkeypatch):
+    """The first periodic scan must not wait for 'interval' after boot."""
+    import time as _time
+
+    from reifs import service
+
+    write(env.root / "boot.txt", "x")
+    env.cfg.scan.interval_minutes = 60
+    monkeypatch.setattr(service.time, "monotonic", lambda: 5.0)  # booted 5 s ago
+    worker = Worker(env.cfg)
+    worker.start()
+    try:
+        deadline = _time.time() + 15
+        while _time.time() < deadline:
+            if env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]:
+                break
+            _time.sleep(0.2)
+        assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+    finally:
+        worker.close()
