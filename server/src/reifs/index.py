@@ -182,3 +182,38 @@ def add_wanted(
         (op, fid, src, dst, json.dumps(data or {}), reason, db.now()),
     )
     return cur.lastrowid
+
+
+def copy_tags(conn: sqlite3.Connection, from_fid: int, to_fid: int) -> None:
+    """Copy tag state (incl. tombstones) from one file to another; newest edit wins."""
+    conn.execute(
+        "INSERT INTO tags(file_id, tag, present, updated, updated_by)"
+        " SELECT ?, tag, present, updated, updated_by FROM tags WHERE file_id = ?"
+        " ON CONFLICT(file_id, tag) DO UPDATE SET present = excluded.present,"
+        " updated = excluded.updated, updated_by = excluded.updated_by"
+        " WHERE excluded.updated > tags.updated",
+        (to_fid, from_fid),
+    )
+
+
+def record_copy(conn: sqlite3.Connection, fid: int, node_id: str, size: int,
+                mtime_ns: int, hash_: str) -> None:
+    """Record a copy observed outside a scan (after a transfer or rename).
+
+    ``first_scan`` is set to the node's last completed scan so the copy is
+    not mistaken for the target of a user rename by the next scan.
+    """
+    row = conn.execute("SELECT last_scan_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    ts = db.now()
+    conn.execute(
+        "INSERT INTO copies(file_id, node_id, size, mtime_ns, hash, first_seen, first_scan,"
+        " hashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(file_id, node_id) DO UPDATE"
+        " SET size = excluded.size, mtime_ns = excluded.mtime_ns, hash = excluded.hash,"
+        " state = 'present', hashed_at = excluded.hashed_at,"
+        " marked_delete = CASE WHEN copies.hash = excluded.hash THEN copies.marked_delete"
+        " ELSE 0 END",
+        (fid, node_id, size, mtime_ns, hash_, ts, (row[0] if row else None) or 0, ts),
+    )
+    log_change(conn, node_id, vpath_of(conn, fid), "upsert", size, mtime_ns, hash_)
+    obsolete_decisions(conn, fid, ("missing",), node_id)
+    evaluate_divergence(conn, fid)

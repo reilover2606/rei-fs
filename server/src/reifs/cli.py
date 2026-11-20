@@ -13,9 +13,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, auth, decisions, nodes, queries, scanner, tags
+from . import __version__, auth, decisions, jobs, nodes, queries, runner, scanner, tags
 from .config import ConfigError, default_home
 from .hashing import short
+from .locking import LockError, ServerLock
+from .paths import to_physical
 from .server import init_server, open_server
 
 
@@ -151,8 +153,9 @@ def cmd_scan(args) -> None:
             line = f"  {stats.seen} files, {stats.hashed} hashed: {current}"
             print("\r" + line[:110].ljust(110), end="", file=sys.stderr, flush=True)
 
-    disc, results = scanner.scan_all(conn, cfg, args.nodes or None, verify=args.verify,
-                                     progress=progress)
+    with ServerLock(cfg.home):
+        disc, results = scanner.scan_all(conn, cfg, args.nodes or None, verify=args.verify,
+                                         progress=progress)
     if sys.stderr.isatty():
         print("\r" + " " * 110 + "\r", end="", file=sys.stderr)
     for name in disc.offline:
@@ -280,6 +283,16 @@ def cmd_decide(args) -> None:
 
 def cmd_wanted(args) -> None:
     _, conn = open_server(args.home)
+    if args.action in ("approve", "reject"):
+        if not args.ids and not args.all:
+            raise CliError(f"give wanted job ids to {args.action}, or --all")
+        ids = None if args.all else args.ids
+        if args.action == "reject":
+            print(f"Rejected {jobs.reject_wanted(conn, ids)} proposal(s).")
+            return
+        rep = jobs.approve_wanted(conn, ids)
+        _print_create_report(rep)
+        return
     rows = []
     for r in conn.execute(
         "SELECT w.*, f.vpath, s.name AS src, d.name AS dst FROM wanted w"
@@ -289,8 +302,135 @@ def cmd_wanted(args) -> None:
         extra = json.loads(r["data"])
         target = f"{extra['from']} -> {extra['to']}" if r["op"] == "rename" else r["vpath"] or ""
         rows.append([str(r["id"]), r["op"], target, r["src"] or "", r["dst"] or "", r["reason"]])
+    if not rows:
+        print("No proposed jobs.")
+        return
     print(table(rows, ["ID", "OP", "FILE", "FROM", "TO", "REASON"]))
-    print("Jobs are executed from milestone 2 on.")
+    print("Approve with 'reifs wanted approve ID... | --all', or reject.")
+
+
+def _print_create_report(rep: jobs.CreateReport) -> None:
+    for reason, vpaths in rep.excluded.items():
+        shown = ", ".join(vpaths[:5]) + (f" (+{len(vpaths) - 5} more)" if len(vpaths) > 5 else "")
+        print(f"  excluded ({reason}): {shown}")
+    if rep.job_id is None:
+        print("Nothing to do; no job created.")
+    else:
+        print(f"Created job #{rep.job_id} with {rep.items} item(s). "
+              f"Run it with 'reifs jobs run {rep.job_id}'.")
+
+
+def _run_jobs(cfg, conn, job_ids) -> list[runner.JobReport]:
+    tty = sys.stderr.isatty()
+
+    def progress(msg: str) -> None:
+        if tty:
+            print("\r" + msg[:110].ljust(110), end="", file=sys.stderr, flush=True)
+
+    with ServerLock(cfg.home):
+        try:
+            reports = runner.run_jobs(conn, cfg, job_ids or None, progress)
+        finally:
+            if tty:
+                print("\r" + " " * 110 + "\r", end="", file=sys.stderr)
+    if not reports:
+        print("No runnable jobs.")
+    for r in reports:
+        parts = [f"{r.done} done ({human_size(r.bytes)})"]
+        for label, value in (("skipped", r.skipped), ("conflicts", r.conflicts),
+                             ("waiting", r.waiting), ("will retry", r.retry),
+                             ("failed", r.failed)):
+            if value:
+                parts.append(f"{value} {label}")
+        print(f"job #{r.job_id} [{r.status}] {r.description}: " + ", ".join(parts))
+        for vpath, msg in r.messages[:20]:
+            print(f"    {vpath}: {msg}")
+        if len(r.messages) > 20:
+            print(f"    ... {len(r.messages) - 20} more (see 'reifs jobs show {r.job_id}')")
+    return reports
+
+
+def cmd_transfer(args) -> None:
+    cfg, conn = open_server(args.home)
+    rep = jobs.create_transfer_job(conn, args.vpaths, args.tag, args.to, args.src,
+                                   move=args.move)
+    _print_create_report(rep)
+    if rep.job_id is not None and args.run:
+        _run_jobs(cfg, conn, [rep.job_id])
+
+
+def cmd_jobs(args) -> None:
+    cfg, conn = open_server(args.home)
+    if args.action == "run":
+        _run_jobs(cfg, conn, args.ids)
+        return
+    if args.action in ("show", "cancel", "retry"):
+        if len(args.ids) != 1:
+            raise CliError(f"'jobs {args.action}' takes exactly one job id")
+        job_id = args.ids[0]
+        if args.action == "cancel":
+            print(f"Cancelled job #{job_id} ({jobs.cancel_job(conn, job_id)} item(s) not done).")
+        elif args.action == "retry":
+            print(f"Re-queued {jobs.retry_job(conn, job_id)} failed item(s) of job #{job_id}.")
+        else:
+            _show_job(conn, job_id, args.all)
+        return
+    q = "SELECT * FROM jobs"
+    if not args.all:
+        q += " WHERE status NOT IN ('done', 'cancelled')"
+    rows = []
+    for j in conn.execute(q + " ORDER BY id"):
+        c = jobs.item_counts(conn, j["id"])
+        total = sum(c.values())
+        summary = " ".join(f"{k}:{v}" for k, v in sorted(c.items()) if k != "done")
+        rows.append([str(j["id"]), j["status"], f"{c.get('done', 0)}/{total}", summary,
+                     j["description"]])
+    if not rows:
+        print("No active jobs." if not args.all else "No jobs.")
+        return
+    print(table(rows, ["ID", "STATUS", "DONE", "OTHER", "DESCRIPTION"]))
+
+
+def _show_job(conn, job_id: int, show_all: bool) -> None:
+    j = jobs.get_job(conn, job_id)
+    print(f"job #{j['id']} [{j['status']}] {j['description']}")
+    print(f"  created {j['created']}" + (f", started {j['started']}" if j["started"] else "")
+          + (f", finished {j['finished']}" if j["finished"] else ""))
+    c = jobs.item_counts(conn, job_id)
+    print("  items: " + ", ".join(f"{v} {k}" for k, v in sorted(c.items())))
+    q = ("SELECT i.*, s.name AS src, d.name AS dst FROM job_items i"
+         " LEFT JOIN nodes s ON s.id = i.src_node JOIN nodes d ON d.id = i.dst_node"
+         " WHERE i.job_id = ?")
+    if not show_all:
+        q += " AND i.state NOT IN ('done')"
+    rows = [[str(i["id"]), i["op"], i["state"],
+             i["vpath"] + (f" -> {i['new_vpath']}" if i["new_vpath"] else ""),
+             i["src"] or "(any)", i["dst"], str(i["attempts"]), i["message"] or ""]
+            for i in conn.execute(q + " ORDER BY i.id", (job_id,))]
+    if rows:
+        print(table(rows, ["ITEM", "OP", "STATE", "FILE", "FROM", "TO", "TRIES", "MESSAGE"]))
+
+
+def cmd_marked(args) -> None:
+    _, conn = open_server(args.home)
+    rows = jobs.marked_copies(conn, args.node)
+    if not rows:
+        print("No copies are marked for deletion.")
+        return
+    out = [[r["node_name"], r["vpath"], human_size(r["size"]),
+            str(to_physical(r["root_path"], r["vpath"])) if r["root_path"] else ""]
+           for r in rows]
+    print(table(out, ["NODE", "FILE", "SIZE", "PHYSICAL PATH"]))
+    print(f"{len(rows)} cop(ies), {human_size(sum(r['size'] for r in rows))}. Delete them "
+          "yourself; the next scan clears the marks. Or keep them with 'reifs unmark'.")
+
+
+def cmd_unmark(args) -> None:
+    _, conn = open_server(args.home)
+    if not args.vpaths and not args.all:
+        raise CliError("give paths to unmark, or --all")
+    n = jobs.unmark(conn, [] if args.all else args.vpaths, args.node)
+    print(f"Removed the deletion mark from {n} cop(ies).")
 
 
 def cmd_status(args) -> None:
@@ -394,8 +534,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("option")
     s.set_defaults(func=cmd_decide)
 
-    s = sub.add_parser("wanted", help="list proposed jobs")
+    s = sub.add_parser("wanted", help="proposed jobs: list, approve, reject")
+    s.add_argument("action", nargs="?", default="list", choices=["list", "approve", "reject"])
+    s.add_argument("ids", nargs="*", type=int)
+    s.add_argument("--all", action="store_true", help="approve/reject every open proposal")
     s.set_defaults(func=cmd_wanted)
+
+    for name, move, help_ in (
+        ("copy", False, "copy files to a node"),
+        ("move", True, "copy files to a node, then mark the source copies for deletion"),
+    ):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("vpaths", nargs="*", help="files or directories (recursive)")
+        s.add_argument("--tag", help="select every file with this tag")
+        s.add_argument("--to", required=True, help="destination node")
+        s.add_argument("--from", dest="src", required=move,
+                       help="source node" + ("" if move else " (default: any current copy)"))
+        s.add_argument("--run", action="store_true", help="run the job right away")
+        s.set_defaults(func=cmd_transfer, move=move)
+
+    s = sub.add_parser("jobs", help="jobs: list, show, run, cancel, retry")
+    s.add_argument("action", nargs="?", default="list",
+                   choices=["list", "show", "run", "cancel", "retry"])
+    s.add_argument("ids", nargs="*", type=int)
+    s.add_argument("--all", action="store_true",
+                   help="list: include finished jobs; show: include done items")
+    s.set_defaults(func=cmd_jobs)
+
+    s = sub.add_parser("marked", help="list copies marked for deletion")
+    s.add_argument("--node")
+    s.set_defaults(func=cmd_marked)
+
+    s = sub.add_parser("unmark", help="remove deletion marks")
+    s.add_argument("vpaths", nargs="*")
+    s.add_argument("--node", help="only on this node")
+    s.add_argument("--all", action="store_true")
+    s.set_defaults(func=cmd_unmark)
 
     s = sub.add_parser("status", help="summary of the index")
     s.set_defaults(func=cmd_status)
@@ -409,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args.func(args)
     except (CliError, ConfigError, nodes.NodeError, decisions.DecisionError,
-            tags.TagError, ValueError) as e:
+            tags.TagError, jobs.JobError, LockError, ValueError) as e:
         print(f"reifs: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

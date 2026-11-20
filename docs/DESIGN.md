@@ -1,6 +1,6 @@
 # rei-fs design
 
-Status: draft for sign-off. Milestone 1 is implemented against this document.
+Status: approved. Milestones 1 (index) and 2 (jobs) are implemented.
 
 ## 1. Goals
 
@@ -176,22 +176,46 @@ skipped.
 
 ### 5.1 Jobs
 
-A job (copy, move, verify, overwrite-stale) is expanded at creation time
-into a list of `(vpath, source node, destination node)` items stored in
-SQLite. Selectors are a vpath, a virtual directory (recursive) or a tag. Each
-item has a state: `pending`, `running`, `done`, `failed`, `skipped`, or
-`conflict`. A failed or interrupted job resumes from its pending items when
-both nodes are reachable again. Retries use backoff.
+A job (copy, move, or a batch of approved wanted jobs) is expanded at
+creation time into items `(op, vpath, source node, destination node)` stored
+in SQLite. Item ops are `copy`, `overwrite` (replace a stale copy) and
+`rename` (within one node). Selectors are a vpath, a virtual directory
+(recursive) or a tag, and can be combined. Without a source node, any online
+node holding the current version is used.
+
+Item states: `pending`, `running`, `done`, `failed`, `skipped`, `conflict`,
+`cancelled`. Progress is committed per item, so a run interrupted by Ctrl-C,
+a crash or an unplugged drive resumes from the pending items. Items left
+`running` by a crash become `pending` again.
+
+* An offline node or a full disk leaves an item pending without using an
+  attempt. The job shows as `waiting`.
+* Transient failures (rsync error, failed verification, source changed
+  during the transfer) use one attempt. After `transfers.max_attempts`
+  attempts the item is `failed` until `reifs jobs retry`.
+* A source that changed since the last scan is re-hashed and indexed before
+  it is sent.
+* A destination already holding the same content is recorded without
+  copying.
+
+Scans and job runs take a per-server lock, so they never overlap.
 
 ### 5.2 Transfers
 
-* rsync copies one file per item (or batches with `--files-from`), using
-  `--partial-dir=.rei-fs/partial` so a large file resumes mid-way, and
-  `--times` to preserve mtime. Permissions and ownership are not preserved.
+* rsync copies batches of items listed with `--files-from` (at most
+  `transfers.batch_files` files or `transfers.batch_mb` MB per batch). It
+  uses `--times` (mtime is the version marker), `--ignore-times` and
+  `--no-whole-file`. Partial files go to `<dst>/.rei-fs/partial` and temp
+  files to `<dst>/.rei-fs/tmp`, so a half-copied large file resumes and
+  nothing is ever left in the user's directories. Permissions and ownership
+  are not preserved.
 * Only the directories required for the destination path are created.
 * After transfer the destination is re-hashed. The item is `done` only if
   the hash matches.
-* Before a job starts, free space on the destination is checked.
+* Before each file, free space on the destination is checked, keeping
+  `transfers.min_free_mb` free.
+* Renames never replace an existing file. They use a hard link plus unlink
+  where supported, otherwise a rename after checking the target is absent.
 * **Destination exists with different content**: the item becomes a
   `conflict` decision (overwrite / skip). Nothing is ever overwritten without
   the user's confirmation, except via an explicit "update stale copies"

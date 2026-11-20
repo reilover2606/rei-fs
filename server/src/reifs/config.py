@@ -25,6 +25,10 @@ DEFAULT_IGNORE = [
 ]
 
 
+SECTIONS = ("server", "storage", "scan", "discovery", "rsync", "transfers")
+PATH_STYLES = ("auto", "native", "cygwin", "msys")
+
+
 class ConfigError(Exception):
     pass
 
@@ -69,6 +73,19 @@ class DiscoverySection:
 @dataclass
 class RsyncSection:
     path: str = "rsync"
+    # How local paths are passed to rsync: "native" (/home/x, also fine for
+    # Termux), "cygwin" (/cygdrive/c/x: cwRsync, Cygwin), "msys" (/c/x: MSYS2).
+    # "auto" = native on Linux, cygwin on Windows.
+    path_style: str = "auto"
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TransfersSection:
+    batch_files: int = 500
+    batch_mb: int = 1024
+    min_free_mb: int = 512
+    max_attempts: int = 5
 
 
 @dataclass
@@ -79,6 +96,7 @@ class Config:
     scan: ScanSection = field(default_factory=ScanSection)
     discovery: DiscoverySection = field(default_factory=DiscoverySection)
     rsync: RsyncSection = field(default_factory=RsyncSection)
+    transfers: TransfersSection = field(default_factory=TransfersSection)
 
     @property
     def config_path(self) -> Path:
@@ -99,7 +117,7 @@ class Config:
         except tomllib.TOMLDecodeError as e:
             raise ConfigError(f"{path}: {e}") from e
         cfg = cls(home=home)
-        for section_name in ("server", "storage", "scan", "discovery", "rsync"):
+        for section_name in SECTIONS:
             section = getattr(cfg, section_name)
             for k, v in data.get(section_name, {}).items():
                 if not hasattr(section, k):
@@ -112,6 +130,8 @@ class Config:
                 if expected is list and not all(isinstance(i, str) for i in v):
                     raise ConfigError(f"{path}: [{section_name}].{k} must be a list of strings")
                 setattr(section, k, v)
+        if cfg.rsync.path_style not in PATH_STYLES:
+            raise ConfigError(f"{path}: [rsync].path_style must be one of {', '.join(PATH_STYLES)}")
         return cfg
 
     def save(self) -> None:
@@ -163,4 +183,16 @@ max_depth = {self.discovery.max_depth}
 
 [rsync]
 path = {s(self.rsync.path)}
+# auto | native | cygwin (/cygdrive/c/..., cwRsync) | msys (/c/..., MSYS2)
+path_style = {s(self.rsync.path_style)}
+extra_args = {lst(self.rsync.extra_args)}
+
+[transfers]
+# Files are sent in batches of at most this many files / megabytes.
+batch_files = {self.transfers.batch_files}
+batch_mb = {self.transfers.batch_mb}
+# Never fill a destination below this much free space.
+min_free_mb = {self.transfers.min_free_mb}
+# Transient failures before an item is marked failed.
+max_attempts = {self.transfers.max_attempts}
 """
