@@ -394,7 +394,7 @@ class _Runner:
 
         result = transfer.run_batch(self.cfg, first.src_root, first.dst_root,
                                     [p.item["vpath"].lstrip("/") for p in batch], on_bytes,
-                                    remote=first.remote)
+                                    remote=first.remote, stop=self.stop)
         error = None
         if result.returncode != 0:
             lines = [ln for ln in result.stderr.splitlines() if ln.strip()]
