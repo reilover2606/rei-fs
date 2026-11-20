@@ -49,10 +49,11 @@ class RsyncDaemon:
             f"secrets file = {rsync_path(self.secrets, style)}",
             f"log file = {rsync_path(self.dir / 'rsyncd.log', style)}",
         ]
-        if hasattr(os, "getuid"):
-            # Serve files as the user running rei-fs (a root daemon would
-            # otherwise switch to "nobody").
-            lines += [f"uid = {os.getuid()}", f"gid = {os.getgid()}"]
+        if hasattr(os, "getuid") and os.getuid() == 0:
+            # A daemon started by root would switch to "nobody"; keep root's
+            # identity so it can read the files. (Setting uid/gid as a normal
+            # user fails: rsync then calls setgroups.)
+            lines += ["uid = 0", "gid = 0"]
         lines.append("")
         auth = ", ".join(u for u, _ in users)
         for r in conn.execute("SELECT id, name, root_path FROM nodes WHERE owner_id = ?"

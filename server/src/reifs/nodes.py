@@ -12,7 +12,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import db, index
+from . import db, index, transfer
 from .config import Config
 
 MARKER_DIR = ".rei-fs"
@@ -263,6 +263,11 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
                 "UPDATE nodes SET online = 1, last_seen = ? WHERE id = ?", (ts, node_id)
             )
             announce = _update_space(conn, row, root) or announce
+            # Path served over SSH (as this machine's rsync names it).
+            ssh_root = transfer.rsync_path(root, cfg.rsync.path_style) if cfg.ssh.enabled else None
+            if ssh_root != row["ssh_root"]:
+                conn.execute("UPDATE nodes SET ssh_root = ? WHERE id = ?", (ssh_root, node_id))
+                announce = True
             if announce:
                 index.log_node(conn, node_id)
             result.online.append(Located(node_id, row["name"], root))

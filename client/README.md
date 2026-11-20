@@ -58,7 +58,7 @@ results, or use `F1`-`F8`.
 
 | Tab | What it shows | Keys |
 |---|---|---|
-| Overview | Copies, activity, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `a` automatic approval on/off, `x` stop |
+| Overview | Copies, activity, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
 | Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move |
 | Search | Find by name/path glob, tag, problems | `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
@@ -66,7 +66,7 @@ results, or use `F1`-`F8`.
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
 | Nodes | Nodes of all servers, foreign drives | `s`/`S` scan, `v` verify, `p` priority, `t` backup target, `o` adopt |
 | Marked | Copies waiting for you to delete them | `u`/`U` keep (unmark) |
-| Servers | This server's fingerprint, paired servers, pairing requests | `p` pair, `a`/`x` accept/reject, `d` unpair, `s` sync now |
+| Servers | This server's fingerprint, paired servers, pairing requests | `p` pair, `a`/`x` accept/reject, `d` unpair, `t` transport (daemon/SSH), `k` SSH key and authorize peers, `s` sync now |
 
 Decisions, Wanted and Jobs show the items of every paired server (marked
 `@server`); actions on them are sent to that server. Copying to another

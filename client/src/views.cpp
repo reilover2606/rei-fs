@@ -62,10 +62,10 @@ Element label_value(const std::string& label, const std::string& value) {
   return label_value(label, paragraph(value));
 }
 
-Element copies_badge(int good) {
-  auto t = text(std::to_string(good) + "x");
-  if (good >= 2) return t | color(Color::Green);
-  if (good == 1) return t | color(Color::Yellow);
+Element copies_badge(int good, int goal) {
+  auto t = text(std::to_string(good) + " / " + std::to_string(goal));
+  if (good >= goal) return t | color(Color::Green);
+  if (good >= 1) return t | color(Color::Yellow);
   return t | color(Color::Red);
 }
 
@@ -86,7 +86,8 @@ std::string file_label(const json& f, int name_width) {
   if (!f.value("issues", json::array()).empty()) flags += " !";
   return fit(f.value("name", f.value("path", "")), name_width) + " " +
          fit(human_size(f.value("size", 0)), 10) + " " +
-         fit(std::to_string(f.value("good_copies", 0)) + "x" + flags, 16);
+         fit(std::to_string(f.value("good_copies", 0)) + "/" + std::to_string(f.value("goal", 2)) +
+                 flags, 16);
 }
 
 // Detail panel for /api/file output.
@@ -97,7 +98,7 @@ Element file_details(const json& f) {
       separator(),
       label_value("size", human_size(f.value("size", 0))),
       label_value("modified", format_time(f.value("mtime", 0))),
-      label_value("good copies", hbox({copies_badge(f.value("good_copies", 0)), text(" / 2")})),
+      label_value("good copies", copies_badge(f.value("good_copies", 0), f.value("goal", 2))),
   };
   if (!f.value("tags", json::array()).empty())
     rows.push_back(label_value("tags", join(f["tags"])));
@@ -225,7 +226,7 @@ class OverviewView : public View {
     if (++polls_ % 5 == 0) refresh();
   }
   std::string help() const override {
-    return "s: scan all  j: run jobs  p: plan backups  a: auto-approve on/off  x: stop";
+    return "s: scan all  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
   }
 
  private:
@@ -241,6 +242,20 @@ class OverviewView : public View {
     if (key(e, "p")) {
       if (ctx_.attempt([&] { ctx_.api->post("/api/replication/plan"); }))
         ctx_.notify("backup planning queued");
+      return true;
+    }
+    if (key(e, "g")) {
+      std::string current = std::to_string(replication_.value("copies", 2));
+      ctx_.dialogs->ask_text("Good copies every file should have (tag-specific goals: "
+                             "[replication] tag_copies in config.toml)",
+                             current, [this](const std::string& value) {
+                               ctx_.attempt([&] {
+                                 int n = std::stoi(value);
+                                 ctx_.api->post("/api/replication", {{"copies", n}});
+                                 ctx_.notify("copy goal set to " + std::to_string(n));
+                               });
+                               refresh();
+                             });
       return true;
     }
     if (key(e, "a")) {
@@ -312,7 +327,10 @@ class OverviewView : public View {
     if (!act.value("last_error", "").empty())
       right.push_back(hbox({text(fit("last error", 26)),
                             paragraph(act.value("last_error", "")) | color(Color::Red)}));
-    Elements backup = {text("Backups (goal: 2 copies of every file)") | bold, separator()};
+    std::string goal = std::to_string(replication_.value("copies", 2)) + " copies of every file";
+    for (auto& [tag, n] : replication_.value("tag_copies", json::object()).items())
+      goal += ", " + n.dump() + " for '" + tag + "'";
+    Elements backup = {text("Backups (goal: " + goal + ")") | bold, separator()};
     bool autom = replication_.value("auto_replicate", false);
     backup.push_back(line("automatic approval", autom ? "on" : "off", Color::Green, autom));
     backup.push_back(line("open proposals", std::to_string(replication_.value("open_proposals", 0)),
@@ -320,10 +338,11 @@ class OverviewView : public View {
     json lp = replication_.value("last_plan", json());
     if (lp.is_object()) {
       backup.push_back(line("last plan", lp.value("finished", "").substr(0, 19)));
-      backup.push_back(line("  single-copy files", std::to_string(lp.value("single_copy", 0)) +
-                                                       " (" + std::to_string(lp.value("responsible", 0)) +
-                                                       " held by this server)"));
-      backup.push_back(line("  proposed", std::to_string(lp.value("proposed", 0))));
+      backup.push_back(line("  files below goal", std::to_string(lp.value("under_replicated",
+                                                                          lp.value("single_copy", 0))) +
+                                                     " (" + std::to_string(lp.value("responsible", 0)) +
+                                                     " planned by this server)"));
+      backup.push_back(line("  copies proposed", std::to_string(lp.value("proposed", 0))));
       if (lp.value("auto_approved", 0) > 0)
         backup.push_back(line("  approved automatically", std::to_string(lp.value("auto_approved", 0))));
       int nodest = lp.value("no_destination", 0);
@@ -1245,7 +1264,7 @@ class ServersView : public View {
   std::string title() const override { return "Servers"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "p: pair with a server  a/x: accept/reject request  d: unpair  s: sync now  r: refresh";
+    return "p: pair  a/x: accept/reject  d: unpair  t: transport daemon/ssh  k: SSH key  s: sync";
   }
   void on_poll() override {
     if (++polls_ % 3 == 0) refresh();
@@ -1275,6 +1294,7 @@ class ServersView : public View {
         std::string state = r.value("online", false) ? "online" : "unreachable";
         labels_.push_back(fit("paired", 13) + fit(r.value("name", ""), 16) +
                           fit(r.value("address", ""), 24) + fit(state, 12) +
+                          fit(r.value("transport", "daemon"), 8) +
                           r.value("last_sync", "").substr(0, 19));
       }
     }
@@ -1296,6 +1316,11 @@ class ServersView : public View {
                                                           kDetailWidth - kLabelWidth - 1))};
     if ((*r)["row"] == "peer") {
       rows.push_back(label_value("state", r->value("online", false) ? "online" : "unreachable"));
+      rows.push_back(label_value("transport",
+                                 std::string(r->value("transport", "daemon") == "ssh"
+                                                 ? "rsync over SSH"
+                                                 : "rsync daemon (LAN/VPN)") +
+                                     (r->value("ssh_offered", false) ? "" : "; no SSH offered")));
       rows.push_back(label_value("last sync", r->value("last_sync", "").substr(0, 19)));
       rows.push_back(label_value("queued calls", std::to_string(r->value("outbox", 0))));
       if (!r->value("last_error", "").empty())
@@ -1337,9 +1362,32 @@ class ServersView : public View {
     });
   }
 
+  void ssh_key_dialog() {
+    std::string key = self_.value("ssh_public_key", "");
+    std::string state = self_.value("ssh_enabled", false)
+                            ? "This server offers SSH to its peers."
+                            : "This server does not offer SSH ([ssh] enabled = false).";
+    ctx_.dialogs->ask_choice(
+        state + "\nIts own key (used to pull from peers over SSH):\n" + key +
+            "\n\nInstall the paired servers' keys into this machine's authorized_keys "
+            "(read-only rsync with rrsync)?",
+        {"Close", "Install the peers' keys"}, [this](int i) {
+          if (i != 1) return;
+          ctx_.attempt([&] {
+            auto out = ctx_.api->post("/api/peers/authorize", {{"apply", true}});
+            std::string msg = "added " + std::to_string(out.value("added", 0)) + " key(s) to " +
+                              out.value("file", "");
+            if (!out.value("restricted", false)) msg += " (rrsync not found: NOT restricted)";
+            if (!out["missing"].empty()) msg += "; no key yet for " + join(out["missing"]);
+            ctx_.notify(msg);
+          });
+        });
+  }
+
   bool on_event(const Event& e) {
     if (key(e, "r")) return refresh(), true;
     if (key(e, "p")) return start_pairing(), true;
+    if (key(e, "k")) return ssh_key_dialog(), true;
     if (key(e, "s")) {
       if (ctx_.attempt([&] { ctx_.api->post("/api/peers/sync"); })) ctx_.notify("syncing");
       return true;
@@ -1364,6 +1412,17 @@ class ServersView : public View {
           ctx_.notify(accept ? "paired with " + row.value("name", "") : "request rejected");
         refresh();
       });
+      return true;
+    }
+    if (key(e, "t") && row["row"] == "peer") {
+      std::string next = row.value("transport", "daemon") == "ssh" ? "daemon" : "ssh";
+      if (ctx_.attempt([&] {
+            ctx_.api->post("/api/peers/" + url_encode(row.value("id", "")) + "/transport",
+                           {{"transport", next}});
+          }))
+        ctx_.notify("files from " + row.value("name", "") + " now come over " +
+                    (next == "ssh" ? "SSH" : "its rsync daemon"));
+      refresh();
       return true;
     }
     if (key(e, "d") && row["row"] == "peer") {

@@ -70,6 +70,7 @@ static Component escape_closes(Component c, std::function<void()> close) {
 void Dialogs::ask_text(const std::string& title, const std::string& initial,
                        std::function<void(const std::string&)> on_ok) {
   text_ = initial;
+  cursor_ = static_cast<int>(initial.size());  // edit from the end of the text
   auto ok = [this, on_ok] {
     std::string value = text_;
     finish([on_ok, value] { on_ok(value); });
@@ -77,6 +78,7 @@ void Dialogs::ask_text(const std::string& title, const std::string& initial,
   InputOption opt;
   opt.multiline = false;
   opt.on_enter = ok;
+  opt.cursor_position = &cursor_;
   auto input = Input(&text_, "", opt);
   auto buttons = Container::Horizontal({
       Button("OK", ok, ButtonOption::Ascii()),

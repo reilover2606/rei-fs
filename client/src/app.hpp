@@ -35,6 +35,7 @@ class Dialogs {
   bool shown_ = false;
   ftxui::Component holder_;
   std::string text_;
+  int cursor_ = 0;
   std::vector<std::string> options_;
   int choice_ = 0;
 };

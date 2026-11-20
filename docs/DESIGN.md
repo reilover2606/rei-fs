@@ -1,7 +1,8 @@
 # rei-fs design
 
 Status: approved. All five milestones are implemented: index, jobs, API and
-client, pairing and sync, replication.
+client, pairing and sync, replication. Also implemented: a configurable copy
+goal, rsync over SSH, and CI on Linux and Windows.
 
 ## 1. Goals
 
@@ -221,11 +222,9 @@ Scans and job runs take a per-server lock, so they never overlap.
   `conflict` decision (overwrite / skip). Nothing is ever overwritten without
   the user's confirmation, except via an explicit "update stale copies"
   decision.
-* Server-to-server: the destination's owner pulls from the source server's
-  read-only rsync daemon (section 7.3). Credentials are generated at
-  pairing. The rsync protocol is not encrypted, so this is intended for a
-  LAN or a VPN (e.g. WireGuard, Tailscale). rsync over SSH may be added
-  later as an option.
+* Server-to-server: the destination's owner pulls from the source server,
+  either from its read-only rsync daemon (unencrypted; for a LAN or a VPN
+  such as WireGuard or Tailscale) or over SSH (section 7.3).
 * On Windows the rsync binary (cwRsync, MSYS2, ...) is set in the config.
   rei-fs translates paths to the `/cygdrive/c/...` form as needed.
 
@@ -246,13 +245,21 @@ there.
 
 ## 6. Replication (milestone 5)
 
-**Satisfied files.** A file is *satisfied* when at least two nodes hold a
-copy of its current version that is not marked for deletion. Those nodes
-can be online or offline.
+**Copy goal.** Every file should have `[replication] copies` good copies
+(default 2). Files carrying a tag listed in `[replication] tag_copies`, for
+example `{ "important" = 3 }`, have that goal instead when it is higher.
+Set the goal with `reifs replication copies N [--tag T]`, from the client
+(`g` on the Overview tab), or in `config.toml`. Each server applies its own
+configuration, so set the same goal on every server.
 
-**Who proposes.** For a file with a single good copy, **the server owning
-that copy** proposes the second one. It is the only server able to serve as
-the source, and exactly one server is responsible, so paired servers never
+**Satisfied files.** A file is *satisfied* when it has as many good copies
+as its goal. A good copy is a copy of the current version that is not
+marked for deletion, on any node, online or offline.
+
+**Who proposes.** For a file below its goal, **the server owning its good
+copy with the lowest node id** proposes the missing copies, one proposal per
+missing copy, each to a different node. That server can serve as the
+source, and the choice is the same everywhere, so paired servers never
 propose duplicates. Files whose only current copies are marked for deletion
 are being deleted and are left alone.
 
@@ -261,7 +268,7 @@ its paired servers. It skips a node if any of these apply:
 
 * the node is not a backup target;
 * it already holds some version of the file (stale versions are handled by
-  `divergent` decisions);
+  `divergent` decisions), or has a pending proposal for it;
 * it cannot hold the name (restricted names, case clash);
 * it lacks the space: its announced free space, minus what pending
   proposals will use, must stay above `transfers.min_free_mb`;
@@ -273,7 +280,8 @@ changes by more than 1 % of the disk or 256 MiB.
 
 **Proposals.** A proposal is a wanted job with reason `replicate`:
 
-* It becomes `done` when the file is satisfied.
+* It becomes `done` when the file is satisfied, or when its destination
+  holds a good copy.
 * A **rejected** proposal is not made again until the file's content
   changes.
 * Approving a proposal whose destination is on another server creates the
@@ -286,8 +294,8 @@ request.
 
 **Report.** The last plan is stored. It records:
 
-* the number of single-copy files, and how many this server is responsible
-  for;
+* the number of files below their goal, and how many this server is
+  responsible for;
 * how many proposals were made, were already pending, or were declined
   earlier;
 * why the rest have no possible destination, with examples.
@@ -383,6 +391,21 @@ It is shown by `reifs replication` and on the client's Overview tab.
   * **read-only**, with every delete option refused, so no server can write
     or delete through it;
   * its configuration is rewritten when nodes or pairings change.
+* **rsync over SSH** (encrypted, for servers not on the same LAN or VPN):
+  * A server offers it with `[ssh] enabled` (plus `host`, `port`, `user`).
+    Its nodes then announce the path they are served under. Peers learn
+    the offer and the server's public key during sync
+    (`GET /api/peer/info`).
+  * Each server has its own Ed25519 key in `<home>/ssh/`. The pulling
+    server pins host keys on first use in `<home>/ssh/known_hosts`.
+  * On the offering machine, `reifs ssh authorize --apply` (or `k` in the
+    client's Servers tab) adds the paired servers' keys to
+    `~/.ssh/authorized_keys`. If `rrsync` is installed (it comes with
+    rsync), each key is restricted to
+    `restrict,command="rrsync -ro /"`: read-only rsync and nothing else,
+    like the daemon.
+  * The transport is chosen per paired server on the pulling side:
+    `reifs peer transport NAME ssh|daemon` or `t` in the Servers tab.
 * A source is usable if it is attached locally, or if its node is online on
   a paired server that answered the last sync. A transfer therefore needs
   the destination's server to be paired with a server that holds the file.
@@ -441,7 +464,9 @@ Endpoints (all JSON, under `/api`):
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
 | `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |
 | `GET marked?node=`, `POST unmark {paths, node, all}` | Deletion marks |
-| `GET replication`, `POST replication {auto_replicate}`, `POST replication/plan` | Two-copy goal |
+| `GET replication`, `POST replication {copies, tag_copies, auto_replicate}`, `POST replication/plan` | Copy goal |
+| `POST peers/<id>/transport {transport}`, `POST peers/authorize {apply}` | rsync over SSH (client only) |
+| `GET peer/info` | Server to server: SSH offer and public key |
 | `POST nodes/<name>/adopt` | Adopt another server's drive attached here |
 | `GET peers`, `POST peers/probe`, `POST peers/pair` | Pairing (client only) |
 | `POST peers/requests/<id>/accept\|reject`, `POST peers/<id>/unpair`, `POST peers/sync` | Pairing (client only) |
@@ -493,6 +518,17 @@ max_depth = 3
 [rsync]
 path = "rsync"
 daemon_port = 7421            # read-only rsync daemon for paired servers
+
+[replication]
+copies = 2                    # good copies every file should have
+tag_copies = {}               # e.g. { "important" = 3 }
+
+[ssh]
+enabled = false               # let paired servers pull over SSH
+host = ""                     # "" = our address as peers know it
+port = 22
+user = ""                     # "" = the user running rei-fs
+command = "ssh"               # ssh client used to pull from peers
 ```
 
 ## 10. Milestones

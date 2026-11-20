@@ -2,7 +2,7 @@
 
 Python server for rei-fs. See [../docs/DESIGN.md](../docs/DESIGN.md).
 
-Requires Python 3.11+ and no third-party packages at runtime. Transfers need
+Requires Python 3.11+ and the `cryptography` package. Transfers need
 rsync 3.1+ (on Windows: cwRsync or MSYS2, set `[rsync] path` and `path_style`).
 
 ```bash
@@ -20,7 +20,13 @@ fingerprint (also shown by `reifs fingerprint`). It also scans every
 jobs in the background. When servers are paired, `serve` also syncs metadata with them and runs a
 read-only rsync daemon on `[rsync] daemon_port` (default 7421) from which
 paired servers pull files. Open both ports between your servers (LAN or
-VPN). Certificates are made with the `cryptography`
+VPN). For servers not on the same network, use rsync over SSH instead:
+
+1. On the server that serves the files, set `[ssh] enabled = true`.
+2. Once the servers have synced, run `reifs ssh authorize --apply` there.
+3. On the server that pulls, run `reifs peer transport NAME ssh`.
+
+Only that server's SSH port then needs to be reachable. Certificates are made with the `cryptography`
 package. On Termux, install it with `pkg install python-cryptography` (or
 have the `openssl` command available).
 
@@ -47,7 +53,9 @@ Run the tests with `uv run pytest`.
 | `reifs wanted [list\|approve\|reject] [ID...\|--all]` | Proposed jobs from decisions |
 | `reifs marked [--node N]` / `reifs unmark VPATH... \| --all` | Copies marked for deletion |
 | `reifs status` | Summary: copies, divergent, missing, non-portable... |
-| `reifs replication [plan\|auto on\|auto off]` | Two-copy report; propose second copies; automatic approval |
+| `reifs replication [plan\|copies N [--tag T]\|auto on\|auto off]` | Copy-goal report; propose missing copies; set the goal; automatic approval |
+| `reifs peer transport NAME daemon\|ssh` | Pull from that server with its rsync daemon or over SSH |
+| `reifs ssh key` / `reifs ssh authorize [--apply]` | This server's SSH key; authorize paired servers (read-only via rrsync) |
 | `reifs serve [--listen HOST:PORT]` | Run the API for the client, the background worker and sync |
 | `reifs peer pair HOST[:PORT]` | Ask another server to pair (shows its fingerprint first) |
 | `reifs peer [list\|accept ID\|reject ID\|remove NAME\|sync]` | Pairing requests and paired servers |

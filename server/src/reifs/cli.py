@@ -61,7 +61,7 @@ def copies_badge(info: queries.FileInfo) -> str:
         flags += " del"
     if info.issues:
         flags += " !" + ",".join(sorted(info.issues))
-    return f"{good}x{flags}"
+    return f"{good}/{info.goal}{flags}"
 
 
 # --- commands -----------------------------------------------------------------
@@ -188,8 +188,8 @@ def cmd_scan(args) -> None:
 
 
 def cmd_ls(args) -> None:
-    _, conn = open_server(args.home)
-    entries = queries.list_dir(conn, args.vdir)
+    cfg, conn = open_server(args.home)
+    entries = queries.list_dir(conn, args.vdir, replication.policy(cfg))
     if entries is None:
         info = queries.lookup(conn, args.vdir)
         if info is None:
@@ -211,12 +211,12 @@ def cmd_ls(args) -> None:
 
 
 def cmd_where(args) -> None:
-    _, conn = open_server(args.home)
-    info = queries.lookup(conn, args.vpath)
+    cfg, conn = open_server(args.home)
+    info = queries.lookup(conn, args.vpath, replication.policy(cfg))
     if info is None:
         raise CliError(f"not a file in the virtual tree: {args.vpath}")
     print(info.vpath)
-    print(f"  good copies: {info.good_copies}/{queries.REPLICATION_TARGET}")
+    print(f"  good copies: {info.good_copies}/{info.goal}")
     if info.tags:
         print(f"  tags: {', '.join(info.tags)}")
     if info.issues:
@@ -234,9 +234,10 @@ def cmd_where(args) -> None:
 
 
 def cmd_find(args) -> None:
-    _, conn = open_server(args.home)
+    cfg, conn = open_server(args.home)
     results = queries.find(conn, args.pattern, tag=args.tag, node=args.node,
-                           issues_only=args.issues, under_replicated=args.under)
+                           issues_only=args.issues, under_replicated=args.under,
+                           policy=replication.policy(cfg))
     rows = [[f.vpath, human_size(f.size), copies_badge(f),
              ",".join(c.node_name for c in f.copies if c.state == "present"),
              " ".join(f.tags)] for f in results]
@@ -540,6 +541,18 @@ def cmd_peer(args) -> None:
         peers.unpair(conn, row["id"])
         print(f"Unpaired from {row['name']!r}.")
         return
+    if args.action == "transport":
+        row = peers.find_peer(conn, args.target or "")
+        if args.value not in ("daemon", "ssh"):
+            raise CliError("use 'reifs peer transport NAME daemon|ssh'")
+        if args.value == "ssh" and not row["ssh_enabled"]:
+            raise CliError(f"{row['name']} does not offer SSH: set [ssh] enabled = true there "
+                           "(and sync)")
+        with db.transaction(conn):
+            conn.execute("UPDATE servers SET transport = ? WHERE id = ?", (args.value, row["id"]))
+        print(f"Files from {row['name']} are now pulled over "
+              f"{'SSH' if args.value == 'ssh' else 'its rsync daemon'}.")
+        return
     if args.action == "sync":
         from .service import sync_peer
 
@@ -552,8 +565,10 @@ def cmd_peer(args) -> None:
             print(f"{p['name']}: {n} change(s) applied ({state})")
         return
     rows = [[p["name"], p["address"], "online" if p["online"] else "offline",
+             p["transport"] + ("" if p["transport"] == "ssh" or not p["ssh_enabled"]
+                               else " (ssh offered)"),
              (p["last_sync"] or "")[:19], p["last_error"] or ""] for p in peers.paired_peers(conn)]
-    print(table(rows, ["SERVER", "ADDRESS", "STATE", "LAST SYNC", "LAST ERROR"])
+    print(table(rows, ["SERVER", "ADDRESS", "STATE", "TRANSPORT", "LAST SYNC", "LAST ERROR"])
           if rows else "Not paired with any server.")
     reqs = conn.execute("SELECT * FROM pair_requests WHERE status = 'pending' ORDER BY id"
                         ).fetchall()
@@ -563,6 +578,35 @@ def cmd_peer(args) -> None:
                       r["name"], r["address"], r["fingerprint"][:23] + "..."] for r in reqs],
                     ["ID", "DIRECTION", "SERVER", "ADDRESS", "FINGERPRINT"]))
         print("Accept an incoming request with 'reifs peer accept ID'.")
+
+
+def cmd_ssh(args) -> None:
+    from . import ssh
+
+    cfg, conn = open_server(args.home)
+    if args.action == "key":
+        print(ssh.ensure_key(cfg.home, cfg.server.name))
+        return
+    lines, rrsync, missing = ssh.authorize_lines(conn)
+    if not cfg.ssh.enabled:
+        print("note: [ssh] enabled is false in config.toml, so peers will not pull over SSH "
+              "from this server until you enable it.")
+    if missing:
+        print(f"no SSH key known yet for: {', '.join(missing)} (they appear after a sync)")
+    if not lines:
+        print("Nothing to authorize.")
+        return
+    if not rrsync:
+        print("warning: 'rrsync' was not found, so these keys are NOT restricted to read-only "
+              "rsync (install it, it comes with rsync, then run this again).")
+    if args.apply:
+        path, added = ssh.install(lines, Path(args.file) if args.file else None)
+        print(f"Added {added} key(s) to {path}.")
+    else:
+        print("Add these lines to ~/.ssh/authorized_keys of the account in [ssh] user "
+              "(or run 'reifs ssh authorize --apply'):")
+        for line in lines:
+            print(line)
 
 
 def cmd_node_adopt(args) -> None:
@@ -578,31 +622,47 @@ def cmd_replication(args) -> None:
             raise CliError("use 'reifs replication auto on' or 'auto off'")
         cfg.server.auto_replicate = args.value == "on"
         cfg.save()
-        print(f"Automatic replication is {args.value}"
-              + (" (applies the next time 'reifs serve' plans; restart it if running)."
-                 if args.value == "on" else "."))
+        print(f"Automatic approval is {args.value} (a running 'reifs serve' picks it up when "
+              "restarted; the client changes it live).")
+        return
+    if args.action == "copies":
+        if not args.value or not args.value.isdigit() or int(args.value) < 1:
+            raise CliError("use 'reifs replication copies N' (N >= 1), optionally --tag T")
+        n = int(args.value)
+        if args.tag:
+            cfg.replication.tag_copies[args.tag] = n
+            what = f"files tagged {args.tag!r}"
+        else:
+            cfg.replication.copies = n
+            what = "every file"
+        cfg.save()
+        print(f"Goal: {n} good copies of {what}.")
         return
     if args.action == "plan":
         report, approved = replication.cycle(conn, cfg)
     else:
         raw = replication.last_plan(conn)
-        report = replication.PlanReport(**raw) if raw else None
+        fields = replication.PlanReport.__dataclass_fields__
+        report = replication.PlanReport(**{k: v for k, v in raw.items() if k in fields}) \
+            if raw else None
         approved = None
-    s = queries.status(conn)
-    print(f"goal: every file on at least {replication.TARGET} nodes; "
-          f"automatic approval {'on' if cfg.server.auto_replicate else 'off'}")
+    pol = replication.policy(cfg)
+    s = queries.status(conn, pol)
+    extra = ", ".join(f"{t}: {n}" for t, n in pol.tag_copies)
+    print(f"goal: {pol.copies} good copies per file" + (f" ({extra})" if extra else "")
+          + f"; automatic approval {'on' if cfg.server.auto_replicate else 'off'}")
     print(f"  satisfied:        {s.satisfied}")
     print(f"  under-replicated: {s.under_replicated}")
     if report is None:
         print("No plan yet: run 'reifs replication plan'.")
         return
     print(f"last plan ({report.finished[:19]}):")
-    print(f"  files with a single copy:       {report.single_copy}"
-          f" ({report.responsible} on this server's nodes; others are planned by their server)")
-    print(f"  proposed now:                   {report.proposed}")
-    print(f"  already proposed / approved:    {report.already_proposed}")
+    print(f"  files below their goal:         {report.under_replicated}"
+          f" ({report.responsible} planned by this server; others by the server holding them)")
+    print(f"  copies proposed now:            {report.proposed}")
+    print(f"  files already fully proposed:   {report.already_proposed}")
     print(f"  declined earlier:               {report.declined}")
-    print(f"  no possible destination:        {report.no_destination}")
+    print(f"  files lacking a destination:    {report.no_destination}")
     for reason, n in sorted(report.reasons.items(), key=lambda x: -x[1]):
         print(f"      {n:6}  {reason}")
     for vpath, reason in report.examples[:args.examples]:
@@ -615,7 +675,7 @@ def cmd_replication(args) -> None:
 
 def cmd_status(args) -> None:
     cfg, conn = open_server(args.home)
-    s = queries.status(conn)
+    s = queries.status(conn, replication.policy(cfg))
     online = conn.execute("SELECT COUNT(*) FROM nodes WHERE online = 1").fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
     print(f"server {cfg.server.name!r}  ({cfg.home})")
@@ -625,7 +685,7 @@ def cmd_status(args) -> None:
     if paired[0]:
         print(f"  paired servers:   {paired[1]}/{paired[0]} reachable")
     print(f"  files:            {s.files} ({human_size(s.bytes)})")
-    print(f"  with >= 2 copies: {s.satisfied}")
+    print(f"  enough copies:    {s.satisfied} (goal {cfg.replication.copies})")
     print(f"  under-replicated: {s.under_replicated} ({s.single_copy} with a single good copy)")
     print(f"  divergent:        {s.divergent}")
     print(f"  missing copies:   {s.missing_copies}")
@@ -676,10 +736,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("peer", help="other servers: list, pair, accept, reject, remove, sync")
     s.add_argument("action", nargs="?", default="list",
-                   choices=["list", "pair", "accept", "reject", "remove", "sync"])
+                   choices=["list", "pair", "accept", "reject", "remove", "sync", "transport"])
     s.add_argument("target", nargs="?", help="address (pair), request id, or server name")
+    s.add_argument("value", nargs="?", help="daemon|ssh (with transport)")
     s.add_argument("-y", "--yes", action="store_true", help="pair without asking")
     s.set_defaults(func=cmd_peer)
+
+    s = sub.add_parser("ssh", help="rsync over SSH: show this server's key, authorize peers")
+    s.add_argument("action", choices=["key", "authorize"])
+    s.add_argument("--apply", action="store_true", help="append to authorized_keys")
+    s.add_argument("--file", help="authorized_keys file (default ~/.ssh/authorized_keys)")
+    s.set_defaults(func=cmd_ssh)
 
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)
@@ -774,9 +841,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("fingerprint", help="show the TLS certificate fingerprint")
     s.set_defaults(func=cmd_fingerprint)
 
-    s = sub.add_parser("replication", help="the two-copy goal: report, plan, auto on|off")
-    s.add_argument("action", nargs="?", default="report", choices=["report", "plan", "auto"])
-    s.add_argument("value", nargs="?", help="on|off (with auto)")
+    s = sub.add_parser("replication",
+                       help="copy goal: report, plan, copies N [--tag T], auto on|off")
+    s.add_argument("action", nargs="?", default="report",
+                   choices=["report", "plan", "auto", "copies"])
+    s.add_argument("value", nargs="?", help="on|off (auto) or a number (copies)")
+    s.add_argument("--tag", help="with copies: goal for files carrying this tag")
     s.add_argument("--examples", type=int, default=10)
     s.set_defaults(func=cmd_replication)
 

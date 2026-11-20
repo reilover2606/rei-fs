@@ -1,3 +1,4 @@
+import sys
 import json
 
 import pytest
@@ -57,6 +58,7 @@ def test_free_space_breaks_ties_and_excludes(three):
     assert "free space" in next(iter(report.reasons))
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason='Windows cannot create such names')
 def test_targets_and_legal_names(three):
     set_node(three, "ssd", replication_target=0)
     write(three.root / "odd?.txt", "q")
@@ -143,11 +145,69 @@ def test_cli_report(three, capsys):
     cfg.save()
     assert cli.main(base + ["replication", "plan"]) == 0
     out = capsys.readouterr().out
-    assert "proposed now:                   2" in out
+    assert "copies proposed now:            2" in out
     assert cli.main(base + ["wanted", "approve", "--all"]) == 0
     assert "2 item(s)" in capsys.readouterr().out
     assert cli.main(base + ["replication", "auto", "on"]) == 0
     assert Config.load(three.cfg.home).server.auto_replicate
+
+
+def test_goal_of_three_proposes_two_distinct_nodes(three):
+    three.cfg.replication.copies = 3
+    replication.plan(three.conn, three.cfg)
+    by_file = {}
+    for w in wanted(three):
+        by_file.setdefault(w["file_id"], set()).add(w["dst"])
+    assert all(d == {"ssd", "usb"} for d in by_file.values()) and len(by_file) == 2
+    assert queries.status(three.conn, replication.policy(three.cfg)).under_replicated == 2
+
+
+def test_goal_after_partial_progress(three):
+    three.cfg.replication.copies = 3
+    replication.plan(three.conn, three.cfg)
+    replication.approve(three.conn, None)
+    runner.run_jobs(three.conn, three.cfg)
+    pol = replication.policy(three.cfg)
+    assert queries.lookup(three.conn, "/a.txt", pol).good_copies == 3
+    assert queries.status(three.conn, pol).under_replicated == 0
+    # A fourth node and a higher goal: one more copy each, nothing duplicated.
+    three.add_node("nas")
+    three.cfg.replication.copies = 4
+    report = replication.plan(three.conn, three.cfg)
+    assert report.proposed == 2 and {w["dst"] for w in wanted(three)} == {"nas"}
+
+
+def test_tag_goal(three):
+    three.cfg.replication.copies = 1
+    assert replication.plan(three.conn, three.cfg).proposed == 0
+    tags.set_tag(three.conn, tags.resolve_targets(three.conn, "/a.txt", False), "important",
+                 True, three.server_id)
+    three.cfg.replication.tag_copies = {"important": 3}
+    report = replication.plan(three.conn, three.cfg)
+    assert report.proposed == 2
+    assert {queries.file_info(three.conn, w["file_id"]).vpath for w in wanted(three)} == {"/a.txt"}
+    info = queries.lookup(three.conn, "/a.txt", replication.policy(three.cfg))
+    assert info.goal == 3
+
+
+def test_not_enough_nodes_for_goal(three):
+    three.cfg.replication.copies = 5
+    report = replication.plan(three.conn, three.cfg)
+    assert report.proposed == 4 and report.no_destination == 2
+    assert report.reasons == {"there are not enough nodes": 2}
+
+
+def test_goal_config_roundtrip(tmp_path):
+    cfg = Config(home=tmp_path)
+    cfg.replication.copies = 3
+    cfg.replication.tag_copies = {"important": 4, "with space": 2}
+    cfg.save()
+    loaded = Config.load(tmp_path)
+    assert loaded.replication.copies == 3
+    assert loaded.replication.tag_copies == {"important": 4, "with space": 2}
+    (tmp_path / "config.toml").write_text("[replication]\ncopies = 0\n")
+    with pytest.raises(Exception):
+        Config.load(tmp_path)
 
 
 # --- several servers -------------------------------------------------------------
@@ -162,7 +222,7 @@ def test_only_the_holder_plans(cluster):  # noqa: F811
     rb = replication.plan(b.conn, b.cfg)
     assert (rb.single_copy, rb.responsible, rb.proposed) == (1, 0, 0)
     ra = replication.plan(a.conn, a.cfg)
-    assert ra.reasons == {"there is no other node": 1}  # alpha does not know beta's node yet
+    assert ra.reasons == {"there are not enough nodes": 1}  # alpha does not know beta's node yet
     a.sync(b)
     ra = replication.plan(a.conn, a.cfg)
     assert ra.proposed == 1

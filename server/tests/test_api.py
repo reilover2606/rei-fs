@@ -1,6 +1,7 @@
 import hashlib
 import json
 import shutil
+import sys
 import ssl
 import threading
 import time
@@ -8,6 +9,8 @@ import urllib.error
 import urllib.request
 
 import pytest
+
+ODD_NAME = "b.txt" if sys.platform == "win32" else "b?.txt"
 
 from reifs import api, auth, tls
 from reifs.service import Worker
@@ -51,7 +54,8 @@ def server(env):
     _, ssd = env.add_node("ssd")
     env.ssd = ssd
     write(env.root / "docs" / "a.txt", "alpha", mtime=1_000_000)
-    write(env.root / "docs" / "b?.txt", "beta", mtime=1_000_000)
+    # Windows cannot create such names; elsewhere they are flagged non-portable.
+    write(env.root / "docs" / ODD_NAME, "beta", mtime=1_000_000)
     write(env.root / "top.txt", "top", mtime=1_000_000)
     env.scan()
     worker = Worker(env.cfg)
@@ -112,12 +116,14 @@ def test_browse(server):
     assert [(e["name"], e["dir"]) for e in root["entries"]] == [("docs", True), ("top.txt", False)]
     docs = client.get("/api/tree?path=/docs")
     names = {e["name"]: e for e in docs["entries"]}
-    assert names["b?.txt"]["issues"] == ["chars"]
+    if sys.platform != "win32":
+        assert names[ODD_NAME]["issues"] == ["chars"]
     client.get("/api/tree?path=/nope", expect=404)
     f = client.get("/api/file?path=" + urllib.request.quote("/docs/a.txt"))
     assert f["good_copies"] == 1 and f["copies"][0]["node"] == "srv"
     found = client.get("/api/find?q=*.txt&issues=1")
-    assert [x["path"] for x in found["files"]] == ["/docs/b?.txt"]
+    expected = [] if sys.platform == "win32" else ["/docs/b?.txt"]
+    assert [x["path"] for x in found["files"]] == expected
     nodes = client.get("/api/nodes")["nodes"]
     assert {n["name"] for n in nodes} == {"srv", "ssd"}
     client.post("/api/nodes/ssd", {"priority": 5})
@@ -199,3 +205,25 @@ def test_unknown_endpoint(server):
     _, client, _ = server
     login(client)
     client.get("/api/nope", expect=404)
+
+
+def test_worker_scans_at_start_even_soon_after_boot(env, monkeypatch):
+    """The first periodic scan must not wait for 'interval' after boot."""
+    import time as _time
+
+    from reifs import service
+
+    write(env.root / "boot.txt", "x")
+    env.cfg.scan.interval_minutes = 60
+    monkeypatch.setattr(service.time, "monotonic", lambda: 5.0)  # booted 5 s ago
+    worker = Worker(env.cfg)
+    worker.start()
+    try:
+        deadline = _time.time() + 15
+        while _time.time() < deadline:
+            if env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]:
+                break
+            _time.sleep(0.2)
+        assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+    finally:
+        worker.close()

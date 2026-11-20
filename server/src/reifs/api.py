@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries,
-               replication, sync, tags, tls)
+               replication, ssh, sync, tags, tls)
 from .config import Config
 from .paths import to_physical
 from .service import Syncer, Worker
@@ -68,6 +68,7 @@ def file_json(info: queries.FileInfo, full: bool = True) -> dict:
         "size": info.size,
         "mtime": _secs(cur.mtime_ns) if cur else 0,
         "good_copies": info.good_copies,
+        "goal": info.goal,
         "tags": info.tags,
         "issues": sorted(info.issues),
         "flags": flags,
@@ -168,12 +169,15 @@ class Api:
         r("POST", r"/api/peers/requests/(?P<id>\d+)/(?P<action>accept|reject)",
           self.pair_request_action, "client")
         r("POST", r"/api/peers/(?P<peer>[^/]+)/unpair", self.unpair_peer, "client")
+        r("POST", r"/api/peers/(?P<peer>[^/]+)/transport", self.set_transport, "client")
+        r("POST", r"/api/peers/authorize", self.ssh_authorize, "client")
         # server-to-server
         r("GET", r"/api/peer/hello", self.peer_hello, "public")
         r("POST", r"/api/peer/pair-request", self.peer_pair_request, "public")
         r("POST", r"/api/peer/pair-confirm", self.peer_pair_confirm, "public")
         r("POST", r"/api/peer/pair-reject", self.peer_pair_reject, "public")
         r("GET", r"/api/peer/changes", self.peer_changes, "peer")
+        r("GET", r"/api/peer/info", self.peer_info, "peer")
         r("POST", r"/api/peer/mark", self.peer_mark, "peer")
         r("POST", r"/api/peer/wanted", self.peer_wanted, "peer")
         r("POST", r"/api/peer/poke", self.peer_poke, "peer")
@@ -222,7 +226,7 @@ class Api:
     # --- status and nodes -----------------------------------------------------------
 
     def status(self, conn, q, body, **_):
-        s = queries.status(conn)
+        s = queries.status(conn, replication.policy(self.cfg))
         online, total = conn.execute(
             "SELECT COALESCE(SUM(online), 0), COUNT(*) FROM nodes").fetchone()
         return {
@@ -332,7 +336,7 @@ class Api:
 
     def tree(self, conn, q, body, **_):
         vdir = paths.normalize(q.get("path", "/"))
-        entries = queries.list_dir(conn, vdir)
+        entries = queries.list_dir(conn, vdir, replication.policy(self.cfg))
         if entries is None:
             raise ApiError(404, f"not a directory in the virtual tree: {vdir}")
         out = []
@@ -346,7 +350,7 @@ class Api:
         return {"path": vdir, "entries": out}
 
     def file(self, conn, q, body, **_):
-        info = queries.lookup(conn, q.get("path", ""))
+        info = queries.lookup(conn, q.get("path", ""), replication.policy(self.cfg))
         if info is None:
             raise ApiError(404, f"not a file in the virtual tree: {q.get('path')}")
         return file_json(info)
@@ -355,7 +359,8 @@ class Api:
         limit = min(int(q.get("limit", FIND_LIMIT)), FIND_LIMIT)
         results = queries.find(conn, q.get("q") or None, tag=q.get("tag") or None,
                                node=q.get("node") or None, issues_only=q.get("issues") == "1",
-                               under_replicated=q.get("under") == "1")
+                               under_replicated=q.get("under") == "1",
+                               policy=replication.policy(self.cfg))
         return {"total": len(results), "truncated": len(results) > limit,
                 "files": [file_json(f, full=False) for f in results[:limit]]}
 
@@ -483,8 +488,10 @@ class Api:
     # --- replication ----------------------------------------------------------------
 
     def replication_status(self, conn, q, body, **_):
-        s = queries.status(conn)
-        return {"target": replication.TARGET, "auto_replicate": self.cfg.server.auto_replicate,
+        s = queries.status(conn, replication.policy(self.cfg))
+        return {"copies": self.cfg.replication.copies,
+                "tag_copies": self.cfg.replication.tag_copies,
+                "auto_replicate": self.cfg.server.auto_replicate,
                 "satisfied": s.satisfied, "under_replicated": s.under_replicated,
                 "single_copy": s.single_copy,
                 "open_proposals": conn.execute(
@@ -493,12 +500,25 @@ class Api:
                 "last_plan": replication.last_plan(conn)}
 
     def replication_settings(self, conn, q, body, **_):
+        if "copies" in body:
+            n = int(body["copies"])
+            if n < 1:
+                raise ApiError(400, "copies must be at least 1")
+            self.cfg.replication.copies = n
+        if "tag_copies" in body:
+            tc = body["tag_copies"]
+            if not isinstance(tc, dict) or not all(
+                    isinstance(k, str) and isinstance(v, int) and v >= 1 for k, v in tc.items()):
+                raise ApiError(400, "tag_copies must map tags to numbers >= 1")
+            self.cfg.replication.tag_copies = dict(tc)
         if "auto_replicate" in body:
             self.cfg.server.auto_replicate = bool(body["auto_replicate"])
-            self.cfg.save()
-            if self.cfg.server.auto_replicate and self.worker:
-                self.worker.request_plan()
-        return {"auto_replicate": self.cfg.server.auto_replicate}
+        self.cfg.save()
+        if self.worker:
+            self.worker.request_plan()
+        return {"auto_replicate": self.cfg.server.auto_replicate,
+                "copies": self.cfg.replication.copies,
+                "tag_copies": self.cfg.replication.tag_copies}
 
     def replication_plan(self, conn, q, body, **_):
         self._need_worker().request_plan()
@@ -557,10 +577,13 @@ class Api:
                             " ORDER BY id").fetchall()
         return {
             "self": {"id": nodes.self_id(conn), "name": self.cfg.server.name,
-                     "fingerprint": peers.my_fingerprint(self.cfg)},
+                     "fingerprint": peers.my_fingerprint(self.cfg),
+                     "ssh_enabled": self.cfg.ssh.enabled,
+                     "ssh_public_key": ssh.ensure_key(self.cfg.home, self.cfg.server.name)},
             "peers": [{"id": r["id"], "name": r["name"], "address": r["address"],
                        "online": bool(r["online"]), "last_sync": r["last_sync"] or "",
                        "last_error": r["last_error"] or "", "fingerprint": r["fingerprint"],
+                       "transport": r["transport"], "ssh_offered": bool(r["ssh_enabled"]),
                        "outbox": conn.execute("SELECT COUNT(*) FROM outbox WHERE server_id = ?",
                                               (r["id"],)).fetchone()[0]}
                       for r in rows],
@@ -597,6 +620,25 @@ class Api:
             self.syncer.request_daemon_update()
         return {"ok": True}
 
+    def set_transport(self, conn, q, body, peer, **_):
+        row = peers.find_peer(conn, unquote(peer))
+        transport = body.get("transport")
+        if transport not in ("daemon", "ssh"):
+            raise ApiError(400, "transport must be 'daemon' or 'ssh'")
+        if transport == "ssh" and not row["ssh_enabled"]:
+            raise ApiError(409, f"{row['name']} does not offer SSH ([ssh] enabled there)")
+        with db.transaction(conn):
+            conn.execute("UPDATE servers SET transport = ? WHERE id = ?", (transport, row["id"]))
+        return {"ok": True, "transport": transport}
+
+    def ssh_authorize(self, conn, q, body, **_):
+        lines, rrsync, missing = ssh.authorize_lines(conn)
+        out = {"lines": lines, "restricted": bool(rrsync), "missing": missing}
+        if body.get("apply"):
+            path, added = ssh.install(lines)
+            out.update(file=str(path), added=added)
+        return out
+
     def sync_now(self, conn, q, body, **_):
         if self.syncer is None:
             raise ApiError(503, "sync not running")
@@ -622,6 +664,10 @@ class Api:
     def peer_pair_reject(self, conn, q, body, **_):
         peers.receive_pair_reject(conn, body)
         return {"ok": True}
+
+    def peer_info(self, conn, q, body, **_):
+        return {"id": nodes.self_id(conn), "name": self.cfg.server.name,
+                "rsync_port": self.cfg.rsync.daemon_port, "ssh": ssh.offer(self.cfg)}
 
     def peer_changes(self, conn, q, body, caller=None, **_):
         return sync.export_changes(conn, int(q.get("since", 0)),

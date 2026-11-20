@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -288,6 +288,17 @@ ALTER TABLE nodes ADD COLUMN free_bytes INTEGER;
 ALTER TABLE nodes ADD COLUMN total_bytes INTEGER;
 ALTER TABLE wanted ADD COLUMN message TEXT;
 CREATE INDEX wanted_status ON wanted(status, reason);
+""",
+    5: """
+-- rsync over SSH between servers: what each peer offers, and how we pull
+-- from it ('daemon' or 'ssh'); nodes announce the path served over SSH.
+ALTER TABLE servers ADD COLUMN transport TEXT NOT NULL DEFAULT 'daemon';
+ALTER TABLE servers ADD COLUMN ssh_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN ssh_host TEXT;
+ALTER TABLE servers ADD COLUMN ssh_port INTEGER;
+ALTER TABLE servers ADD COLUMN ssh_user TEXT;
+ALTER TABLE servers ADD COLUMN ssh_pubkey TEXT;
+ALTER TABLE nodes ADD COLUMN ssh_root TEXT;
 """,
 }
 

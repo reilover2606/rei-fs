@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server:
+    name: server (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install rsync (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rsync openssh-server openssh-client
+      - name: Install rsync (Windows, cwRsync)
+        if: runner.os == 'Windows'
+        run: choco install rsync -y --no-progress
+      - name: Show rsync
+        shell: bash
+        run: which rsync && rsync --version | head -1 || echo "no rsync"
+      - run: uv sync
+      - name: Tests
+        run: uv run pytest -v -rs
+
+  client:
+    name: client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ meson ninja-build libssl-dev pkg-config
+      - name: Install build tools (Windows, MSYS2 UCRT64)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-pkgconf
+      - name: Build and unit tests (Linux)
+        if: runner.os == 'Linux'
+        working-directory: client
+        run: |
+          meson setup build
+          ninja -C build
+          meson test -C build --print-errorlogs
+      - name: Build and unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        working-directory: client
+        run: |
+          meson setup build
+          ninja -C build
+          meson test -C build --print-errorlogs
+      - name: Live test against a server
+        shell: bash
+        env:
+          REIFS_HOME: ${{ runner.temp }}/reifs-home
+        run: |
+          cd server
+          uv sync
+          uv run reifs init --name ci --root "$RUNNER_TEMP/reifs-root"
+          uv run python -c "from reifs.config import Config, default_home; from reifs import auth; c = Config.load(default_home()); c.server.password_hash = auth.hash_password('secret'); c.server.listen = '127.0.0.1:7499'; c.save()"
+          uv run reifs serve > "$RUNNER_TEMP/serve.log" 2>&1 &
+          for i in $(seq 1 30); do sleep 1; uv run reifs fingerprint > /dev/null 2>&1 && break; done
+          sleep 3
+          FP=$(uv run reifs fingerprint)
+          cd ../client
+          EXE=build/core-tests; BIN=build/rei-fs
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=$EXE.exe; BIN=$BIN.exe; export PATH="/d/a/_temp/msys64/ucrt64/bin:$PATH"; fi
+          REIFS_TEST_PORT=7499 REIFS_TEST_PASSWORD=secret REIFS_TEST_FINGERPRINT=$FP ./$EXE
+          SEEN=$(./$BIN --fingerprint 127.0.0.1:7499)
+          echo "server: $FP"; echo "client: $SEEN"
+          test "$SEEN" = "$FP"
+          cat "$RUNNER_TEMP/serve.log"
+      - name: Stop the server
+        if: always()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            taskkill //F //IM python.exe //T || true
+            taskkill //F //IM rsync.exe //T || true
+          else
+            pkill -f "reifs serve" || true
+          fi

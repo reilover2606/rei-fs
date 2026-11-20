@@ -349,6 +349,27 @@ class RemoteSource:
         return f"rsync://{self.user}@{host}:{self.port}/{self.module}/"
 
 
+@dataclass
+class SshSource:
+    """Pull with rsync over SSH from a paired server's node root."""
+    host: str
+    port: int
+    user: str
+    root: str          # node root as rsync on that machine names it
+
+    def url(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        user = f"{self.user}@" if self.user else ""
+        return f"{user}{host}:{self.root.rstrip('/')}/"
+
+
+def ssh_source(peer: sqlite3.Row, node: sqlite3.Row) -> SshSource | None:
+    if not (peer["ssh_enabled"] and node["ssh_root"]):
+        return None
+    host = peer["ssh_host"] or split_address(peer["address"])[0]
+    return SshSource(host, int(peer["ssh_port"] or 22), peer["ssh_user"] or "", node["ssh_root"])
+
+
 def module_name(node_id: str) -> str:
     return f"n-{node_id}"
 

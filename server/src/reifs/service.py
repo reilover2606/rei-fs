@@ -116,11 +116,15 @@ class Worker:
 
     def _main(self) -> None:
         conn = db.open_existing(self.cfg.db_path)
-        last_scan = 0.0 if self.cfg.scan.interval_minutes > 0 else float("inf")
-        last_discovery = 0.0
-        last_jobs = 0.0
-        last_plan = 0.0
-        last_plan_check = 0.0
+        # -inf: everything runs once right away. (Not 0.0: monotonic time
+        # counts from boot, so on a machine booted less than an hour ago the
+        # first hourly scan would otherwise wait.)
+        never = float("-inf")
+        last_scan = never
+        last_discovery = never
+        last_jobs = never
+        last_plan = never
+        last_plan_check = never
         planned_at_seq = None
         online: set[str] | None = None
         try:
@@ -341,6 +345,19 @@ def sync_peer(conn, server_id: str, poke: bool = False) -> int:
             if not data.get("more"):
                 break
         deliver_outbox(conn, server_id, client)
+        try:  # what the peer offers (SSH access, its public key)
+            info = client.request("GET", "/api/peer/info")
+            ssh_offer = info.get("ssh") or {}
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE servers SET ssh_enabled = ?, ssh_host = ?, ssh_port = ?, ssh_user = ?,"
+                    " ssh_pubkey = ? WHERE id = ?",
+                    (int(bool(ssh_offer.get("enabled"))), ssh_offer.get("host") or None,
+                     ssh_offer.get("port"), ssh_offer.get("user"), ssh_offer.get("public_key"),
+                     server_id))
+        except peers.PeerError as e:
+            if e.status != 404:  # older peers do not have it
+                raise
         with db.transaction(conn):
             conn.execute("UPDATE servers SET online = 1, last_sync = ?, last_error = NULL"
                          " WHERE id = ?", (db.now(), server_id))
