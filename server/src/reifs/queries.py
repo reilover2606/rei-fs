@@ -1,0 +1,175 @@
+"""Read-only queries over the index (tree listing, lookup, search, status)."""
+
+from __future__ import annotations
+
+import fnmatch
+import sqlite3
+from dataclasses import dataclass, field
+
+from . import index, paths
+from .tags import tags_of
+
+REPLICATION_TARGET = 2
+
+
+@dataclass
+class CopyInfo:
+    node_id: str
+    node_name: str
+    online: bool
+    size: int
+    mtime_ns: int
+    hash: str
+    state: str
+    marked_delete: bool
+    current: bool
+
+
+@dataclass
+class FileInfo:
+    id: int
+    vpath: str
+    issues: set[str]
+    tags: list[str]
+    copies: list[CopyInfo] = field(default_factory=list)
+
+    @property
+    def good_copies(self) -> int:
+        """Copies that count towards the two-copy goal."""
+        return len({c.node_id for c in self.copies
+                    if c.state == "present" and c.current and not c.marked_delete})
+
+    @property
+    def size(self) -> int:
+        cur = [c for c in self.copies if c.current]
+        return cur[0].size if cur else 0
+
+
+def file_info(conn: sqlite3.Connection, fid: int) -> FileInfo:
+    f = conn.execute("SELECT * FROM files WHERE id = ?", (fid,)).fetchone()
+    version = index.current_version(conn, fid)
+    info = FileInfo(fid, f["vpath"], paths.decode_issues(f["issues"]), tags_of(conn, fid))
+    for c in conn.execute(
+        "SELECT c.*, n.name, n.online FROM copies c JOIN nodes n ON n.id = c.node_id"
+        " WHERE c.file_id = ? ORDER BY n.name",
+        (fid,),
+    ):
+        info.copies.append(CopyInfo(
+            c["node_id"], c["name"], bool(c["online"]), c["size"], c["mtime_ns"], c["hash"],
+            c["state"], bool(c["marked_delete"]),
+            current=bool(version and c["state"] == "present" and c["hash"] == version.hash),
+        ))
+    return info
+
+
+def lookup(conn: sqlite3.Connection, vpath: str) -> FileInfo | None:
+    fid = index.file_id(conn, paths.normalize(vpath))
+    return file_info(conn, fid) if fid is not None else None
+
+
+@dataclass
+class DirEntry:
+    name: str
+    is_dir: bool
+    files: int                 # files at or below this entry
+    file: FileInfo | None = None
+
+
+def list_dir(conn: sqlite3.Connection, vdir: str) -> list[DirEntry] | None:
+    """Immediate children of a virtual directory. None if it does not exist."""
+    vdir = paths.normalize(vdir)
+    lo, hi = paths.prefix_range(vdir) if vdir != "/" else ("/", "0")
+    dirs: dict[str, int] = {}
+    files: list[DirEntry] = []
+    for r in conn.execute("SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ?",
+                          (lo, hi)):
+        rest = r["vpath"][len(lo):]
+        head, sep, _ = rest.partition("/")
+        if sep:
+            dirs[head] = dirs.get(head, 0) + 1
+        else:
+            files.append(DirEntry(head, False, 1, file_info(conn, r["id"])))
+    if not dirs and not files and vdir != "/":
+        return None
+    out = [DirEntry(name, True, n) for name, n in sorted(dirs.items())]
+    return out + sorted(files, key=lambda e: e.name)
+
+
+def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
+         node: str | None = None, issues_only: bool = False,
+         under_replicated: bool = False) -> list[FileInfo]:
+    q = "SELECT DISTINCT f.id, f.vpath FROM files f"
+    where, args = [], []
+    if tag:
+        q += " JOIN tags t ON t.file_id = f.id AND t.present = 1"
+        where.append("t.tag = ?")
+        args.append(tag)
+    if node:
+        q += " JOIN copies c ON c.file_id = f.id JOIN nodes n ON n.id = c.node_id"
+        where.append("(n.name = ? OR n.id = ?)")
+        args += [node, node]
+    if issues_only:
+        where.append("f.issues != ''")
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY f.vpath"
+    pat = pattern.casefold() if pattern else None
+    out = []
+    for r in conn.execute(q, args):
+        if pat:
+            target = r["vpath"] if "/" in pat else paths.basename(r["vpath"])
+            if not fnmatch.fnmatchcase(target.casefold(), pat):
+                continue
+        info = file_info(conn, r["id"])
+        if under_replicated and info.good_copies >= REPLICATION_TARGET:
+            continue
+        out.append(info)
+    return out
+
+
+@dataclass
+class Status:
+    files: int
+    bytes: int
+    satisfied: int
+    under_replicated: int
+    single_copy: int
+    divergent: int
+    missing_copies: int
+    marked_delete: int
+    non_portable: int
+    open_decisions: int
+    open_wanted: int
+
+
+def status(conn: sqlite3.Connection) -> Status:
+    # Per file: size of the current version and number of good copies, in SQL
+    # so it stays fast for tens of thousands of files.
+    rows = conn.execute("""
+        WITH cur AS (
+            SELECT file_id, hash, size FROM (
+                SELECT file_id, hash, size, ROW_NUMBER() OVER (
+                    PARTITION BY file_id ORDER BY mtime_ns DESC, hash) AS rn
+                FROM copies WHERE state = 'present')
+            WHERE rn = 1
+        )
+        SELECT cur.file_id, cur.size,
+               (SELECT COUNT(DISTINCT c.node_id) FROM copies c
+                 WHERE c.file_id = cur.file_id AND c.state = 'present'
+                   AND c.hash = cur.hash AND c.marked_delete = 0) AS good
+        FROM cur
+    """).fetchall()
+    one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
+    return Status(
+        files=one("SELECT COUNT(*) FROM files"),
+        bytes=sum(r["size"] for r in rows),
+        satisfied=sum(1 for r in rows if r["good"] >= REPLICATION_TARGET),
+        under_replicated=sum(1 for r in rows if r["good"] < REPLICATION_TARGET),
+        single_copy=sum(1 for r in rows if r["good"] == 1),
+        divergent=one("SELECT COUNT(*) FROM decisions WHERE kind = 'divergent' AND status = 'open'"),
+        missing_copies=one("SELECT COUNT(*) FROM copies WHERE state = 'missing'"),
+        marked_delete=one("SELECT COUNT(*) FROM copies WHERE marked_delete = 1"),
+        non_portable=one("SELECT COUNT(*) FROM files WHERE issues != ''"),
+        open_decisions=one("SELECT COUNT(*) FROM decisions WHERE status = 'open'"),
+        open_wanted=one("SELECT COUNT(*) FROM wanted WHERE status = 'open'"),
+    )

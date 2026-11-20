@@ -1,0 +1,422 @@
+"""``reifs`` command-line interface (administration and testing).
+
+The FTXUI client (milestone 3) talks to the server over its API; this CLI
+works directly on the local server home.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from . import __version__, auth, decisions, nodes, queries, scanner, tags
+from .config import ConfigError, default_home
+from .hashing import short
+from .server import init_server, open_server
+
+
+class CliError(Exception):
+    pass
+
+
+# --- formatting ---------------------------------------------------------------
+
+
+def human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} B"
+
+
+def fmt_mtime(ns: int) -> str:
+    return datetime.fromtimestamp(ns / 1e9, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def table(rows: list[list[str]], header: list[str]) -> str:
+    rows = [header] + rows
+    widths = [max(len(r[i]) for r in rows) for i in range(len(header))]
+    lines = ["  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows]
+    lines.insert(1, "  ".join("-" * w for w in widths))
+    return "\n".join(lines)
+
+
+def copies_badge(info: queries.FileInfo) -> str:
+    good = info.good_copies
+    flags = ""
+    if any(c.state == "present" and not c.current for c in info.copies):
+        flags += " stale"
+    if any(c.state == "missing" for c in info.copies):
+        flags += " missing"
+    if any(c.marked_delete for c in info.copies):
+        flags += " del"
+    if info.issues:
+        flags += " !" + ",".join(sorted(info.issues))
+    return f"{good}x{flags}"
+
+
+# --- commands -----------------------------------------------------------------
+
+
+def cmd_init(args) -> None:
+    cfg = init_server(args.home, args.name, Path(args.root))
+    print(f"Created server {args.name!r} at {cfg.home}")
+    print(f"  node root: {cfg.storage.root}")
+    print("Set the admin password with 'reifs passwd', then run 'reifs scan'.")
+
+
+def cmd_passwd(args) -> None:
+    cfg, conn = open_server(args.home)
+    conn.close()
+    pw = getpass.getpass("New admin password: ")
+    if not pw:
+        raise CliError("empty password")
+    if getpass.getpass("Repeat: ") != pw:
+        raise CliError("passwords do not match")
+    cfg.server.password_hash = auth.hash_password(pw)
+    cfg.save()
+    print("Password updated.")
+
+
+def cmd_node_add(args) -> None:
+    _, conn = open_server(args.home)
+    node_id = nodes.register_node(conn, Path(args.path), args.name)
+    row = nodes.get_node(conn, node_id)
+    print(f"Registered storage node {args.name!r} ({node_id})")
+    print(f"  case sensitive: {bool(row['case_sensitive'])}, "
+          f"restricted names: {bool(row['restricted_names'])}")
+
+
+def cmd_node_list(args) -> None:
+    _, conn = open_server(args.home)
+    me = nodes.self_id(conn)
+    rows = []
+    for r in conn.execute(
+        "SELECT n.*, s.name AS owner, (SELECT COUNT(*) FROM copies c WHERE c.node_id = n.id)"
+        " AS ncopies, (SELECT COALESCE(SUM(size), 0) FROM copies c WHERE c.node_id = n.id)"
+        " AS nbytes FROM nodes n JOIN servers s ON s.id = n.owner_id ORDER BY n.name"
+    ):
+        fs = ("cs" if r["case_sensitive"] else "ci") + (",win" if r["restricted_names"] else "")
+        rows.append([
+            r["name"], r["kind"], "online" if r["online"] else "offline",
+            "self" if r["owner_id"] == me else r["owner"], str(r["ncopies"]),
+            human_size(r["nbytes"]), fs, str(r["priority"]),
+            "yes" if r["replication_target"] else "no", r["root_path"] or "",
+        ])
+    print(table(rows, ["NAME", "KIND", "STATE", "OWNER", "FILES", "SIZE", "FS", "PRIO",
+                       "TARGET", "ROOT"]))
+
+
+def cmd_node_set(args) -> None:
+    _, conn = open_server(args.home)
+    node = nodes.get_node(conn, args.node)
+    updates = {}
+    if args.priority is not None:
+        updates["priority"] = args.priority
+    if args.target is not None:
+        updates["replication_target"] = int(args.target == "yes")
+    if args.rename:
+        updates["name"] = args.rename
+    if not updates:
+        raise CliError("nothing to change")
+    sets = ", ".join(f"{k} = ?" for k in updates)
+    conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
+    print(f"Updated node {node['name']!r}.")
+
+
+def cmd_discover(args) -> None:
+    cfg, conn = open_server(args.home)
+    d = nodes.discover(conn, cfg)
+    for loc in d.online:
+        print(f"online   {loc.name:20} {loc.root}")
+    for name in d.offline:
+        print(f"offline  {name}")
+    for name, root in d.moved:
+        print(f"moved    {name:20} now at {root}")
+    for name, owner, path in d.foreign:
+        print(f"foreign  {name:20} {path} (owned by server {owner})")
+
+
+def cmd_scan(args) -> None:
+    cfg, conn = open_server(args.home)
+
+    def progress(stats: scanner.ScanStats, current: str) -> None:
+        if sys.stderr.isatty() and current:
+            line = f"  {stats.seen} files, {stats.hashed} hashed: {current}"
+            print("\r" + line[:110].ljust(110), end="", file=sys.stderr, flush=True)
+
+    disc, results = scanner.scan_all(conn, cfg, args.nodes or None, verify=args.verify,
+                                     progress=progress)
+    if sys.stderr.isatty():
+        print("\r" + " " * 110 + "\r", end="", file=sys.stderr)
+    for name in disc.offline:
+        if not args.nodes or name in args.nodes:
+            print(f"{name}: offline, not scanned")
+    for res in results:
+        s = res.stats
+        parts = [f"{s.seen} files", f"{s.hashed} hashed", f"+{s.added}", f"~{s.changed}"]
+        for label, value in (("renamed", s.renamed), ("missing", s.missing),
+                             ("reappeared", s.reappeared), ("forgotten", s.forgotten),
+                             ("deleted as marked", s.deleted_marked),
+                             ("VERIFY MISMATCH", s.verify_mismatch),
+                             ("dirs pruned", s.pruned_dirs), ("errors", len(res.errors))):
+            if value:
+                parts.append(f"{value} {label}")
+        print(f"{res.node_name}: " + ", ".join(parts))
+        for vpath, msg in res.errors[: args.max_errors]:
+            print(f"    error: {vpath}: {msg}")
+        if len(res.errors) > args.max_errors:
+            print(f"    ... {len(res.errors) - args.max_errors} more")
+    open_count = len(decisions.list_decisions(conn))
+    if open_count:
+        print(f"{open_count} decision(s) need attention: 'reifs decisions'")
+
+
+def cmd_ls(args) -> None:
+    _, conn = open_server(args.home)
+    entries = queries.list_dir(conn, args.vdir)
+    if entries is None:
+        info = queries.lookup(conn, args.vdir)
+        if info is None:
+            raise CliError(f"not in the virtual tree: {args.vdir}")
+        entries = [queries.DirEntry(info.vpath.rsplit("/", 1)[-1], False, 1, info)]
+    rows = []
+    for e in entries:
+        if e.is_dir:
+            rows.append([e.name + "/", "", f"{e.files} files", "", ""])
+        else:
+            f = e.file
+            cur = next((c for c in f.copies if c.current), None)
+            rows.append([
+                e.name, human_size(f.size), copies_badge(f),
+                fmt_mtime(cur.mtime_ns) if cur else "",
+                " ".join(f.tags),
+            ])
+    print(table(rows, ["NAME", "SIZE", "COPIES", "MODIFIED", "TAGS"]))
+
+
+def cmd_where(args) -> None:
+    _, conn = open_server(args.home)
+    info = queries.lookup(conn, args.vpath)
+    if info is None:
+        raise CliError(f"not a file in the virtual tree: {args.vpath}")
+    print(info.vpath)
+    print(f"  good copies: {info.good_copies}/{queries.REPLICATION_TARGET}")
+    if info.tags:
+        print(f"  tags: {', '.join(info.tags)}")
+    if info.issues:
+        print(f"  portability issues: {', '.join(sorted(info.issues))}")
+    rows = []
+    for c in info.copies:
+        state = c.state
+        if c.state == "present":
+            state = "current" if c.current else "stale"
+        if c.marked_delete:
+            state += ", marked for deletion"
+        rows.append([c.node_name, "online" if c.online else "offline", state,
+                     human_size(c.size), fmt_mtime(c.mtime_ns), short(c.hash)])
+    print(table(rows, ["NODE", "NODE STATE", "COPY", "SIZE", "MODIFIED", "HASH"]))
+
+
+def cmd_find(args) -> None:
+    _, conn = open_server(args.home)
+    results = queries.find(conn, args.pattern, tag=args.tag, node=args.node,
+                           issues_only=args.issues, under_replicated=args.under)
+    rows = [[f.vpath, human_size(f.size), copies_badge(f),
+             ",".join(c.node_name for c in f.copies if c.state == "present"),
+             " ".join(f.tags)] for f in results]
+    print(table(rows, ["PATH", "SIZE", "COPIES", "NODES", "TAGS"]))
+    print(f"{len(results)} file(s)")
+
+
+def cmd_tag(args) -> None:
+    _, conn = open_server(args.home)
+    me = nodes.self_id(conn)
+    total = 0
+    for vpath in args.vpaths:
+        ids = tags.resolve_targets(conn, vpath, args.recursive)
+        total += tags.set_tag(conn, ids, args.tag, args.action == "add", me)
+    verb = "Tagged" if args.action == "add" else "Untagged"
+    print(f"{verb} {total} file(s) with {args.tag!r}.")
+
+
+def cmd_tags(args) -> None:
+    _, conn = open_server(args.home)
+    rows = [[t, str(n)] for t, n in tags.all_tags(conn)]
+    print(table(rows, ["TAG", "FILES"]))
+
+
+def cmd_decisions(args) -> None:
+    _, conn = open_server(args.home)
+    items = decisions.list_decisions(conn, args.status)
+    if args.json:
+        print(json.dumps([d.__dict__ for d in items], indent=2))
+        return
+    if not items:
+        print(f"No {args.status} decisions.")
+        return
+    for d in items:
+        where = f" on {d.node_name}" if d.node_name else ""
+        print(f"#{d.id} [{d.kind}] {d.vpath or d.data.get('vpath', '?')}{where}")
+        if d.kind == "rename":
+            print(f"    renamed to {d.data['to']}; {len(d.data['nodes'])} other node(s) keep the old path")
+        elif d.kind == "divergent":
+            print(f"    {len(d.data['stale_nodes'])} stale cop(ies)"
+                  + (" (several versions share the newest mtime!)" if d.data.get("tie") else ""))
+        for opt, desc in d.options.items():
+            print(f"    {opt:12} {desc}")
+
+
+def cmd_decide(args) -> None:
+    _, conn = open_server(args.home)
+    print(decisions.resolve(conn, args.id, args.option))
+
+
+def cmd_wanted(args) -> None:
+    _, conn = open_server(args.home)
+    rows = []
+    for r in conn.execute(
+        "SELECT w.*, f.vpath, s.name AS src, d.name AS dst FROM wanted w"
+        " LEFT JOIN files f ON f.id = w.file_id LEFT JOIN nodes s ON s.id = w.src_node"
+        " LEFT JOIN nodes d ON d.id = w.dst_node WHERE w.status = 'open' ORDER BY w.id"
+    ):
+        extra = json.loads(r["data"])
+        target = f"{extra['from']} -> {extra['to']}" if r["op"] == "rename" else r["vpath"] or ""
+        rows.append([str(r["id"]), r["op"], target, r["src"] or "", r["dst"] or "", r["reason"]])
+    print(table(rows, ["ID", "OP", "FILE", "FROM", "TO", "REASON"]))
+    print("Jobs are executed from milestone 2 on.")
+
+
+def cmd_status(args) -> None:
+    cfg, conn = open_server(args.home)
+    s = queries.status(conn)
+    online = conn.execute("SELECT COUNT(*) FROM nodes WHERE online = 1").fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+    print(f"server {cfg.server.name!r}  ({cfg.home})")
+    print(f"  nodes:            {online}/{total} online")
+    print(f"  files:            {s.files} ({human_size(s.bytes)})")
+    print(f"  with >= 2 copies: {s.satisfied}")
+    print(f"  under-replicated: {s.under_replicated} ({s.single_copy} with a single good copy)")
+    print(f"  divergent:        {s.divergent}")
+    print(f"  missing copies:   {s.missing_copies}")
+    print(f"  marked to delete: {s.marked_delete}")
+    print(f"  non-portable:     {s.non_portable}")
+    print(f"  open decisions:   {s.open_decisions}")
+    print(f"  wanted jobs:      {s.open_wanted}")
+    if not cfg.server.password_hash:
+        print("  warning: no admin password set ('reifs passwd')")
+
+
+# --- parser -------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="reifs", description="rei-fs server administration")
+    p.add_argument("--version", action="version", version=f"rei-fs {__version__}")
+    p.add_argument("--home", type=Path, default=None,
+                   help="server home directory (default: $REIFS_HOME or platform default)")
+    sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    s = sub.add_parser("init", help="create a server home and its own node")
+    s.add_argument("--name", required=True, help="server (and server node) name")
+    s.add_argument("--root", required=True, help="root directory of this server's node")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("passwd", help="set the admin password")
+    s.set_defaults(func=cmd_passwd)
+
+    node = sub.add_parser("node", help="manage nodes").add_subparsers(
+        dest="node_cmd", required=True, metavar="ACTION")
+    s = node.add_parser("add", help="register a storage node (drive, folder) owned by this server")
+    s.add_argument("path")
+    s.add_argument("--name", required=True)
+    s.set_defaults(func=cmd_node_add)
+    s = node.add_parser("list", help="list nodes")
+    s.set_defaults(func=cmd_node_list)
+    s = node.add_parser("set", help="change node settings")
+    s.add_argument("node")
+    s.add_argument("--priority", type=int, help="higher = preferred replication target")
+    s.add_argument("--target", choices=["yes", "no"], help="may receive replication copies")
+    s.add_argument("--rename", metavar="NAME")
+    s.set_defaults(func=cmd_node_set)
+
+    s = sub.add_parser("discover", help="find which owned nodes are attached")
+    s.set_defaults(func=cmd_discover)
+
+    s = sub.add_parser("scan", help="scan online owned nodes for changes")
+    s.add_argument("nodes", nargs="*", help="node names (default: all online)")
+    s.add_argument("--verify", action="store_true", help="re-hash every file")
+    s.add_argument("--max-errors", type=int, default=20)
+    s.set_defaults(func=cmd_scan)
+
+    s = sub.add_parser("ls", help="list a virtual directory")
+    s.add_argument("vdir", nargs="?", default="/")
+    s.set_defaults(func=cmd_ls)
+
+    s = sub.add_parser("where", help="show where a file's copies are")
+    s.add_argument("vpath")
+    s.set_defaults(func=cmd_where)
+
+    s = sub.add_parser("find", help="search files")
+    s.add_argument("pattern", nargs="?", help="glob on the name (or on the path if it has '/')")
+    s.add_argument("--tag")
+    s.add_argument("--node")
+    s.add_argument("--issues", action="store_true", help="only non-portable names")
+    s.add_argument("--under", action="store_true", help="only files with fewer than 2 good copies")
+    s.set_defaults(func=cmd_find)
+
+    for name, action, help_ in (("tag", "add", "tag files"),
+                                ("untag", "rm", "remove a tag from files")):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("tag")
+        s.add_argument("vpaths", nargs="+")
+        s.add_argument("-r", "--recursive", action="store_true",
+                       help="apply to every file below a directory")
+        s.set_defaults(func=cmd_tag, action=action)
+
+    s = sub.add_parser("tags", help="list tags")
+    s.set_defaults(func=cmd_tags)
+
+    s = sub.add_parser("decisions", help="list the decision stack")
+    s.add_argument("--status", default="open",
+                   choices=["open", "resolved", "dismissed", "obsolete"])
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_decisions)
+
+    s = sub.add_parser("decide", help="resolve a decision")
+    s.add_argument("id", type=int)
+    s.add_argument("option")
+    s.set_defaults(func=cmd_decide)
+
+    s = sub.add_parser("wanted", help="list proposed jobs")
+    s.set_defaults(func=cmd_wanted)
+
+    s = sub.add_parser("status", help="summary of the index")
+    s.set_defaults(func=cmd_status)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.home is None:
+        args.home = default_home()
+    try:
+        args.func(args)
+    except (CliError, ConfigError, nodes.NodeError, decisions.DecisionError,
+            tags.TagError, ValueError) as e:
+        print(f"reifs: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
