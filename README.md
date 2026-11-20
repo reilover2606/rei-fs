@@ -21,4 +21,25 @@ Status: all five planned milestones are done:
 5. replication to two copies, with optional automatic approval. See the server's
 [README](server/README.md) to try it.
 
+## Platforms
+
+CI (`.github/workflows/ci.yml`) runs on every push, on Linux and Windows.
+
+**Server.** The full test suite runs on both systems. That includes
+transfers between servers through the rsync daemon; on Windows it uses
+cwRsync, installed with `choco install rsync`. rsync over SSH is tested on
+Linux against a real `sshd`, with read-only keys through `rrsync`. On
+Windows, the tests that create names Windows forbids, or symlinks, are
+skipped.
+
+**Client.** It is built and unit-tested on both systems: on Windows with
+MSYS2 UCRT64, on Linux with the distribution's compiler. On both, it then
+connects to a freshly started `reifs serve`, checks certificate pinning,
+logs in, and reads data.
+
+**Not covered by CI:**
+
+* serving files over SSH *from* a Windows machine;
+* running the server under Termux on Android.
+
 License: MIT.
