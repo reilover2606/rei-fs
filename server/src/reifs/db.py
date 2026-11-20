@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -280,6 +280,15 @@ INSERT INTO changes(origin_id, origin_seq, kind, data, ts)
            strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
     FROM tags t JOIN files f ON f.id = t.file_id JOIN meta m ON m.key = 'server_id';
 """,
+    4: """
+-- Replication (milestone 5): nodes announce their free space so any server
+-- can pick backup destinations; wanted jobs can carry a note (e.g. why
+-- forwarding an approval failed).
+ALTER TABLE nodes ADD COLUMN free_bytes INTEGER;
+ALTER TABLE nodes ADD COLUMN total_bytes INTEGER;
+ALTER TABLE wanted ADD COLUMN message TEXT;
+CREATE INDEX wanted_status ON wanted(status, reason);
+""",
 }
 
 
@@ -354,6 +363,11 @@ class transaction:
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
+
+
+def set_meta_tx(conn: sqlite3.Connection, key: str, value: str) -> None:
+    with transaction(conn):
+        set_meta(conn, key, value)
 
 
 def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:

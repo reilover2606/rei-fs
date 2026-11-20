@@ -1,7 +1,7 @@
 # rei-fs design
 
-Status: approved. Milestones 1 (index), 2 (jobs), 3 (API and client) and 4
-(pairing and sync) are implemented.
+Status: approved. All five milestones are implemented: index, jobs, API and
+client, pairing and sync, replication.
 
 ## 1. Goals
 
@@ -246,16 +246,62 @@ there.
 
 ## 6. Replication (milestone 5)
 
-A file is **satisfied** when at least two *online or offline* nodes hold a
-copy of the current version that is not marked for deletion. For every
-unsatisfied file the server proposes a **wanted job**, picking the
-destination by node priority and then free space, and skipping nodes that are
-excluded as replication targets or incompatible.
+**Satisfied files.** A file is *satisfied* when at least two nodes hold a
+copy of its current version that is not marked for deletion. Those nodes
+can be online or offline.
 
-* Default mode: wanted jobs appear in the client for the user to approve or
-  reject one by one or in bulk.
-* Optional **auto-replicate** mode (per server): wanted jobs are approved
-  automatically.
+**Who proposes.** For a file with a single good copy, **the server owning
+that copy** proposes the second one. It is the only server able to serve as
+the source, and exactly one server is responsible, so paired servers never
+propose duplicates. Files whose only current copies are marked for deletion
+are being deleted and are left alone.
+
+**Destination.** The proposing server looks at its own nodes and those of
+its paired servers. It skips a node if any of these apply:
+
+* the node is not a backup target;
+* it already holds some version of the file (stale versions are handled by
+  `divergent` decisions);
+* it cannot hold the name (restricted names, case clash);
+* it lacks the space: its announced free space, minus what pending
+  proposals will use, must stay above `transfers.min_free_mb`;
+* its server was unreachable at the last sync.
+
+The remaining nodes are ranked online first, then by priority, then by free
+space. Nodes announce their free space in their `node` log entries when it
+changes by more than 1 % of the disk or 256 MiB.
+
+**Proposals.** A proposal is a wanted job with reason `replicate`:
+
+* It becomes `done` when the file is satisfied.
+* A **rejected** proposal is not made again until the file's content
+  changes.
+* Approving a proposal whose destination is on another server creates the
+  job on that server, which pulls the file.
+
+**When planning runs.** The worker plans after each scan, every 10 minutes,
+and within a minute of any change to the log (including facts from peers).
+`reifs replication plan` and the client (`p` on the Overview tab) plan on
+request.
+
+**Report.** The last plan is stored. It records:
+
+* the number of single-copy files, and how many this server is responsible
+  for;
+* how many proposals were made, were already pending, or were declined
+  earlier;
+* why the rest have no possible destination, with examples.
+
+It is shown by `reifs replication` and on the client's Overview tab.
+
+**Approval.**
+
+* By default, proposals wait in the Wanted list.
+* With automatic approval (`[server] auto_replicate`, toggled with
+  `reifs replication auto on|off` or `a` on the Overview tab), replication
+  proposals are approved as soon as they are made.
+* Restores, renames and overwrites come from the user's own decisions and
+  always wait for approval.
 
 ## 7. Metadata and server-to-server sync (milestone 4)
 
@@ -395,6 +441,7 @@ Endpoints (all JSON, under `/api`):
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
 | `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |
 | `GET marked?node=`, `POST unmark {paths, node, all}` | Deletion marks |
+| `GET replication`, `POST replication {auto_replicate}`, `POST replication/plan` | Two-copy goal |
 | `POST nodes/<name>/adopt` | Adopt another server's drive attached here |
 | `GET peers`, `POST peers/probe`, `POST peers/pair` | Pairing (client only) |
 | `POST peers/requests/<id>/accept\|reject`, `POST peers/<id>/unpair`, `POST peers/sync` | Pairing (client only) |

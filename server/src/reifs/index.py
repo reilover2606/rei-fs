@@ -113,7 +113,8 @@ def node_payload(conn: sqlite3.Connection, node_id: str) -> dict | None:
             "owner_name": r["owner_name"], "owner_since": r["owner_since"],
             "case_sensitive": r["case_sensitive"], "restricted_names": r["restricted_names"],
             "priority": r["priority"], "replication_target": r["replication_target"],
-            "online": r["online"]}
+            "online": r["online"], "free_bytes": r["free_bytes"],
+            "total_bytes": r["total_bytes"]}
 
 
 def log_node(conn: sqlite3.Connection, node_id: str) -> None:

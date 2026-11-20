@@ -181,7 +181,7 @@ def test_wanted(server):
     wait_idle(client)
     [d] = client.get("/api/decisions")["decisions"]
     client.post(f"/api/decisions/{d['id']}", {"option": "restore"})
-    [w] = client.get("/api/wanted")["wanted"]
+    [w] = [x for x in client.get("/api/wanted")["wanted"] if x["reason"] == "restore"]
     assert (w["op"], w["to"]) == ("copy", "ssd")
     client.post("/api/wanted", {"action": "approve", "ids": [w["id"]]})
     wait_idle(client)

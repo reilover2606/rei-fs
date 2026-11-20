@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries,
-               sync, tags, tls)
+               replication, sync, tags, tls)
 from .config import Config
 from .paths import to_physical
 from .service import Syncer, Worker
@@ -155,6 +155,9 @@ class Api:
         r("POST", r"/api/jobs/run", self.run_jobs)
         r("GET", r"/api/jobs/(?P<id>\d+)", self.show_job)
         r("POST", r"/api/jobs/(?P<id>\d+)/(?P<action>cancel|retry)", self.job_action)
+        r("GET", r"/api/replication", self.replication_status)
+        r("POST", r"/api/replication", self.replication_settings)
+        r("POST", r"/api/replication/plan", self.replication_plan)
         r("GET", r"/api/marked", self.list_marked)
         r("POST", r"/api/unmark", self.unmark)
         # pairing management (client only)
@@ -238,6 +241,7 @@ class Api:
                                         ).fetchone()[0],
             "peers_online": conn.execute("SELECT COUNT(*) FROM servers WHERE paired = 1"
                                          " AND online = 1").fetchone()[0],
+            "auto_replicate": self.cfg.server.auto_replicate,
             "pair_requests": conn.execute(
                 "SELECT COUNT(*) FROM pair_requests WHERE direction = 'in' AND status = 'pending'"
             ).fetchone()[0],
@@ -385,27 +389,36 @@ class Api:
         return {"ok": True, "summary": summary}
 
     def list_wanted(self, conn, q, body, caller=None, **_):
+        limit = min(int(q.get("limit", 1000)), 5000)
+        total = conn.execute("SELECT COUNT(*) FROM wanted WHERE status = 'open'").fetchone()[0]
         out = []
         for r in conn.execute(
             "SELECT w.*, f.vpath, s.name AS src, d.name AS dst FROM wanted w"
             " LEFT JOIN files f ON f.id = w.file_id LEFT JOIN nodes s ON s.id = w.src_node"
             " LEFT JOIN nodes d ON d.id = w.dst_node WHERE w.status = 'open' ORDER BY w.id"
+            " LIMIT ?", (limit,)
         ):
             data = json.loads(r["data"])
             path = f"{data['from']} -> {data['to']}" if r["op"] == "rename" else r["vpath"]
             out.append({"id": r["id"], "op": r["op"], "path": path or "",
-                        "from": r["src"] or "", "to": r["dst"] or "", "reason": r["reason"]})
-        return self._everywhere(conn, q, caller, "/api/wanted", "wanted", out)
+                        "from": r["src"] or "", "to": r["dst"] or "", "reason": r["reason"],
+                        "message": r["message"] or ""})
+        result = self._everywhere(conn, q, caller, f"/api/wanted?limit={limit}", "wanted", out)
+        result["total"] = total
+        return result
 
     def act_wanted(self, conn, q, body, **_):
         ids = None if body.get("all") else [int(i) for i in body.get("ids", [])]
         if ids is not None and not ids:
             raise ApiError(400, "give 'ids' or 'all'")
         if body.get("action") == "approve":
-            rep = jobs.approve_wanted(conn, ids)
-            if rep.job_id is not None and self.worker:
+            res = replication.approve(conn, ids)
+            if res.local_job is not None and self.worker:
                 self.worker.request_jobs()
-            return {"job_id": rep.job_id, "items": rep.items}
+            return {"job_id": res.local_job, "items": res.items + sum(
+                        n for _, _, n in res.remote_jobs),
+                    "remote_jobs": len(res.remote_jobs), "errors": res.errors,
+                    "summary": res.summary()}
         if body.get("action") == "reject":
             return {"rejected": jobs.reject_wanted(conn, ids)}
         raise ApiError(400, "action must be 'approve' or 'reject'")
@@ -466,6 +479,30 @@ class Api:
             if n and self.worker:
                 self.worker.request_jobs()
         return {"ok": True, "items": n}
+
+    # --- replication ----------------------------------------------------------------
+
+    def replication_status(self, conn, q, body, **_):
+        s = queries.status(conn)
+        return {"target": replication.TARGET, "auto_replicate": self.cfg.server.auto_replicate,
+                "satisfied": s.satisfied, "under_replicated": s.under_replicated,
+                "single_copy": s.single_copy,
+                "open_proposals": conn.execute(
+                    "SELECT COUNT(*) FROM wanted WHERE status = 'open' AND reason = ?",
+                    (replication.REASON,)).fetchone()[0],
+                "last_plan": replication.last_plan(conn)}
+
+    def replication_settings(self, conn, q, body, **_):
+        if "auto_replicate" in body:
+            self.cfg.server.auto_replicate = bool(body["auto_replicate"])
+            self.cfg.save()
+            if self.cfg.server.auto_replicate and self.worker:
+                self.worker.request_plan()
+        return {"auto_replicate": self.cfg.server.auto_replicate}
+
+    def replication_plan(self, conn, q, body, **_):
+        self._need_worker().request_plan()
+        return {"ok": True, "queued": True}
 
     # --- deletion marks ------------------------------------------------------------
 

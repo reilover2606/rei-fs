@@ -13,8 +13,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, peers, queries, runner,
-               scanner, tags)
+from . import (__version__, auth, db, decisions, index, jobs, nodes, peers, queries,
+               replication, runner, scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
 from .locking import LockError, ServerLock
@@ -296,8 +296,10 @@ def cmd_wanted(args) -> None:
         if args.action == "reject":
             print(f"Rejected {jobs.reject_wanted(conn, ids)} proposal(s).")
             return
-        rep = jobs.approve_wanted(conn, ids)
-        _print_create_report(rep)
+        res = replication.approve(conn, ids)
+        print(res.summary())
+        if res.local_job is not None:
+            print(f"Run it with 'reifs jobs run {res.local_job}' (or let 'reifs serve' run it).")
         return
     rows = []
     for r in conn.execute(
@@ -307,7 +309,8 @@ def cmd_wanted(args) -> None:
     ):
         extra = json.loads(r["data"])
         target = f"{extra['from']} -> {extra['to']}" if r["op"] == "rename" else r["vpath"] or ""
-        rows.append([str(r["id"]), r["op"], target, r["src"] or "", r["dst"] or "", r["reason"]])
+        rows.append([str(r["id"]), r["op"], target, r["src"] or "", r["dst"] or "",
+                     r["reason"] + (f" ({r['message']})" if r["message"] else "")])
     if not rows:
         print("No proposed jobs.")
         return
@@ -568,6 +571,48 @@ def cmd_node_adopt(args) -> None:
     print(f"This server now owns node {name!r}. Run 'reifs scan {name}'.")
 
 
+def cmd_replication(args) -> None:
+    cfg, conn = open_server(args.home)
+    if args.action == "auto":
+        if args.value not in ("on", "off"):
+            raise CliError("use 'reifs replication auto on' or 'auto off'")
+        cfg.server.auto_replicate = args.value == "on"
+        cfg.save()
+        print(f"Automatic replication is {args.value}"
+              + (" (applies the next time 'reifs serve' plans; restart it if running)."
+                 if args.value == "on" else "."))
+        return
+    if args.action == "plan":
+        report, approved = replication.cycle(conn, cfg)
+    else:
+        raw = replication.last_plan(conn)
+        report = replication.PlanReport(**raw) if raw else None
+        approved = None
+    s = queries.status(conn)
+    print(f"goal: every file on at least {replication.TARGET} nodes; "
+          f"automatic approval {'on' if cfg.server.auto_replicate else 'off'}")
+    print(f"  satisfied:        {s.satisfied}")
+    print(f"  under-replicated: {s.under_replicated}")
+    if report is None:
+        print("No plan yet: run 'reifs replication plan'.")
+        return
+    print(f"last plan ({report.finished[:19]}):")
+    print(f"  files with a single copy:       {report.single_copy}"
+          f" ({report.responsible} on this server's nodes; others are planned by their server)")
+    print(f"  proposed now:                   {report.proposed}")
+    print(f"  already proposed / approved:    {report.already_proposed}")
+    print(f"  declined earlier:               {report.declined}")
+    print(f"  no possible destination:        {report.no_destination}")
+    for reason, n in sorted(report.reasons.items(), key=lambda x: -x[1]):
+        print(f"      {n:6}  {reason}")
+    for vpath, reason in report.examples[:args.examples]:
+        print(f"      e.g. {vpath}: {reason}")
+    if approved is not None:
+        print(f"approved automatically: {approved.summary()}")
+    elif report.proposed or report.already_proposed:
+        print("See and approve the proposals with 'reifs wanted' / 'reifs wanted approve --all'.")
+
+
 def cmd_status(args) -> None:
     cfg, conn = open_server(args.home)
     s = queries.status(conn)
@@ -728,6 +773,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("fingerprint", help="show the TLS certificate fingerprint")
     s.set_defaults(func=cmd_fingerprint)
+
+    s = sub.add_parser("replication", help="the two-copy goal: report, plan, auto on|off")
+    s.add_argument("action", nargs="?", default="report", choices=["report", "plan", "auto"])
+    s.add_argument("value", nargs="?", help="on|off (with auto)")
+    s.add_argument("--examples", type=int, default=10)
+    s.set_defaults(func=cmd_replication)
 
     s = sub.add_parser("status", help="summary of the index")
     s.set_defaults(func=cmd_status)

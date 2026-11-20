@@ -218,8 +218,15 @@ class OverviewView : public View {
   }
   std::string title() const override { return "Overview"; }
   Component component() override { return root_; }
-  void refresh() override {}
-  std::string help() const override { return "s: scan all nodes  j: run jobs  x: stop current work"; }
+  void refresh() override {
+    ctx_.attempt([&] { replication_ = ctx_.api->get("/api/replication"); });
+  }
+  void on_poll() override {
+    if (++polls_ % 5 == 0) refresh();
+  }
+  std::string help() const override {
+    return "s: scan all  j: run jobs  p: plan backups  a: auto-approve on/off  x: stop";
+  }
 
  private:
   bool on_event(const Event& e) {
@@ -229,6 +236,26 @@ class OverviewView : public View {
     }
     if (key(e, "j")) {
       if (ctx_.attempt([&] { ctx_.api->post("/api/jobs/run"); })) ctx_.notify("job run queued");
+      return true;
+    }
+    if (key(e, "p")) {
+      if (ctx_.attempt([&] { ctx_.api->post("/api/replication/plan"); }))
+        ctx_.notify("backup planning queued");
+      return true;
+    }
+    if (key(e, "a")) {
+      bool on = replication_.value("auto_replicate", false);
+      std::string q = on ? "Turn OFF automatic approval of backup copies?"
+                         : "Turn ON automatic approval? Second copies of under-replicated files "
+                           "will then be made without asking (restores, renames and overwrites "
+                           "still wait for you).";
+      ctx_.dialogs->confirm(q, [this, on] {
+        ctx_.attempt([&] {
+          ctx_.api->post("/api/replication", {{"auto_replicate", !on}});
+          ctx_.notify(std::string("automatic approval ") + (on ? "off" : "on"));
+        });
+        refresh();
+      });
       return true;
     }
     if (key(e, "x")) {
@@ -285,10 +312,35 @@ class OverviewView : public View {
     if (!act.value("last_error", "").empty())
       right.push_back(hbox({text(fit("last error", 26)),
                             paragraph(act.value("last_error", "")) | color(Color::Red)}));
-    return hbox({vbox(left) | flex | border, vbox(right) | flex | border});
+    Elements backup = {text("Backups (goal: 2 copies of every file)") | bold, separator()};
+    bool autom = replication_.value("auto_replicate", false);
+    backup.push_back(line("automatic approval", autom ? "on" : "off", Color::Green, autom));
+    backup.push_back(line("open proposals", std::to_string(replication_.value("open_proposals", 0)),
+                          Color::Cyan, replication_.value("open_proposals", 0) > 0));
+    json lp = replication_.value("last_plan", json());
+    if (lp.is_object()) {
+      backup.push_back(line("last plan", lp.value("finished", "").substr(0, 19)));
+      backup.push_back(line("  single-copy files", std::to_string(lp.value("single_copy", 0)) +
+                                                       " (" + std::to_string(lp.value("responsible", 0)) +
+                                                       " held by this server)"));
+      backup.push_back(line("  proposed", std::to_string(lp.value("proposed", 0))));
+      if (lp.value("auto_approved", 0) > 0)
+        backup.push_back(line("  approved automatically", std::to_string(lp.value("auto_approved", 0))));
+      int nodest = lp.value("no_destination", 0);
+      backup.push_back(line("  no possible destination", std::to_string(nodest), Color::Red,
+                            nodest > 0));
+      for (auto& [reason, n] : lp.value("reasons", json::object()).items())
+        backup.push_back(hbox({text("      " + n.dump() + "  "), paragraph(reason) | dim}));
+    } else {
+      backup.push_back(text("not planned yet (p: plan now)") | dim);
+    }
+    return vbox({hbox({vbox(left) | flex | border, vbox(right) | flex | border}),
+                 vbox(backup) | border});
   }
 
   Context& ctx_;
+  json replication_ = json::object();
+  int polls_ = 0;
   Component root_;
 };
 
@@ -732,8 +784,12 @@ class WantedView : public View {
   explicit WantedView(Context& ctx) : ctx_(ctx) {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
+      std::string shown = total_ > static_cast<int>(items_.size())
+                              ? " (showing " + std::to_string(items_.size()) + " of " +
+                                    std::to_string(total_) + "; A approves all)"
+                              : "";
       return vbox({list_panel(std::to_string(items_.size()) + " proposed job(s), " +
-                                  std::to_string(checked_.size()) + " selected" + note_,
+                                  std::to_string(checked_.size()) + " selected" + shown + note_,
                               menu_, labels_.size(), "no proposed jobs")});
     });
     root_ |= CatchEvent([this](Event e) { return on_event(e); });
@@ -748,6 +804,7 @@ class WantedView : public View {
     json out;
     if (ctx_.attempt([&] { out = ctx_.api->get("/api/wanted?everywhere=1"); })) {
       items_ = out["wanted"];
+      total_ = std::max(out.value("total", 0), static_cast<int>(items_.size()));
       note_ = unreachable_note(out);
     } else {
       items_ = json::array();
@@ -771,7 +828,8 @@ class WantedView : public View {
                                                       : w.value("from", "") + " → " + w.value("to", "");
       labels_.push_back(std::string(on ? "[x] " : "[ ] ") + fit(w.value("op", ""), 10) +
                         fit(w.value("path", ""), 50) + " " + fit(route, 24) + " " +
-                        w.value("reason", "") + where_suffix(ctx_, w));
+                        w.value("reason", "") + where_suffix(ctx_, w) +
+                        (w.value("message", "").empty() ? "" : "  (" + w.value("message", "") + ")"));
     }
   }
 
@@ -803,9 +861,12 @@ class WantedView : public View {
       if (!server.empty()) body["server"] = server;
       ctx_.attempt([&] {
         auto out = ctx_.api->post("/api/wanted", body);
-        if (!out["job_id"].is_null() && out.contains("job_id")) ++jobs;
+        if (out.contains("job_id") && !out["job_id"].is_null()) ++jobs;
+        jobs += out.value("remote_jobs", 0);
         items += out.value("items", 0);
         rejected += out.value("rejected", 0);
+        for (const auto& err : out.value("errors", json::array()))
+          ctx_.error(err.get<std::string>());
       });
     }
     if (action == "approve")
@@ -846,6 +907,7 @@ class WantedView : public View {
   Context& ctx_;
   json items_ = json::array();
   std::string note_;
+  int total_ = 0;
   std::set<std::string> checked_;
   std::vector<std::string> labels_;
   int selected_ = 0;
