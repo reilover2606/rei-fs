@@ -13,6 +13,10 @@ uv run reifs scan
 uv run reifs serve           # HTTPS API for the client + background work
 ```
 
+Ctrl+C (or SIGTERM) stops the server: the current scan or transfer is
+interrupted (partial files are kept and resumed next time) and the rsync
+processes it started are ended. A second Ctrl+C forces an immediate exit.
+
 `reifs serve` listens on `[server] listen` (default `0.0.0.0:7420`). It
 creates a self-signed certificate on first start and prints its
 fingerprint (also shown by `reifs fingerprint`). It also scans every

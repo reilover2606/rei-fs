@@ -19,15 +19,19 @@ hash afterwards.
 from __future__ import annotations
 
 import os
+import queue
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .config import Config
+from .control import StopFn, check
 
 SCRATCH = ".rei-fs"
 _PROGRESS = re.compile(rb"^\s*([\d,.']+)\s+\d+%")
@@ -110,15 +114,24 @@ def ssh_command(cfg: Config, remote) -> str:
             f' -o UserKnownHostsFile="{known}" -o ConnectTimeout=20')
 
 
+# rsync processes running now, so that a forced shutdown can kill them.
+_ACTIVE: set[subprocess.Popen] = set()
+_ACTIVE_LOCK = threading.Lock()
+POLL_SECONDS = 0.5
+
+
 def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: list[str],
-              progress: ProgressFn | None = None, remote=None) -> BatchResult:
+              progress: ProgressFn | None = None, remote=None,
+              stop: StopFn | None = None) -> BatchResult:
     """Copy ``rel_paths`` (``/``-separated, relative to the roots).
 
-    With ``remote`` (a peers.RemoteSource) the files are pulled from a paired
-    server's rsync daemon instead of the local ``src_root``.
+    With ``remote`` (a peers.RemoteSource or SshSource) the files are pulled
+    from a paired server instead of the local ``src_root``.
 
-    KeyboardInterrupt terminates rsync (keeping its partial file) and is
-    re-raised.
+    ``stop`` is polled twice a second whether or not rsync prints anything.
+    When it returns True, rsync (all of its processes) is terminated, keeping
+    its partial file, and ``control.Stopped`` is raised. KeyboardInterrupt
+    does the same.
     """
     scratch = Path(dst_root) / SCRATCH
     (scratch / "partial").mkdir(parents=True, exist_ok=True)
@@ -136,16 +149,25 @@ def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: lis
             env = dict(os.environ, RSYNC_PASSWORD=remote.password)
         with tempfile.TemporaryFile(dir=tmp_dir) as err:
             try:
+                # Its own process group (POSIX): rsync is several processes, and
+                # we must be able to end all of them, whatever the terminal does.
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err,
-                                        stdin=subprocess.DEVNULL, env=env)
+                                        stdin=subprocess.DEVNULL, env=env,
+                                        start_new_session=(os.name == "posix"))
             except OSError as e:
                 return BatchResult(127, f"cannot run rsync ({cfg.rsync.path}): {e}")
+            with _ACTIVE_LOCK:
+                _ACTIVE.add(proc)
             try:
-                _pump_progress(proc, progress)
+                _pump_progress(proc, progress, stop)
                 proc.wait()
             except BaseException:
                 _stop(proc)
                 raise
+            finally:
+                _kill_group(proc)  # stragglers still holding the pipe
+                with _ACTIVE_LOCK:
+                    _ACTIVE.discard(proc)
             err.seek(0)
             stderr = err.read().decode("utf-8", "replace").strip()
         return BatchResult(proc.returncode, stderr)
@@ -156,12 +178,41 @@ def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: lis
             pass
 
 
-def _pump_progress(proc: subprocess.Popen, progress: ProgressFn | None) -> None:
+def _pump_progress(proc: subprocess.Popen, progress: ProgressFn | None,
+                   stop: StopFn | None = None) -> None:
+    """Read rsync's progress until it ends, checking ``stop`` all the time.
+
+    The reading is done in a thread: a blocking read would not notice a stop
+    request while rsync is silent (stalled network, a long checksum), nor an
+    rsync that died while a child process still holds the pipe open.
+    """
     assert proc.stdout is not None
+    chunks: queue.Queue = queue.Queue()
+
+    def reader() -> None:
+        try:
+            while True:
+                data = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") \
+                    else proc.stdout.read(4096)
+                if not data:
+                    break
+                chunks.put(data)
+        except (OSError, ValueError):  # pipe closed under us
+            pass
+        finally:
+            chunks.put(None)
+
+    threading.Thread(target=reader, name="reifs-rsync-output", daemon=True).start()
     buf = b""
     while True:
-        chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
-        if not chunk:
+        try:
+            chunk = chunks.get(timeout=POLL_SECONDS)
+        except queue.Empty:
+            check(stop)
+            if proc.poll() is not None:
+                break  # rsync is gone, even if a leftover child keeps the pipe open
+            continue
+        if chunk is None:
             break
         buf += chunk
         *lines, buf = re.split(rb"[\r\n]", buf)
@@ -171,14 +222,47 @@ def _pump_progress(proc: subprocess.Popen, progress: ProgressFn | None) -> None:
                 if m:
                     progress(int(re.sub(rb"[^\d]", b"", m.group(1)) or b"0"))
                     break
+        check(stop)
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    if os.name != "posix":
+        return
+    try:
+        os.killpg(proc.pid, sig)  # the group was created by start_new_session
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    _signal_group(proc, signal.SIGKILL if os.name == "posix" else 0)
 
 
 def _stop(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    proc.terminate()  # rsync keeps the partial file on SIGTERM
+    """End rsync, politely first (it keeps its partial file on SIGTERM)."""
+    if os.name == "posix":
+        _signal_group(proc, signal.SIGTERM)
+    elif proc.poll() is None:
+        proc.terminate()
     try:
-        proc.wait(timeout=15)
+        proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if os.name == "posix":
+            _kill_group(proc)
+        else:
+            proc.kill()
         proc.wait()
+    _kill_group(proc)
+
+
+def kill_all() -> None:
+    """Forced shutdown: kill every rsync still running."""
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+    for proc in procs:
+        _kill_group(proc)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass

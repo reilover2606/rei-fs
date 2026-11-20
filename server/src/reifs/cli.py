@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -494,11 +495,28 @@ def cmd_serve(args) -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down (finishing the current file)...", file=sys.stderr)
-    finally:
+        print("\nshutting down... (Ctrl+C again to force)", file=sys.stderr, flush=True)
+    try:
         server.server_close()
-        worker.close()
-        syncer.close()
+        worker.close(timeout=10)   # stops the current scan or transfer
+        syncer.close(timeout=5)
+    except KeyboardInterrupt:
+        # A second Ctrl+C (or SIGTERM): do not wait for anything.
+        from . import transfer
+
+        print("forcing exit", file=sys.stderr, flush=True)
+        transfer.kill_all()
+        syncer.daemon.stop()
+        os._exit(130)
+    if worker.thread.is_alive() or syncer.thread.is_alive():
+        # Something did not stop in time; the threads are daemons, but the
+        # children we started must not outlive us.
+        from . import transfer
+
+        print("some work did not stop in time; ending it", file=sys.stderr, flush=True)
+        transfer.kill_all()
+        syncer.daemon.stop()
+        os._exit(1)
 
 
 def cmd_fingerprint(args) -> None:
