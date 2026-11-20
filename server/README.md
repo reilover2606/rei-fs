@@ -13,9 +13,12 @@ uv run reifs scan
 uv run reifs serve           # HTTPS API for the client + background work
 ```
 
-Ctrl+C (or SIGTERM) stops the server: the current scan or transfer is
+Press `q` (or Ctrl+C, or send SIGTERM) to stop the server. In a terminal, `q`
+works without Enter; with no terminal (a service, a background job) only the
+signals work. Stopping: the current scan or transfer is
 interrupted (partial files are kept and resumed next time) and the rsync
-processes it started are ended. A second Ctrl+C forces an immediate exit.
+processes it started are ended. A second Ctrl+C forces an immediate exit. If the terminal was left with
+Ctrl+C disabled by another program, the server re-enables it and says so.
 If shutdown ever gets stuck, after 8 s it prints where every thread is (send
 that output with a bug report) and after 20 s it exits anyway; set
 `REIFS_SHUTDOWN_SECONDS` to change that. `kill -USR1 PID` prints the thread

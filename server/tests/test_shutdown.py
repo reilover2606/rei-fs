@@ -232,3 +232,106 @@ def test_watchdog_ends_a_stuck_shutdown_and_shows_stacks(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_ctrl_c_works_on_a_terminal_with_signals_disabled(tmp_path):
+    """A terminal left in raw mode (stty -isig, e.g. after a killed full-screen
+    program) turns Ctrl+C into plain input. The server re-enables signals."""
+    import pty
+    import select
+    import termios
+
+    env = _serve_env(tmp_path)
+    pid, master = pty.fork()
+    if pid == 0:                                    # child: stdin is the pty
+        attrs = termios.tcgetattr(0)
+        attrs[3] &= ~termios.ISIG                   # signals off, like raw mode
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
+        os.execve(sys.executable, [sys.executable, "-m", "reifs", "serve",
+                                   "--listen", "127.0.0.1:0"], env)
+    output = b""
+
+    def read(seconds):
+        nonlocal output
+        end = time.time() + seconds
+        while time.time() < end:
+            if select.select([master], [], [], 0.2)[0]:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                output += data
+
+    try:
+        read(4)
+        assert b"to stop" in output
+        os.write(master, b"\x03")                   # the Ctrl+C keystroke
+        read(4)
+        done, status = os.waitpid(pid, os.WNOHANG)
+        assert done == pid, "the server ignored Ctrl+C"
+        assert b"shutting down" in output
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        os.close(master)
+
+
+def test_q_stops_the_server_and_restores_the_terminal(tmp_path):
+    """In a terminal, pressing q (no Enter) shuts the server down cleanly."""
+    import pty
+    import select
+    import termios
+
+    env = _serve_env(tmp_path)
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execve(sys.executable, [sys.executable, "-m", "reifs", "serve",
+                                   "--listen", "127.0.0.1:0"], env)
+    output = b""
+
+    def read(seconds):
+        nonlocal output
+        end = time.time() + seconds
+        while time.time() < end:
+            if select.select([master], [], [], 0.2)[0]:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                output += data
+
+    try:
+        read(4)
+        assert b"Press q (or Ctrl+C) to stop" in output
+        # While running, single keys are delivered (cbreak: no ICANON).
+        assert not termios.tcgetattr(master)[3] & termios.ICANON
+        os.write(master, b"x")                       # other keys do nothing
+        read(1)
+        assert os.waitpid(pid, os.WNOHANG)[0] == 0
+        os.write(master, b"q")
+        read(4)
+        done, status = os.waitpid(pid, os.WNOHANG)
+        assert done == pid, "q did not stop the server"
+        assert os.WEXITSTATUS(status) == 0
+        assert b"shutting down" in output
+        assert termios.tcgetattr(master)[3] & termios.ICANON   # terminal restored
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        os.close(master)
