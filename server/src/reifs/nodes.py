@@ -11,7 +11,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import db
+from . import db, index
 from .config import Config
 
 MARKER_DIR = ".rei-fs"
@@ -174,9 +174,11 @@ def register_node(
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO nodes(id, name, kind, owner_id, root_path, case_sensitive,"
-            " restricted_names, online, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
-            (node_id, name, kind, owner, str(root), int(case_sensitive), int(restricted), ts),
+            " restricted_names, online, last_seen, owner_since)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (node_id, name, kind, owner, str(root), int(case_sensitive), int(restricted), ts, ts),
         )
+        index.log_node(conn, node_id)
         write_marker(root, marker)
     return node_id
 
@@ -222,12 +224,13 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
         if row["root_path"]:
             consider(Path(row["root_path"]))
 
-    if len(located) < len(owned):
-        bases = [Path(p) for p in cfg.discovery.paths] or default_discovery_paths()
-        for base in bases:
-            if base.is_dir():
-                for root in find_markers(base, cfg.discovery.max_depth):
-                    consider(root)
+    # Always look at the mount points too: a moved drive, or another server's
+    # drive plugged in here (shown as foreign, can be adopted).
+    bases = [Path(p) for p in cfg.discovery.paths] or default_discovery_paths()
+    for base in bases:
+        if base.is_dir():
+            for root in find_markers(base, cfg.discovery.max_depth):
+                consider(root)
 
     ts = db.now()
     result = Discovery(online=[], offline=[], foreign=[], moved=[])
@@ -235,9 +238,12 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
         for node_id, row in owned.items():
             root = located.get(node_id)
             if root is None:
-                conn.execute("UPDATE nodes SET online = 0 WHERE id = ?", (node_id,))
+                if row["online"]:
+                    conn.execute("UPDATE nodes SET online = 0 WHERE id = ?", (node_id,))
+                    index.log_node(conn, node_id)
                 result.offline.append(row["name"])
                 continue
+            announce = not row["online"]
             if row["root_path"] != str(root):
                 result.moved.append((row["name"], root))
                 try:
@@ -249,9 +255,12 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
                     " restricted_names = ? WHERE id = ?",
                     (str(root), cs, rn, node_id),
                 )
+                announce = announce or (cs, rn) != (row["case_sensitive"], row["restricted_names"])
             conn.execute(
                 "UPDATE nodes SET online = 1, last_seen = ? WHERE id = ?", (ts, node_id)
             )
+            if announce:
+                index.log_node(conn, node_id)
             result.online.append(Located(node_id, row["name"], root))
         for m, path in foreign:
             conn.execute(
@@ -263,3 +272,54 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
             )
     result.foreign = [(m.name, m.owner_id, path) for m, path in foreign]
     return result
+
+
+def adopt_node(conn: sqlite3.Connection, name_or_path: str) -> str:
+    """Take ownership of a storage node owned by another server that is now
+    attached here (design 3.3). The new ownership is announced with a newer
+    ``owner_since``; the former owner stops managing the node when it syncs."""
+    me = self_id(conn)
+    row = conn.execute("SELECT * FROM foreign_sightings WHERE name = ? OR node_id = ?",
+                       (name_or_path, name_or_path)).fetchone()
+    root = Path(row["path"] if row else name_or_path).resolve()
+    marker = read_marker(root)
+    if marker is None:
+        raise NodeError(f"no foreign node named {name_or_path!r} and no node marker at {root}")
+    if marker.owner_id == me:
+        raise NodeError(f"{root} is already one of this server's nodes")
+    if marker.kind == "server":
+        raise NodeError("that is another server's own storage; it cannot be adopted")
+    for r in conn.execute("SELECT name, root_path FROM nodes WHERE owner_id = ? AND"
+                          " root_path IS NOT NULL", (me,)):
+        if _overlaps(root, Path(r["root_path"])):
+            raise NodeError(f"{root} overlaps node {r['name']!r}")
+    case_sensitive, restricted = probe_capabilities(root)
+    ts = db.now()
+    with db.transaction(conn):
+        conn.execute("INSERT OR IGNORE INTO servers(id, name) VALUES (?, ?)",
+                     (marker.owner_id, marker.owner_id[:8]))
+        existing = conn.execute("SELECT name FROM nodes WHERE id = ?", (marker.node_id,)).fetchone()
+        if existing:
+            name = existing["name"]
+            conn.execute(
+                "UPDATE nodes SET owner_id = ?, owner_since = ?, root_path = ?, online = 1,"
+                " last_seen = ?, case_sensitive = ?, restricted_names = ?, last_scan_id = NULL"
+                " WHERE id = ?",
+                (me, ts, str(root), ts, int(case_sensitive), int(restricted), marker.node_id))
+        else:
+            name = marker.name
+            n = 2
+            while conn.execute("SELECT 1 FROM nodes WHERE name = ?", (name,)).fetchone():
+                name = f"{marker.name}-{n}"
+                n += 1
+            conn.execute(
+                "INSERT INTO nodes(id, name, kind, owner_id, owner_since, root_path,"
+                " case_sensitive, restricted_names, online, last_seen)"
+                " VALUES (?, ?, 'storage', ?, ?, ?, ?, ?, 1, ?)",
+                (marker.node_id, name, me, ts, str(root), int(case_sensitive),
+                 int(restricted), ts))
+        index.log_node(conn, marker.node_id)
+        conn.execute("DELETE FROM foreign_sightings WHERE node_id = ?", (marker.node_id,))
+        write_marker(root, Marker(node_id=marker.node_id, name=name, kind="storage",
+                                  owner_id=me, created=marker.created))
+    return name

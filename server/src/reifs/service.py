@@ -12,22 +12,27 @@ with the CLI. It also:
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
 
-from . import db, runner, scanner
+from . import db, peers, runner, scanner, sync
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
 from .nodes import discover
+from .rsyncd import RsyncDaemon
 
 log = logging.getLogger("reifs.service")
 
 DISCOVERY_SECONDS = 30
 JOBS_SECONDS = 60
+SYNC_SECONDS = 30
+RETRY_SECONDS = 5      # while a paired server is unreachable
+TICK_SECONDS = 2       # how often the pairing state is checked for changes
 
 
 @dataclass
@@ -40,8 +45,9 @@ class Activity:
 
 
 class Worker:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, syncer: "Syncer | None" = None):
         self.cfg = cfg
+        self.syncer = syncer
         self.tasks: queue.Queue = queue.Queue()
         self.stop_requested = threading.Event()
         self.shutdown = threading.Event()
@@ -148,6 +154,9 @@ class Worker:
                 log.info("node %s came online; scanning it", node_id)
                 self.request_scan([node_id])
                 self.request_jobs()
+        if self.syncer is not None and current != previous:
+            self.syncer.request_daemon_update()
+            self.syncer.request_poke()  # node online/offline announcements
         return current
 
     def _run(self, conn, task: tuple) -> None:
@@ -169,10 +178,14 @@ class Worker:
                               last_error="")
                     if any(r.stats.added or r.stats.changed for r in results):
                         self.request_jobs()
+                    if self.syncer is not None:
+                        self.syncer.request_poke()
                 else:
                     reports = runner.run_jobs(conn, self.cfg, None, self._progress, stop)
                     done = sum(r.done for r in reports)
                     self._set(last_result=f"jobs run: {done} item(s) done", last_error="")
+                    if done and self.syncer is not None:
+                        self.syncer.request_poke()
         except Stopped:
             self._set(last_result=f"{kind} stopped on request")
         except LockError as e:
@@ -182,3 +195,144 @@ class Worker:
             self._set(last_error=f"{kind} failed: {e}")
         finally:
             self._set(state="idle", detail="", since=db.now())
+
+
+class Syncer:
+    """Pulls the change log of every paired server, delivers the outbox and
+    keeps the rsync daemon configuration current. Runs in its own thread so
+    long scans and transfers never delay metadata propagation."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.daemon = RsyncDaemon(cfg)
+        self.wake = threading.Event()
+        self.shutdown = threading.Event()
+        self._flags_lock = threading.Lock()
+        self._daemon_dirty = True
+        self._poke_peers = False
+        self.thread = threading.Thread(target=self._main, name="reifs-sync", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self, timeout: float = 15) -> None:
+        self.shutdown.set()
+        self.wake.set()
+        self.thread.join(timeout)
+        self.daemon.stop()
+
+    def request_sync(self) -> None:
+        self.wake.set()
+
+    def request_daemon_update(self) -> None:
+        with self._flags_lock:
+            self._daemon_dirty = True
+        self.wake.set()
+
+    def request_poke(self) -> None:
+        """Ask peers to pull from us now (after local changes)."""
+        with self._flags_lock:
+            self._poke_peers = True
+        self.wake.set()
+
+    @staticmethod
+    def _pairing_signature(conn) -> tuple:
+        # Changes when servers are paired/unpaired, even by the CLI in another process.
+        return tuple(conn.execute("SELECT id, paired, token_out, rsync_in_password FROM servers"
+                                  " ORDER BY id").fetchall())
+
+    def _main(self) -> None:
+        conn = db.open_existing(self.cfg.db_path)
+        signature = None
+        last_own = None
+        next_sync = 0.0
+        try:
+            while not self.shutdown.is_set():
+                current = self._pairing_signature(conn)
+                if current != signature:
+                    signature = current
+                    self.request_daemon_update()
+                # New local facts (also from the CLI in another process): tell peers.
+                own = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+                if last_own is not None and own != last_own:
+                    self.request_poke()
+                last_own = own
+                with self._flags_lock:
+                    dirty, poke = self._daemon_dirty, self._poke_peers
+                    self._daemon_dirty = self._poke_peers = False
+                if dirty:
+                    try:
+                        self.daemon.update(conn)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("rsync daemon update failed: %s", e)
+                    next_sync = 0.0  # pairing or nodes changed: sync now
+                else:
+                    self.daemon.ensure()  # restart it if it died
+                now = time.monotonic()
+                if poke or self.wake.is_set() or now >= next_sync:
+                    self.wake.clear()
+                    self.sync_all(conn, poke)
+                    offline = conn.execute("SELECT 1 FROM servers WHERE paired = 1"
+                                           " AND online = 0 LIMIT 1").fetchone()
+                    next_sync = time.monotonic() + (RETRY_SECONDS if offline else SYNC_SECONDS)
+                self.wake.wait(TICK_SECONDS)
+        finally:
+            conn.close()
+
+    def sync_all(self, conn, poke: bool = False) -> int:
+        total = 0
+        for peer in peers.paired_peers(conn):
+            if self.shutdown.is_set():
+                break
+            total += sync_peer(conn, peer["id"], poke)
+        if total:
+            # News learned from one peer: let the others pull it from us now.
+            self.request_poke()
+        return total
+
+
+def sync_peer(conn, server_id: str, poke: bool = False) -> int:
+    """Pull a peer's changes and deliver our outbox to it. Returns entries applied."""
+    applied = 0
+    try:
+        client = peers.client_for(conn, server_id, timeout=30)
+        if poke:
+            client.request("POST", "/api/peer/poke", {})
+        cursor = peers.peer_row(conn, server_id)["pull_cursor"]
+        while True:
+            data = client.request("GET", f"/api/peer/changes?since={cursor}&limit={sync.BATCH}")
+            applied += sync.apply_changes(conn, data["changes"])
+            cursor = int(data["last_seq"])
+            with db.transaction(conn):
+                conn.execute("UPDATE servers SET pull_cursor = ? WHERE id = ?", (cursor, server_id))
+            if not data.get("more"):
+                break
+        deliver_outbox(conn, server_id, client)
+        with db.transaction(conn):
+            conn.execute("UPDATE servers SET online = 1, last_sync = ?, last_error = NULL"
+                         " WHERE id = ?", (db.now(), server_id))
+    except peers.PeerError as e:
+        with db.transaction(conn):
+            conn.execute("UPDATE servers SET online = 0, last_error = ? WHERE id = ?",
+                         (str(e), server_id))
+    return applied
+
+
+def deliver_outbox(conn, server_id: str, client: "peers.PeerClient") -> None:
+    for item in conn.execute("SELECT * FROM outbox WHERE server_id = ? ORDER BY id",
+                             (server_id,)).fetchall():
+        try:
+            client.request("POST", item["path"], json.loads(item["body"]))
+        except peers.PeerError as e:
+            if e.status and 400 <= e.status < 500 and e.status != 495:
+                # Refused for good (e.g. the copy changed): drop it, keep a trace.
+                log.warning("peer refused %s: %s", item["path"], e)
+                with db.transaction(conn):
+                    conn.execute("DELETE FROM outbox WHERE id = ?", (item["id"],))
+                continue
+            with db.transaction(conn):
+                conn.execute("UPDATE outbox SET attempts = attempts + 1, last_error = ?"
+                             " WHERE id = ?", (str(e), item["id"]))
+            raise
+        with db.transaction(conn):
+            conn.execute("DELETE FROM outbox WHERE id = ?", (item["id"],))

@@ -52,7 +52,7 @@ new one. Settings live in `~/.config/rei-fs-client/client.json`
 
 ### Tabs and keys
 
-`1`-`8` or `F1`-`F8` switch tabs, `?` shows help, `q` quits. In the Search
+`1`-`9` or `F1`-`F9` switch tabs, `?` shows help, `q` quits. In the Search
 tab the number keys type into the fields: press `Esc` (or `↓`) to get to the
 results, or use `F1`-`F8`.
 
@@ -64,5 +64,10 @@ results, or use `F1`-`F8`.
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
-| Nodes | Nodes and their settings | `s`/`S` scan, `v` verify, `p` priority, `t` backup target |
+| Nodes | Nodes of all servers, foreign drives | `s`/`S` scan, `v` verify, `p` priority, `t` backup target, `o` adopt |
 | Marked | Copies waiting for you to delete them | `u`/`U` keep (unmark) |
+| Servers | This server's fingerprint, paired servers, pairing requests | `p` pair, `a`/`x` accept/reject, `d` unpair, `s` sync now |
+
+Decisions, Wanted and Jobs show the items of every paired server (marked
+`@server`); actions on them are sent to that server. Copying to another
+server's node creates the job on that server, which pulls the files.

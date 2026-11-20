@@ -13,7 +13,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, auth, decisions, jobs, nodes, queries, runner, scanner, tags
+from . import (__version__, auth, db, decisions, index, jobs, nodes, peers, queries, runner,
+               scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
 from .locking import LockError, ServerLock
@@ -128,7 +129,12 @@ def cmd_node_set(args) -> None:
     if not updates:
         raise CliError("nothing to change")
     sets = ", ".join(f"{k} = ?" for k in updates)
-    conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
+    if node["owner_id"] != nodes.self_id(conn):
+        raise CliError(f"node {node['name']!r} belongs to another server; change it there "
+                       "(or from the client)")
+    with db.transaction(conn):
+        conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
+        index.log_node(conn, node["id"])
     print(f"Updated node {node['name']!r}.")
 
 
@@ -352,8 +358,24 @@ def _run_jobs(cfg, conn, job_ids) -> list[runner.JobReport]:
 
 def cmd_transfer(args) -> None:
     cfg, conn = open_server(args.home)
-    rep = jobs.create_transfer_job(conn, args.vpaths, args.tag, args.to, args.src,
-                                   move=args.move)
+    try:
+        rep = jobs.create_transfer_job(conn, args.vpaths, args.tag, args.to, args.src,
+                                       move=args.move)
+    except jobs.RemoteDestination as e:
+        # Transfers into a node are run by its owner: create the job there.
+        body = {"kind": "move" if args.move else "copy", "paths": args.vpaths, "to": args.to}
+        if args.tag:
+            body["tag"] = args.tag
+        if args.src:
+            body["from"] = args.src
+        out = peers.forward(conn, e.owner_id, "POST", "/api/jobs", body)
+        owner = conn.execute("SELECT name FROM servers WHERE id = ?", (e.owner_id,)).fetchone()[0]
+        if out.get("job_id") is None:
+            print(f"Nothing to do on {owner}; no job created.")
+        else:
+            print(f"Created job #{out['job_id']} with {out['items']} item(s) on server {owner!r}; "
+                  "it runs there.")
+        return
     _print_create_report(rep)
     if rep.job_id is not None and args.run:
         _run_jobs(cfg, conn, [rep.job_id])
@@ -437,7 +459,7 @@ def cmd_serve(args) -> None:
     import logging
 
     from . import api, tls
-    from .service import Worker
+    from .service import Syncer, Worker
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -446,14 +468,25 @@ def cmd_serve(args) -> None:
     if not cfg.server.password_hash:
         print("warning: no admin password set; clients cannot log in ('reifs passwd')",
               file=sys.stderr)
-    worker = Worker(cfg)
-    server = api.make_server(cfg, worker, args.listen)
+    syncer = Syncer(cfg)
+    worker = Worker(cfg, syncer)
+    server = api.make_server(cfg, worker, args.listen, syncer)
     cert, _ = tls.paths(cfg.home)
     host, port = server.server_address[:2]
     print(f"rei-fs server {cfg.server.name!r} listening on https://{host}:{port}")
     print(f"certificate fingerprint (SHA-256): {tls.fingerprint(cert)}")
     print("Compare it with what the client shows the first time it connects.", flush=True)
+    import signal
+
+    def on_term(signum, frame):  # shut down cleanly (stops the rsync daemon too)
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, on_term)
+    except (ValueError, OSError):
+        pass
     worker.start()
+    syncer.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -461,6 +494,7 @@ def cmd_serve(args) -> None:
     finally:
         server.server_close()
         worker.close()
+        syncer.close()
 
 
 def cmd_fingerprint(args) -> None:
@@ -472,6 +506,68 @@ def cmd_fingerprint(args) -> None:
     print(tls.fingerprint(cert))
 
 
+def cmd_peer(args) -> None:
+    cfg, conn = open_server(args.home)
+    if args.action == "pair":
+        if not args.target:
+            raise CliError("give the other server's HOST[:PORT]")
+        info, fp = peers.hello(args.target)
+        print(f"Server {info.get('name')!r} ({info.get('id')}) at {args.target}")
+        print(f"certificate fingerprint: {fp}")
+        print("Compare it with 'reifs fingerprint' on that server.")
+        if not args.yes and input("Send a pairing request? [y/N] ").strip().lower() != "y":
+            print("Cancelled.")
+            return
+        peers.request_pairing(conn, cfg, args.target, fp)
+        print("Request sent. Accept it on the other server ('reifs peer list' there, or the "
+              "client's Servers tab). This server must be running 'reifs serve' for that.")
+        return
+    if args.action in ("accept", "reject"):
+        if not args.target or not args.target.isdigit():
+            raise CliError(f"give the request number to {args.action} (see 'reifs peer list')")
+        if args.action == "accept":
+            name = peers.accept_pairing(conn, cfg, int(args.target))
+            print(f"Paired with {name!r}.")
+        else:
+            peers.reject_pairing(conn, int(args.target))
+            print("Rejected.")
+        return
+    if args.action == "remove":
+        row = peers.find_peer(conn, args.target or "")
+        peers.unpair(conn, row["id"])
+        print(f"Unpaired from {row['name']!r}.")
+        return
+    if args.action == "sync":
+        from .service import sync_peer
+
+        for p in peers.paired_peers(conn):
+            if args.target and args.target not in (p["name"], p["id"]):
+                continue
+            n = sync_peer(conn, p["id"])
+            row = peers.peer_row(conn, p["id"])
+            state = "ok" if row["online"] else f"failed: {row['last_error']}"
+            print(f"{p['name']}: {n} change(s) applied ({state})")
+        return
+    rows = [[p["name"], p["address"], "online" if p["online"] else "offline",
+             (p["last_sync"] or "")[:19], p["last_error"] or ""] for p in peers.paired_peers(conn)]
+    print(table(rows, ["SERVER", "ADDRESS", "STATE", "LAST SYNC", "LAST ERROR"])
+          if rows else "Not paired with any server.")
+    reqs = conn.execute("SELECT * FROM pair_requests WHERE status = 'pending' ORDER BY id"
+                        ).fetchall()
+    if reqs:
+        print("\nPending pairing requests:")
+        print(table([[str(r["id"]), "incoming" if r["direction"] == "in" else "outgoing",
+                      r["name"], r["address"], r["fingerprint"][:23] + "..."] for r in reqs],
+                    ["ID", "DIRECTION", "SERVER", "ADDRESS", "FINGERPRINT"]))
+        print("Accept an incoming request with 'reifs peer accept ID'.")
+
+
+def cmd_node_adopt(args) -> None:
+    _, conn = open_server(args.home)
+    name = nodes.adopt_node(conn, args.node)
+    print(f"This server now owns node {name!r}. Run 'reifs scan {name}'.")
+
+
 def cmd_status(args) -> None:
     cfg, conn = open_server(args.home)
     s = queries.status(conn)
@@ -479,6 +575,10 @@ def cmd_status(args) -> None:
     total = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
     print(f"server {cfg.server.name!r}  ({cfg.home})")
     print(f"  nodes:            {online}/{total} online")
+    paired = conn.execute("SELECT COUNT(*), COALESCE(SUM(online), 0) FROM servers"
+                          " WHERE paired = 1").fetchone()
+    if paired[0]:
+        print(f"  paired servers:   {paired[1]}/{paired[0]} reachable")
     print(f"  files:            {s.files} ({human_size(s.bytes)})")
     print(f"  with >= 2 copies: {s.satisfied}")
     print(f"  under-replicated: {s.under_replicated} ({s.single_copy} with a single good copy)")
@@ -524,6 +624,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--target", choices=["yes", "no"], help="may receive replication copies")
     s.add_argument("--rename", metavar="NAME")
     s.set_defaults(func=cmd_node_set)
+
+    s = node.add_parser("adopt", help="take ownership of another server's drive attached here")
+    s.add_argument("node", help="name (see 'reifs discover') or path of the drive's node root")
+    s.set_defaults(func=cmd_node_adopt)
+
+    s = sub.add_parser("peer", help="other servers: list, pair, accept, reject, remove, sync")
+    s.add_argument("action", nargs="?", default="list",
+                   choices=["list", "pair", "accept", "reject", "remove", "sync"])
+    s.add_argument("target", nargs="?", help="address (pair), request id, or server name")
+    s.add_argument("-y", "--yes", action="store_true", help="pair without asking")
+    s.set_defaults(func=cmd_peer)
 
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)
@@ -630,7 +741,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args.func(args)
     except (CliError, ConfigError, nodes.NodeError, decisions.DecisionError,
-            tags.TagError, jobs.JobError, LockError, ValueError, OSError) as e:
+            tags.TagError, jobs.JobError, peers.PeerError, LockError, ValueError,
+            OSError) as e:
         print(f"reifs: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

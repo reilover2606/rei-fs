@@ -342,9 +342,9 @@ class App {
 
   bool on_global_event(const Event& e) {
     if (dialogs_.shown()) return false;
-    const Event fkeys[] = {Event::F1, Event::F2, Event::F3, Event::F4,
-                           Event::F5, Event::F6, Event::F7, Event::F8};
-    for (int i = 0; i < 8 && i < static_cast<int>(views_.size()); ++i) {
+    const Event fkeys[] = {Event::F1, Event::F2, Event::F3, Event::F4, Event::F5,
+                           Event::F6, Event::F7, Event::F8, Event::F9};
+    for (int i = 0; i < 9 && i < static_cast<int>(views_.size()); ++i) {
       if (e == fkeys[i]) {
         switch_to(i);
         return true;
@@ -357,7 +357,7 @@ class App {
     if (views_[tab_]->typing()) return false;
     if (e.is_character()) {
       const std::string& c = e.character();
-      if (c.size() == 1 && c[0] >= '1' && c[0] <= '8') {
+      if (c.size() == 1 && c[0] >= '1' && c[0] <= '9') {
         switch_to(c[0] - '1');
         return true;
       }
@@ -367,7 +367,7 @@ class App {
       }
       if (c == "?") {
         dialogs_.info("Keys",
-                      "1-8 / F1-F8   switch tab\n"
+                      "1-9 / F1-F9   switch tab\n"
                       "arrows        move, Enter opens / chooses\n"
                       "r             refresh the current tab\n"
                       "q             quit\n\n"
@@ -400,6 +400,13 @@ class App {
     bar.push_back(count("open_wanted", "wanted", Color::Cyan));
     bar.push_back(count("active_jobs", "jobs", Color::Cyan));
     bar.push_back(count("under_replicated", "under-replicated", Color::Red));
+    if (st.value("peers_total", 0) > 0) {
+      int on = st.value("peers_online", 0), total = st.value("peers_total", 0);
+      auto t = text(" servers " + std::to_string(on) + "/" + std::to_string(total) + " ");
+      bar.push_back(on < total ? t | color(Color::Red) : t | dim);
+    }
+    if (st.value("pair_requests", 0) > 0)
+      bar.push_back(text(" pairing request! ") | color(Color::Yellow) | bold);
     if (!act.value("last_error", "").empty())
       bar.push_back(text(" " + act.value("last_error", "") + " ") | color(Color::Red));
     if (auto err = poll_error(); !err.empty())

@@ -205,7 +205,7 @@ def test_rsync_failure_retries_then_fails(two):
 
 
 def test_verification_failure_is_transient(two, monkeypatch):
-    def corrupt(cfg, src_root, dst_root, rel_paths, progress=None):
+    def corrupt(cfg, src_root, dst_root, rel_paths, progress=None, remote=None):
         for rel in rel_paths:
             write(dst_root / rel, "corrupted!")
         return transfer.BatchResult(0, "")

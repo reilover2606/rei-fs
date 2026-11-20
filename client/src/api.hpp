@@ -55,6 +55,7 @@ class Api {
   json post(const std::string& path, const json& body = json::object());
 
   std::string server_name() const;
+  std::string server_id() const;
   std::string host() const { return host_; }
   int port() const { return port_; }
 
@@ -68,6 +69,7 @@ class Api {
   std::string seen_;
   std::string token_;
   std::string server_name_;
+  std::string server_id_;
   std::unique_ptr<httplib::SSLClient> client_;
   mutable std::mutex mutex_;
 };

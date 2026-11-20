@@ -130,9 +130,11 @@ def _apply_missing(conn, row, data, option) -> str:
         return "queued a copy back to the node"
     index.forget_copy(conn, fid, node_id)
     if option == "delete":
-        n = conn.execute(
-            "UPDATE copies SET marked_delete = 1 WHERE file_id = ?", (fid,)
-        ).rowcount
+        others = [r[0] for r in conn.execute(
+            "SELECT node_id FROM copies WHERE file_id = ?", (fid,)).fetchall()]
+        for other in others:
+            index.mark_copy(conn, fid, other, True)
+        n = len(others)
         return f"forgot the copy and marked {n} other cop{'y' if n == 1 else 'ies'} for deletion"
     return "forgot the copy"
 
@@ -140,14 +142,23 @@ def _apply_missing(conn, row, data, option) -> str:
 def _apply_rename(conn, row, data, option) -> str:
     if option == "ignore":
         return "left the other copies in place"
-    n = 0
-    for (node_id,) in conn.execute(
-        "SELECT node_id FROM copies WHERE file_id = ? AND state = 'present'", (row["file_id"],)
+    me, n, remote = index.self_id(conn), 0, 0
+    for node_id, owner in conn.execute(
+        "SELECT c.node_id, n.owner_id FROM copies c JOIN nodes n ON n.id = c.node_id"
+        " WHERE c.file_id = ? AND c.state = 'present'", (row["file_id"],)
     ).fetchall():
-        index.add_wanted(conn, "rename", row["file_id"], node_id, node_id, "rename",
-                         {"from": data["from"], "to": data["to"]})
-        n += 1
-    return f"queued {n} rename(s)"
+        if owner == me:
+            index.add_wanted(conn, "rename", row["file_id"], node_id, node_id, "rename",
+                             {"from": data["from"], "to": data["to"]})
+            n += 1
+        else:
+            # Renames on another server's node are proposed to that server.
+            index.queue_peer_call(conn, owner, "/api/peer/wanted",
+                                  {"op": "rename", "node_id": node_id, "from": data["from"],
+                                   "to": data["to"], "reason": "rename"})
+            remote += 1
+    extra = f"; proposed {remote} rename(s) to the servers owning the other nodes" if remote else ""
+    return f"queued {n} rename(s){extra}"
 
 
 def _apply_divergent(conn, row, data, option) -> str:

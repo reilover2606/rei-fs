@@ -79,6 +79,7 @@ void Api::login(const std::string& password) {
   std::lock_guard lock(mutex_);
   token_ = out.value("token", "");
   server_name_ = out.contains("server") ? out["server"].value("name", "") : "";
+  server_id_ = out.contains("server") ? out["server"].value("id", "") : "";
 }
 
 void Api::logout() {
@@ -88,6 +89,11 @@ void Api::logout() {
   }
   std::lock_guard lock(mutex_);
   token_.clear();
+}
+
+std::string Api::server_id() const {
+  std::lock_guard lock(mutex_);
+  return server_id_;
 }
 
 std::string Api::server_name() const {

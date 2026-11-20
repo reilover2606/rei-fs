@@ -50,6 +50,9 @@ class ServerSection:
     listen: str = f"0.0.0.0:{DEFAULT_PORT}"
     password_hash: str = ""
     auto_replicate: bool = False
+    # How other servers reach this one (HOST:PORT). Empty: the address they
+    # see our requests coming from, with the listen port.
+    advertise: str = ""
 
 
 @dataclass
@@ -78,6 +81,8 @@ class RsyncSection:
     # "auto" = native on Linux, cygwin on Windows.
     path_style: str = "auto"
     extra_args: list[str] = field(default_factory=list)
+    # rsync daemon serving our nodes (read-only) to paired servers.
+    daemon_port: int = 7421
 
 
 @dataclass
@@ -163,6 +168,8 @@ listen = {s(self.server.listen)}
 password_hash = {s(self.server.password_hash)}
 # Approve replication ("wanted") jobs automatically.
 auto_replicate = {b(self.server.auto_replicate)}
+# HOST:PORT other servers use to reach this one ("" = detect).
+advertise = {s(self.server.advertise)}
 
 [storage]
 # This server's own node root.
@@ -186,6 +193,8 @@ path = {s(self.rsync.path)}
 # auto | native | cygwin (/cygdrive/c/..., cwRsync) | msys (/c/..., MSYS2)
 path_style = {s(self.rsync.path_style)}
 extra_args = {lst(self.rsync.extra_args)}
+# Port of the rsync daemon that serves our nodes, read-only, to paired servers.
+daemon_port = {self.rsync.daemon_port}
 
 [transfers]
 # Files are sent in batches of at most this many files / megabytes.
