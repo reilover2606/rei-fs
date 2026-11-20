@@ -357,12 +357,13 @@ class Api:
 
     def find(self, conn, q, body, **_):
         limit = min(int(q.get("limit", FIND_LIMIT)), FIND_LIMIT)
-        results = queries.find(conn, q.get("q") or None, tag=q.get("tag") or None,
+        pol = replication.policy(self.cfg)
+        ids = queries.find_ids(conn, q.get("q") or None, tag=q.get("tag") or None,
                                node=q.get("node") or None, issues_only=q.get("issues") == "1",
-                               under_replicated=q.get("under") == "1",
-                               policy=replication.policy(self.cfg))
-        return {"total": len(results), "truncated": len(results) > limit,
-                "files": [file_json(f, full=False) for f in results[:limit]]}
+                               under_replicated=q.get("under") == "1", policy=pol)
+        return {"total": len(ids), "truncated": len(ids) > limit,
+                "files": [file_json(queries.file_info(conn, fid, pol), full=False)
+                          for fid in ids[:limit]]}
 
     # --- tags -----------------------------------------------------------------------------
 

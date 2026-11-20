@@ -223,7 +223,7 @@ class OverviewView : public View {
     ctx_.attempt([&] { replication_ = ctx_.api->get("/api/replication"); });
   }
   void on_poll() override {
-    if (++polls_ % 5 == 0) refresh();
+    if (++polls_ % 15 == 0) refresh();  // the backup plan changes rarely (~30 s)
   }
   std::string help() const override {
     return "s: scan all  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
@@ -284,7 +284,18 @@ class OverviewView : public View {
 
   Element render() {
     json s = ctx_.status();
-    if (s.empty()) return text("waiting for the server...") | center;
+    if (s.empty()) {
+      auto waited = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - ctx_.connected_at).count();
+      Elements lines = {text("waiting for the server's status... (" + std::to_string(waited) +
+                             " s)") | center};
+      std::string err = ctx_.poll_error();
+      if (!err.empty()) lines.push_back(paragraph("last error: " + err) | color(Color::Red) | center);
+      if (waited > 10)
+        lines.push_back(paragraph("The server may be busy (first scan of many files). "
+                                  "Other tabs work meanwhile.") | dim | center);
+      return vbox(lines) | center;
+    }
     auto act = s.value("activity", json::object());
     auto num = [&](const char* k) { return std::to_string(s.value(k, 0)); };
     auto line = [&](const std::string& label, const std::string& value, Color c = Color::Default,
