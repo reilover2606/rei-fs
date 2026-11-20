@@ -2,6 +2,7 @@
 // Marked. Each view keeps its own data and talks to the server through the
 // shared Context.
 #include <algorithm>
+#include <map>
 #include <set>
 
 #include <ftxui/component/component.hpp>
@@ -562,6 +563,32 @@ class SearchView : public View {
   Component query_input_, tag_input_, menu_, root_;
 };
 
+// --- several servers ---------------------------------------------------------------
+
+// Lists merged from every paired server carry "server" / "server_name".
+std::string where_suffix(Context& ctx, const json& item) {
+  std::string sid = item.value("server", "");
+  if (sid.empty() || sid == ctx.api->server_id()) return "";
+  return "  @" + item.value("server_name", sid.substr(0, 8));
+}
+
+// Address an action to the server that owns the item.
+json on_server(json body, const json& item) {
+  std::string sid = item.value("server", "");
+  if (!sid.empty()) body["server"] = sid;
+  return body;
+}
+
+std::string server_query(const json& item) {
+  std::string sid = item.value("server", "");
+  return sid.empty() ? "" : "server=" + url_encode(sid);
+}
+
+std::string unreachable_note(const json& out) {
+  if (!out.contains("unreachable") || out["unreachable"].empty()) return "";
+  return "  (unreachable: " + join(out["unreachable"]) + ")";
+}
+
 // --- Decisions ----------------------------------------------------------------------
 
 class DecisionsView : public View {
@@ -571,7 +598,8 @@ class DecisionsView : public View {
     opt.on_enter = [this] { decide_current(); };
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
-      return with_detail(list_panel(std::to_string(items_.size()) + " decision(s) need attention",
+      return with_detail(list_panel(std::to_string(items_.size()) +
+                                        " decision(s) need attention" + note_,
                                     menu_, labels_.size(), "nothing needs your attention"),
                          detail());
     });
@@ -584,20 +612,27 @@ class DecisionsView : public View {
   }
 
   void refresh() override {
-    std::string keep = current_id();
-    if (!ctx_.attempt([&] { items_ = ctx_.api->get("/api/decisions")["decisions"]; }))
+    std::string keep = current_key();
+    json out;
+    if (ctx_.attempt([&] { out = ctx_.api->get("/api/decisions?everywhere=1"); })) {
+      items_ = out["decisions"];
+      note_ = unreachable_note(out);
+    } else {
       items_ = json::array();
+    }
     labels_.clear();
     for (const auto& d : items_)
       labels_.push_back(fit("[" + d.value("kind", "") + "]", 12) + d.value("path", "") +
-                        (d["node"].is_string() ? "  (" + d.value("node", "") + ")" : ""));
-    selected_ = reselect(items_, keep, [](const json& d) { return d["id"].dump(); }, selected_);
+                        (d["node"].is_string() ? "  (" + d.value("node", "") + ")" : "") +
+                        where_suffix(ctx_, d));
+    selected_ = reselect(items_, keep, key_of, selected_);
   }
 
  private:
-  std::string current_id() const {
+  static std::string key_of(const json& d) { return d.value("server", "") + d["id"].dump(); }
+  std::string current_key() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
-    return items_[selected_]["id"].dump();
+    return key_of(items_[selected_]);
   }
 
   Element detail() {
@@ -605,15 +640,19 @@ class DecisionsView : public View {
     const json& d = items_[selected_];
     Elements rows = {hard_wrap(d.value("path", ""), kDetailWidth - 1) | bold, separator(),
                      label_value("kind", d.value("kind", "")),
-                     paragraph(d.value("summary", "")), separator(), text("choices") | bold};
+                     label_value("server", d.value("server_name", ""))};
+    rows.push_back(paragraph(d.value("summary", "")));
+    rows.push_back(separator());
+    rows.push_back(text("choices") | bold);
     for (const auto& o : d["options"])
       rows.push_back(paragraph("• " + o.value("label", "")));
     return vbox(rows);
   }
 
-  void resolve(int id, const std::string& option) {
-    ctx_.attempt([&] {
-      auto out = ctx_.api->post("/api/decisions/" + std::to_string(id), {{"option", option}});
+  bool resolve(const json& d, const std::string& option) {
+    return ctx_.attempt([&] {
+      auto out = ctx_.api->post("/api/decisions/" + std::to_string(d.value("id", 0)),
+                                on_server({{"option", option}}, d));
       ctx_.notify(out.value("summary", "done"));
     });
   }
@@ -625,7 +664,7 @@ class DecisionsView : public View {
     for (const auto& o : d["options"]) labels.push_back(o.value("label", ""));
     ctx_.dialogs->ask_choice(d.value("summary", "") + "\n" + d.value("path", ""), labels,
                              [this, d](int i) {
-                               resolve(d.value("id", 0), d["options"][i].value("key", ""));
+                               resolve(d, d["options"][i].value("key", ""));
                                refresh();
                              });
   }
@@ -663,14 +702,9 @@ class DecisionsView : public View {
               "Really apply \"" + labels[i] + "\" to " + std::to_string(n) + " decision(s)?",
               [this, kind, key = keys[i]] {
                 int done = 0;
-                for (const auto& x : items_) {
-                  if (x.value("kind", "") != kind) continue;
-                  bool ok = ctx_.attempt([&] {
-                    ctx_.api->post("/api/decisions/" + std::to_string(x.value("id", 0)),
-                                   {{"option", key}});
-                  });
-                  done += ok;
-                }
+                json all = items_;
+                for (const auto& x : all)
+                  if (x.value("kind", "") == kind) done += resolve(x, key);
                 ctx_.notify("applied to " + std::to_string(done) + " decision(s)");
                 refresh();
               });
@@ -678,19 +712,14 @@ class DecisionsView : public View {
   }
 
   bool on_event(const Event& e) {
-    if (key(e, "r")) {
-      refresh();
-      return true;
-    }
-    if (key(e, "a")) {
-      decide_all_of_kind();
-      return true;
-    }
+    if (key(e, "r")) return refresh(), true;
+    if (key(e, "a")) return decide_all_of_kind(), true;
     return false;
   }
 
   Context& ctx_;
   json items_ = json::array();
+  std::string note_;
   std::vector<std::string> labels_;
   int selected_ = 0;
   Component menu_, root_;
@@ -704,7 +733,7 @@ class WantedView : public View {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
       return vbox({list_panel(std::to_string(items_.size()) + " proposed job(s), " +
-                                  std::to_string(checked_.size()) + " selected",
+                                  std::to_string(checked_.size()) + " selected" + note_,
                               menu_, labels_.size(), "no proposed jobs")});
     });
     root_ |= CatchEvent([this](Event e) { return on_event(e); });
@@ -716,55 +745,74 @@ class WantedView : public View {
   }
 
   void refresh() override {
-    if (!ctx_.attempt([&] { items_ = ctx_.api->get("/api/wanted")["wanted"]; }))
+    json out;
+    if (ctx_.attempt([&] { out = ctx_.api->get("/api/wanted?everywhere=1"); })) {
+      items_ = out["wanted"];
+      note_ = unreachable_note(out);
+    } else {
       items_ = json::array();
-    std::set<int> still;
+    }
+    std::set<std::string> still;
     for (const auto& w : items_)
-      if (checked_.count(w.value("id", 0))) still.insert(w.value("id", 0));
+      if (checked_.count(key_of(w))) still.insert(key_of(w));
     checked_ = still;
     relabel();
     selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
   }
 
  private:
+  static std::string key_of(const json& w) { return w.value("server", "") + ":" + w["id"].dump(); }
+
   void relabel() {
     labels_.clear();
     for (const auto& w : items_) {
-      bool on = checked_.count(w.value("id", 0)) > 0;
+      bool on = checked_.count(key_of(w)) > 0;
       std::string route = w.value("from", "").empty() ? "→ " + w.value("to", "")
                                                       : w.value("from", "") + " → " + w.value("to", "");
       labels_.push_back(std::string(on ? "[x] " : "[ ] ") + fit(w.value("op", ""), 10) +
                         fit(w.value("path", ""), 50) + " " + fit(route, 24) + " " +
-                        w.value("reason", ""));
+                        w.value("reason", "") + where_suffix(ctx_, w));
     }
   }
 
-  std::vector<int> targets() const {
-    if (!checked_.empty()) return {checked_.begin(), checked_.end()};
-    if (selected_ >= 0 && selected_ < static_cast<int>(items_.size()))
-      return {items_[selected_].value("id", 0)};
-    return {};
+  // Selected items (or the current one), grouped by server: ids are per server.
+  std::map<std::string, std::vector<int>> targets() const {
+    std::map<std::string, std::vector<int>> out;
+    for (size_t i = 0; i < items_.size(); ++i) {
+      const json& w = items_[i];
+      bool pick = checked_.empty() ? static_cast<int>(i) == selected_ : checked_.count(key_of(w)) > 0;
+      if (pick) out[w.value("server", "")].push_back(w.value("id", 0));
+    }
+    return out;
   }
 
   void act(const std::string& action, bool all) {
-    json body = {{"action", action}};
+    std::map<std::string, std::vector<int>> groups;
     if (all) {
-      body["all"] = true;
+      for (const auto& w : items_) groups[w.value("server", "")];
     } else {
-      auto ids = targets();
-      if (ids.empty()) return;
-      body["ids"] = ids;
+      groups = targets();
     }
-    ctx_.attempt([&] {
-      auto out = ctx_.api->post("/api/wanted", body);
-      if (action == "approve")
-        ctx_.notify(out["job_id"].is_null()
-                        ? "nothing approved"
-                        : "job #" + std::to_string(out.value("job_id", 0)) + " created with " +
-                              std::to_string(out.value("items", 0)) + " item(s)");
+    int jobs = 0, items = 0, rejected = 0;
+    for (auto& [server, ids] : groups) {
+      json body = {{"action", action}};
+      if (all)
+        body["all"] = true;
       else
-        ctx_.notify("rejected " + std::to_string(out.value("rejected", 0)) + " proposal(s)");
-    });
+        body["ids"] = ids;
+      if (!server.empty()) body["server"] = server;
+      ctx_.attempt([&] {
+        auto out = ctx_.api->post("/api/wanted", body);
+        if (!out["job_id"].is_null() && out.contains("job_id")) ++jobs;
+        items += out.value("items", 0);
+        rejected += out.value("rejected", 0);
+      });
+    }
+    if (action == "approve")
+      ctx_.notify(std::to_string(jobs) + " job(s) created with " + std::to_string(items) +
+                  " item(s)");
+    else
+      ctx_.notify("rejected " + std::to_string(rejected) + " proposal(s)");
     checked_.clear();
     refresh();
   }
@@ -772,8 +820,8 @@ class WantedView : public View {
   bool on_event(const Event& e) {
     if (key(e, " ")) {
       if (selected_ >= 0 && selected_ < static_cast<int>(items_.size())) {
-        int id = items_[selected_].value("id", 0);
-        if (!checked_.erase(id)) checked_.insert(id);
+        std::string k = key_of(items_[selected_]);
+        if (!checked_.erase(k)) checked_.insert(k);
         relabel();
         if (selected_ + 1 < static_cast<int>(items_.size())) ++selected_;
       }
@@ -797,7 +845,8 @@ class WantedView : public View {
 
   Context& ctx_;
   json items_ = json::array();
-  std::set<int> checked_;
+  std::string note_;
+  std::set<std::string> checked_;
   std::vector<std::string> labels_;
   int selected_ = 0;
   Component menu_, root_;
@@ -812,7 +861,8 @@ class JobsView : public View {
     opt.on_change = [this] { load_detail(); };
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
-      return with_detail(list_panel(all_ ? "all jobs" : "active jobs", menu_, labels_.size(),
+      return with_detail(list_panel((all_ ? "all jobs" : "active jobs") + note_, menu_,
+                                    labels_.size(),
                                     all_ ? "no jobs" : "no active jobs (h: show finished)"),
                          detail_);
     });
@@ -823,38 +873,56 @@ class JobsView : public View {
   std::string help() const override {
     return "j: run now  c: cancel  y: retry failed  h: show/hide finished  r: refresh";
   }
-  void on_poll() override { refresh(); }
+  void on_poll() override {
+    if (++polls_ % 2 == 0) refresh();  // every ~4 s: lists come from every server
+  }
 
   void refresh() override {
-    std::string keep = current_id();
-    if (!ctx_.attempt([&] { items_ = ctx_.api->get(all_ ? "/api/jobs?all=1" : "/api/jobs")["jobs"]; }))
+    std::string keep = current_key();
+    json out;
+    if (ctx_.attempt([&] {
+          out = ctx_.api->get(all_ ? "/api/jobs?all=1&everywhere=1" : "/api/jobs?everywhere=1");
+        })) {
+      items_ = out["jobs"];
+      note_ = unreachable_note(out);
+    } else {
       items_ = json::array();
+    }
     labels_.clear();
     for (const auto& j : items_)
       labels_.push_back(fit("#" + std::to_string(j.value("id", 0)), 6) +
                         fit(j.value("status", ""), 10) +
                         fit(std::to_string(j.value("done", 0)) + "/" +
                                 std::to_string(j.value("total", 0)), 12) +
-                        j.value("description", ""));
-    selected_ = reselect(items_, keep, [](const json& j) { return j["id"].dump(); }, selected_);
+                        j.value("description", "") + where_suffix(ctx_, j));
+    selected_ = reselect(items_, keep, key_of, selected_);
     load_detail();
   }
 
  private:
-  std::string current_id() const {
-    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
-    return items_[selected_]["id"].dump();
+  static std::string key_of(const json& j) { return j.value("server", "") + j["id"].dump(); }
+  const json* current() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return nullptr;
+    return &items_[selected_];
   }
+  std::string current_key() const { return current() ? key_of(*current()) : ""; }
 
   void load_detail() {
-    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) {
+    const json* cur = current();
+    if (!cur) {
       detail_ = text("");
       return;
     }
     json j;
-    if (!ctx_.attempt([&] { j = ctx_.api->get("/api/jobs/" + current_id()); })) return;
+    std::string q = server_query(*cur);
+    if (!ctx_.attempt([&] {
+          j = ctx_.api->get("/api/jobs/" + std::to_string(cur->value("id", 0)) +
+                            (q.empty() ? "" : "?" + q));
+        }))
+      return;
     Elements rows = {paragraph(j.value("description", "")) | bold, separator(),
                      label_value("status", j.value("status", "")),
+                     label_value("server", cur->value("server_name", "")),
                      label_value("created", j.value("created", "").substr(0, 19))};
     std::string counts;
     for (auto& [k, v] : j["counts"].items()) counts += k + " " + v.dump() + "  ";
@@ -890,22 +958,37 @@ class JobsView : public View {
       return true;
     }
     if (key(e, "j")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/jobs/run"); })) ctx_.notify("job run queued");
+      // Every server runs its own jobs: ask each one shown.
+      std::set<std::string> servers = {""};
+      for (const auto& j : items_) servers.insert(j.value("server", ""));
+      for (const auto& sid : servers) {
+        if (sid == ctx_.api->server_id()) continue;
+        json body = json::object();
+        if (!sid.empty()) body["server"] = sid;
+        ctx_.attempt([&] { ctx_.api->post("/api/jobs/run", body); });
+      }
+      ctx_.notify("job run queued");
       return true;
     }
-    std::string id = current_id();
-    if (id.empty()) return false;
+    const json* cur = current();
+    if (!cur) return false;
+    json item = *cur;
+    std::string id = std::to_string(item.value("id", 0));
     if (key(e, "c")) {
-      ctx_.dialogs->confirm("Cancel job #" + id + "? Items already done stay done.", [this, id] {
-        if (ctx_.attempt([&] { ctx_.api->post("/api/jobs/" + id + "/cancel"); }))
-          ctx_.notify("job #" + id + " cancelled");
-        refresh();
-      });
+      ctx_.dialogs->confirm("Cancel job #" + id + "? Items already done stay done.",
+                            [this, id, item] {
+                              if (ctx_.attempt([&] {
+                                    ctx_.api->post("/api/jobs/" + id + "/cancel",
+                                                   on_server(json::object(), item));
+                                  }))
+                                ctx_.notify("job #" + id + " cancelled");
+                              refresh();
+                            });
       return true;
     }
     if (key(e, "y")) {
       ctx_.attempt([&] {
-        auto out = ctx_.api->post("/api/jobs/" + id + "/retry");
+        auto out = ctx_.api->post("/api/jobs/" + id + "/retry", on_server(json::object(), item));
         ctx_.notify("re-queued " + std::to_string(out.value("items", 0)) + " failed item(s)");
       });
       refresh();
@@ -916,7 +999,9 @@ class JobsView : public View {
 
   Context& ctx_;
   bool all_ = false;
+  int polls_ = 0;
   json items_ = json::array();
+  std::string note_;
   std::vector<std::string> labels_;
   int selected_ = 0;
   Element detail_ = text("");
@@ -937,30 +1022,53 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "s: scan node  S: scan all  v: verify (re-hash)  p: priority  t: toggle target  r: refresh";
+    return "s/S: scan node/all  v: verify  p: priority  t: backup target  o: adopt foreign drive";
   }
 
   void refresh() override {
     std::string keep = current_name();
-    if (!ctx_.attempt([&] { items_ = ctx_.api->get("/api/nodes")["nodes"]; }))
+    json out;
+    if (ctx_.attempt([&] { out = ctx_.api->get("/api/nodes"); })) {
+      items_ = out["nodes"];
+      foreign_ = out.value("foreign", json::array());
+    } else {
       items_ = json::array();
+      foreign_ = json::array();
+    }
     labels_.clear();
-    for (const auto& n : items_)
+    for (const auto& n : items_) {
+      std::string state = n.value("online", false) ? (n.value("reachable", true) ? "online"
+                                                                                  : "unreachable")
+                                                   : "offline";
       labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
-                        fit(n.value("online", false) ? "online" : "offline", 9) +
+                        fit(state, 12) + fit(n.value("owner", ""), 12) +
                         fit(std::to_string(n.value("files", 0)) + " files", 14) +
                         human_size(n.value("bytes", 0)));
+    }
+    for (const auto& f : foreign_)
+      labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
+                        fit(f.value("owner", ""), 12) + "press o to adopt");
     selected_ = reselect(items_, keep, [](const json& n) { return n.value("name", ""); },
                          selected_);
   }
 
  private:
+  bool on_foreign() const { return selected_ >= static_cast<int>(items_.size()); }
   std::string current_name() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
     return items_[selected_].value("name", "");
   }
 
   Element detail() {
+    if (on_foreign() && selected_ - items_.size() < foreign_.size()) {
+      const json& f = foreign_[selected_ - items_.size()];
+      return vbox({text(f.value("name", "")) | bold, separator(),
+                   label_value("owner", f.value("owner", "")),
+                   label_path("path", f.value("path", "")),
+                   label_value("seen", f.value("seen", "").substr(0, 19)), text(""),
+                   paragraph("This drive belongs to another server and is attached here. "
+                             "Press o to make this server its owner.") | dim});
+    }
     if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return text("");
     const json& n = items_[selected_];
     auto yes = [](bool b) { return std::string(b ? "yes" : "no"); };
@@ -985,6 +1093,24 @@ class NodesView : public View {
     if (key(e, "r")) return refresh(), true;
     if (key(e, "S")) {
       if (ctx_.attempt([&] { ctx_.api->post("/api/scan"); })) ctx_.notify("scan of all nodes queued");
+      return true;
+    }
+    if (key(e, "o")) {
+      if (!on_foreign()) {
+        ctx_.error("select a foreign drive (listed after the nodes) to adopt it");
+        return true;
+      }
+      json f = foreign_[selected_ - items_.size()];
+      ctx_.dialogs->confirm("Make this server the owner of '" + f.value("name", "") +
+                                "' (owned by " + f.value("owner", "") + ")?",
+                            [this, f] {
+                              ctx_.attempt([&] {
+                                ctx_.api->post("/api/nodes/" + url_encode(f.value("node_id", "")) +
+                                               "/adopt");
+                                ctx_.notify("adopted " + f.value("name", "") + "; scanning it");
+                              });
+                              refresh();
+                            });
       return true;
     }
     std::string name = current_name();
@@ -1029,6 +1155,175 @@ class NodesView : public View {
 
   Context& ctx_;
   json items_ = json::array();
+  json foreign_ = json::array();
+  std::vector<std::string> labels_;
+  int selected_ = 0;
+  Component menu_, root_;
+};
+
+// --- Servers (pairing) -----------------------------------------------------------
+
+class ServersView : public View {
+ public:
+  explicit ServersView(Context& ctx) : ctx_(ctx) {
+    menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
+    root_ = Renderer(menu_, [this] {
+      Element self = vbox({
+          hbox({text("This server: ") | dim, text(self_.value("name", "")) | bold}),
+          hbox({text("fingerprint: ") | dim, text(self_.value("fingerprint", ""))}),
+      });
+      return vbox({self, separator(),
+                   with_detail(list_panel("paired servers and pairing requests", menu_,
+                                          labels_.size(), "not paired with any server (p: pair)"),
+                               detail()) |
+                       flex});
+    });
+    root_ |= CatchEvent([this](Event e) { return on_event(e); });
+  }
+  std::string title() const override { return "Servers"; }
+  Component component() override { return root_; }
+  std::string help() const override {
+    return "p: pair with a server  a/x: accept/reject request  d: unpair  s: sync now  r: refresh";
+  }
+  void on_poll() override {
+    if (++polls_ % 3 == 0) refresh();
+  }
+
+  void refresh() override {
+    json out;
+    if (!ctx_.attempt([&] { out = ctx_.api->get("/api/peers"); })) return;
+    self_ = out["self"];
+    rows_ = json::array();
+    for (auto r : out["requests"]) {
+      r["row"] = "request";
+      rows_.push_back(r);
+    }
+    for (auto p : out["peers"]) {
+      p["row"] = "peer";
+      rows_.push_back(p);
+    }
+    labels_.clear();
+    for (const auto& r : rows_) {
+      if (r["row"] == "request") {
+        bool in = r.value("direction", "") == "in";
+        labels_.push_back(fit(in ? "▶ request" : "◀ requested", 13) + fit(r.value("name", ""), 16) +
+                          fit(r.value("address", ""), 24) +
+                          (in ? "press a to accept, x to reject" : "waiting for them to accept"));
+      } else {
+        std::string state = r.value("online", false) ? "online" : "unreachable";
+        labels_.push_back(fit("paired", 13) + fit(r.value("name", ""), 16) +
+                          fit(r.value("address", ""), 24) + fit(state, 12) +
+                          r.value("last_sync", "").substr(0, 19));
+      }
+    }
+    selected_ = std::min(selected_, std::max(0, static_cast<int>(rows_.size()) - 1));
+  }
+
+ private:
+  const json* current() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(rows_.size())) return nullptr;
+    return &rows_[selected_];
+  }
+
+  Element detail() {
+    const json* r = current();
+    if (!r) return text("");
+    Elements rows = {text(r->value("name", "")) | bold, separator(),
+                     label_value("address", r->value("address", "")),
+                     label_value("fingerprint", hard_wrap(r->value("fingerprint", ""),
+                                                          kDetailWidth - kLabelWidth - 1))};
+    if ((*r)["row"] == "peer") {
+      rows.push_back(label_value("state", r->value("online", false) ? "online" : "unreachable"));
+      rows.push_back(label_value("last sync", r->value("last_sync", "").substr(0, 19)));
+      rows.push_back(label_value("queued calls", std::to_string(r->value("outbox", 0))));
+      if (!r->value("last_error", "").empty())
+        rows.push_back(label_value("last error",
+                                   paragraph(r->value("last_error", "")) | color(Color::Red)));
+    } else {
+      rows.push_back(label_value("request", r->value("direction", "") == "in" ? "incoming"
+                                                                              : "outgoing"));
+      rows.push_back(label_value("since", r->value("created", "").substr(0, 19)));
+      if (!r->value("message", "").empty())
+        rows.push_back(label_value("note", r->value("message", "")));
+      if (r->value("direction", "") == "in")
+        rows.push_back(paragraph("Check that this fingerprint matches 'reifs fingerprint' on " +
+                                 r->value("name", "") + " before accepting.") | dim);
+    }
+    return vbox(rows);
+  }
+
+  void start_pairing() {
+    ctx_.dialogs->ask_text("Address of the server to pair with (HOST[:PORT])", "",
+                           [this](const std::string& address) {
+      if (address.empty()) return;
+      json info;
+      if (!ctx_.attempt([&] { info = ctx_.api->post("/api/peers/probe", {{"address", address}}); }))
+        return;
+      std::string fp = info.value("fingerprint", "");
+      ctx_.dialogs->ask_choice(
+          "Server '" + info.value("name", "") + "' at " + address +
+              ".\nIts certificate fingerprint is\n" + fp +
+              "\nCompare it with 'reifs fingerprint' on that server.",
+          {"Send a pairing request", "Cancel"}, [this, address, fp](int i) {
+            if (i != 0) return;
+            if (ctx_.attempt([&] {
+                  ctx_.api->post("/api/peers/pair", {{"address", address}, {"fingerprint", fp}});
+                }))
+              ctx_.notify("pairing requested; accept it on the other server");
+            refresh();
+          });
+    });
+  }
+
+  bool on_event(const Event& e) {
+    if (key(e, "r")) return refresh(), true;
+    if (key(e, "p")) return start_pairing(), true;
+    if (key(e, "s")) {
+      if (ctx_.attempt([&] { ctx_.api->post("/api/peers/sync"); })) ctx_.notify("syncing");
+      return true;
+    }
+    const json* r = current();
+    if (!r) return false;
+    json row = *r;
+    if ((key(e, "a") || key(e, "x")) && row["row"] == "request") {
+      bool accept = key(e, "a");
+      if (accept && row.value("direction", "") != "in") {
+        ctx_.error("that request is waiting for the other server to accept");
+        return true;
+      }
+      std::string q = accept ? "Accept pairing with '" + row.value("name", "") + "'?\n"
+                                   "Fingerprint " + row.value("fingerprint", "")
+                             : "Reject this pairing request?";
+      ctx_.dialogs->confirm(q, [this, row, accept] {
+        if (ctx_.attempt([&] {
+              ctx_.api->post("/api/peers/requests/" + std::to_string(row.value("id", 0)) +
+                             (accept ? "/accept" : "/reject"));
+            }))
+          ctx_.notify(accept ? "paired with " + row.value("name", "") : "request rejected");
+        refresh();
+      });
+      return true;
+    }
+    if (key(e, "d") && row["row"] == "peer") {
+      ctx_.dialogs->confirm("Unpair from '" + row.value("name", "") +
+                                "'? Its nodes stay listed but stop updating.",
+                            [this, row] {
+                              if (ctx_.attempt([&] {
+                                    ctx_.api->post("/api/peers/" + url_encode(row.value("id", "")) +
+                                                   "/unpair");
+                                  }))
+                                ctx_.notify("unpaired");
+                              refresh();
+                            });
+      return true;
+    }
+    return false;
+  }
+
+  Context& ctx_;
+  json self_ = json::object();
+  json rows_ = json::array();
+  int polls_ = 0;
   std::vector<std::string> labels_;
   int selected_ = 0;
   Component menu_, root_;
@@ -1115,6 +1410,7 @@ std::vector<std::shared_ptr<View>> make_views(Context& ctx) {
       std::make_shared<SearchView>(ctx),    std::make_shared<DecisionsView>(ctx),
       std::make_shared<WantedView>(ctx),    std::make_shared<JobsView>(ctx),
       std::make_shared<NodesView>(ctx),     std::make_shared<MarkedView>(ctx),
+      std::make_shared<ServersView>(ctx),
   };
 }
 

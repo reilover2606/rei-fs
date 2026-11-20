@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from . import db, paths
+from . import db, index, paths
 
 
 class TagError(Exception):
@@ -59,6 +59,8 @@ def set_tag(conn: sqlite3.Connection, file_ids: list[int], tag: str, present: bo
                     " WHERE file_id = ? AND tag = ? AND present = 1",
                     (ts, server_id, fid, tag),
                 )
+            if cur.rowcount:
+                index.log_tag(conn, fid, tag)
             changed += cur.rowcount
     return changed
 

@@ -56,13 +56,23 @@ def select_files(conn: sqlite3.Connection, vpaths: list[str],
     return sorted(selected.items(), key=lambda x: x[1])
 
 
+class RemoteDestination(JobError):
+    """The destination node belongs to another server: the job must be created
+    there (the destination's owner runs transfers into its nodes)."""
+
+    def __init__(self, node: sqlite3.Row):
+        super().__init__(f"node {node['name']!r} belongs to another server")
+        self.owner_id = node["owner_id"]
+
+
+def destination_owner(conn: sqlite3.Connection, name: str) -> str:
+    return nodes.get_node(conn, name)["owner_id"]
+
+
 def _owned_node(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
     node = nodes.get_node(conn, name)
     if node["owner_id"] != nodes.self_id(conn):
-        raise JobError(
-            f"node {node['name']!r} belongs to another server; "
-            "transfers between servers arrive with pairing (milestone 4)"
-        )
+        raise RemoteDestination(node)
     return node
 
 
@@ -86,7 +96,7 @@ def create_transfer_job(conn: sqlite3.Connection, vpaths: list[str], tag: str | 
     if not vpaths and not tag:
         raise JobError("select files by path and/or --tag")
     dst_node = _owned_node(conn, dst)
-    src_node = _owned_node(conn, src) if src else None
+    src_node = nodes.get_node(conn, src) if src else None  # may be on a paired server
     if src_node is not None and src_node["id"] == dst_node["id"]:
         raise JobError("source and destination are the same node")
 
@@ -295,15 +305,17 @@ def marked_copies(conn: sqlite3.Connection, node: str | None = None) -> list[sql
 
 
 def unmark(conn: sqlite3.Connection, vpaths: list[str], node: str | None) -> int:
+    """Remove deletion marks (on other servers' nodes, by asking their owner)."""
     node_id = nodes.get_node(conn, node)["id"] if node else None
     with db.transaction(conn):
-        ids = [fid for fid, _ in select_files(conn, vpaths)] if vpaths else None
-        q = "UPDATE copies SET marked_delete = 0 WHERE marked_delete = 1"
-        args: list = []
-        if node_id:
-            q += " AND node_id = ?"
-            args.append(node_id)
-        if ids is not None:
-            q += f" AND file_id IN ({','.join('?' * len(ids))})"
-            args += ids
-        return conn.execute(q, args).rowcount
+        ids = {fid for fid, _ in select_files(conn, vpaths)} if vpaths else None
+        n = 0
+        for r in conn.execute("SELECT file_id, node_id FROM copies WHERE marked_delete = 1"
+                              ).fetchall():
+            if node_id and r["node_id"] != node_id:
+                continue
+            if ids is not None and r["file_id"] not in ids:
+                continue
+            index.mark_copy(conn, r["file_id"], r["node_id"], False)
+            n += 1
+        return n

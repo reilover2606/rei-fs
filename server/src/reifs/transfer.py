@@ -68,9 +68,13 @@ class BatchResult:
 ProgressFn = Callable[[int], None]  # bytes transferred so far in this batch
 
 
-def build_command(cfg: Config, src_root: Path, dst_root: Path, list_file: Path) -> list[str]:
+def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file: Path,
+                  remote=None) -> list[str]:
+    """rsync command line; ``remote`` (peers.RemoteSource) pulls from a peer's daemon."""
     style = cfg.rsync.path_style
     scratch = Path(dst_root) / SCRATCH
+    source = remote.url() if remote else rsync_path(src_root, style).rstrip("/\\") + "/"
+    daemon_opts = ["--contimeout=20", "--timeout=300"] if remote else []
     return [
         cfg.rsync.path,
         "--times",
@@ -82,15 +86,19 @@ def build_command(cfg: Config, src_root: Path, dst_root: Path, list_file: Path) 
         "--from0",
         f"--files-from={rsync_path(list_file, style)}",
         "--info=progress2",
+        *daemon_opts,
         *cfg.rsync.extra_args,
-        rsync_path(src_root, style).rstrip("/\\") + "/",
+        source,
         rsync_path(dst_root, style).rstrip("/\\") + "/",
     ]
 
 
-def run_batch(cfg: Config, src_root: Path, dst_root: Path, rel_paths: list[str],
-              progress: ProgressFn | None = None) -> BatchResult:
+def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: list[str],
+              progress: ProgressFn | None = None, remote=None) -> BatchResult:
     """Copy ``rel_paths`` (``/``-separated, relative to the roots).
+
+    With ``remote`` (a peers.RemoteSource) the files are pulled from a paired
+    server's rsync daemon instead of the local ``src_root``.
 
     KeyboardInterrupt terminates rsync (keeping its partial file) and is
     re-raised.
@@ -105,11 +113,14 @@ def run_batch(cfg: Config, src_root: Path, dst_root: Path, rel_paths: list[str],
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(b"\0".join(p.encode("utf-8") for p in rel_paths) + b"\0")
-        cmd = build_command(cfg, src_root, dst_root, list_file)
+        cmd = build_command(cfg, src_root, dst_root, list_file, remote)
+        env = None
+        if remote is not None:
+            env = dict(os.environ, RSYNC_PASSWORD=remote.password)
         with tempfile.TemporaryFile(dir=tmp_dir) as err:
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err,
-                                        stdin=subprocess.DEVNULL)
+                                        stdin=subprocess.DEVNULL, env=env)
             except OSError as e:
                 return BatchResult(127, f"cannot run rsync ({cfg.rsync.path}): {e}")
             try:

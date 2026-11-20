@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import db, fsops, index, jobs, paths, transfer
+from . import db, fsops, index, jobs, paths, peers, transfer
 from .config import Config
 from .control import StopFn, check
 from .hashing import hash_file
@@ -57,11 +57,12 @@ class Prepared:
     item: sqlite3.Row
     fid: int
     src_node: str
-    src_root: Path
+    src_root: Path | None          # local source
     dst_root: Path
     src_hash: str
     size: int
-    src_stat: tuple[int, int]
+    src_stat: tuple[int, int] | None
+    remote: peers.RemoteSource | None = None  # source on a paired server
 
 
 def run_jobs(conn: sqlite3.Connection, cfg: Config, job_ids: list[int] | None = None,
@@ -102,6 +103,16 @@ class _Runner:
             conn.execute("UPDATE jobs SET status = 'pending' WHERE status = 'running'")
         self.roots = {loc.node_id: loc.root for loc in discover(conn, self.cfg).online}
         self.nodes = {r["id"]: r for r in conn.execute("SELECT * FROM nodes")}
+        # Nodes of paired servers we can pull from: node announced online and
+        # its server reachable at the last sync.
+        self.remote = {}
+        reachable = {p["id"]: p for p in peers.paired_peers(conn) if p["online"]}
+        for node in self.nodes.values():
+            peer = reachable.get(node["owner_id"])
+            if peer is not None and node["online"]:
+                src = peers.remote_source(peer, node["id"])
+                if src is not None:
+                    self.remote[node["id"]] = src
         q = "SELECT * FROM jobs WHERE status IN ('pending', 'waiting')"
         args: list = []
         if job_ids:
@@ -186,12 +197,13 @@ class _Runner:
             rep.note(item["vpath"], f"will retry: {msg}")
 
     def _finish(self, item, src_node: str | None, rep: JobReport, size: int,
-                msg: str | None = None) -> None:
+                msg: str | None = None, expected_hash: str | None = None) -> None:
         """Mark an item done (caller holds a transaction)."""
         fid = index.file_id(self.conn, item["vpath"])
         if item["mark_source"] and src_node and fid is not None:
-            self.conn.execute("UPDATE copies SET marked_delete = 1 WHERE file_id = ?"
-                              " AND node_id = ?", (fid, src_node))
+            # Only the verified content may be marked: if the source changed
+            # meanwhile, its owner refuses.
+            index.mark_copy(self.conn, fid, src_node, True, expect_hash=expected_hash)
         self._set(item, "done", msg)
         if item["wanted_id"]:
             self.conn.execute("UPDATE wanted SET status = 'done' WHERE id = ?",
@@ -258,30 +270,38 @@ class _Runner:
                 self._skip(item, rep, f"the copy on {self._name(item['src_node'])}"
                                       " is no longer the current version")
                 return None
-            if source["node_id"] not in self.roots:
-                self._wait(item, rep, f"node {self._name(source['node_id'])} is offline")
+            if source["node_id"] not in self.roots and source["node_id"] not in self.remote:
+                self._wait(item, rep, f"node {self._name(source['node_id'])} is not reachable")
                 return None
         else:
             current = [c for c in copies if c["hash"] == version.hash]
-            online = [c for c in current if c["node_id"] in self.roots]
+            # Local sources first, then nodes of reachable paired servers.
+            online = [c for c in current if c["node_id"] in self.roots] + \
+                     [c for c in current if c["node_id"] in self.remote]
             if not online:
                 if current:
-                    self._wait(item, rep, "no node holding the current version is online")
+                    self._wait(item, rep, "no node holding the current version is reachable "
+                                          "(it must be attached here, or on a paired server "
+                                          "that is online)")
                 else:
                     self._skip(item, rep, "no current copy to copy from")
                 return None
             source = online[0]
 
-        src_root = self.roots[source["node_id"]]
-        src_phys = paths.to_physical(src_root, vpath)
-        try:
-            st = os.stat(src_phys)
-        except FileNotFoundError:
-            self._transient(item, rep, f"source missing on {self._name(source['node_id'])}"
-                                       " (rescan that node)")
-            return None
         src_hash, size = source["hash"], source["size"]
-        if (st.st_size, st.st_mtime_ns) != (source["size"], source["mtime_ns"]):
+        src_root = self.roots.get(source["node_id"])
+        remote = None if src_root is not None else self.remote[source["node_id"]]
+        src_stat = None
+        if src_root is not None:
+            src_phys = paths.to_physical(src_root, vpath)
+            try:
+                st = os.stat(src_phys)
+            except FileNotFoundError:
+                self._transient(item, rep, f"source missing on {self._name(source['node_id'])}"
+                                           " (rescan that node)")
+                return None
+            src_stat = (st.st_size, st.st_mtime_ns)
+        if src_root is not None and src_stat != (source["size"], source["mtime_ns"]):
             # Changed since the last scan: index the new content first.
             try:
                 src_hash = hash_file(src_phys)
@@ -312,7 +332,8 @@ class _Runner:
                 with db.transaction(conn):
                     index.record_copy(conn, fid, dst, dst_st.st_size, dst_st.st_mtime_ns,
                                       dst_hash)
-                    self._finish(item, source["node_id"], rep, 0, "already present")
+                    self._finish(item, source["node_id"], rep, 0, "already present",
+                                 expected_hash=src_hash)
                 return None
             if item["allow_hash"] != dst_hash:
                 with db.transaction(conn):
@@ -348,7 +369,7 @@ class _Runner:
         with db.transaction(conn):
             self._set(item, "running")
         return Prepared(item, fid, source["node_id"], src_root, dst_root, src_hash, size,
-                        (st.st_size, st.st_mtime_ns))
+                        src_stat, remote)
 
     def _dst_hash(self, fid: int, node_id: str, phys: Path, st: os.stat_result) -> str:
         row = self.conn.execute("SELECT size, mtime_ns, hash FROM copies WHERE file_id = ?"
@@ -368,7 +389,8 @@ class _Runner:
                           f" {_human(base_bytes + n)}")
 
         result = transfer.run_batch(self.cfg, first.src_root, first.dst_root,
-                                    [p.item["vpath"].lstrip("/") for p in batch], on_bytes)
+                                    [p.item["vpath"].lstrip("/") for p in batch], on_bytes,
+                                    remote=first.remote)
         error = None
         if result.returncode != 0:
             lines = [ln for ln in result.stderr.splitlines() if ln.strip()]
@@ -385,13 +407,16 @@ class _Runner:
             if got == p.src_hash:
                 with db.transaction(self.conn):
                     index.record_copy(self.conn, p.fid, dst, st.st_size, st.st_mtime_ns, got)
-                    self._finish(p.item, p.src_node, rep, p.size)
+                    self._finish(p.item, p.src_node, rep, p.size, expected_hash=p.src_hash)
                 continue
-            try:
-                sst = os.stat(paths.to_physical(p.src_root, p.item["vpath"]))
-                changed = (sst.st_size, sst.st_mtime_ns) != p.src_stat
-            except OSError:
-                changed = True
+            if p.remote is not None:
+                changed = False  # its owner rescans it; the sync brings the news
+            else:
+                try:
+                    sst = os.stat(paths.to_physical(p.src_root, p.item["vpath"]))
+                    changed = (sst.st_size, sst.st_mtime_ns) != p.src_stat
+                except OSError:
+                    changed = True
             if changed:
                 msg = "source changed during the transfer"
             elif got is None:

@@ -19,13 +19,15 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
-from . import (__version__, auth, db, decisions, jobs, nodes, paths, queries, tags,
-               tls)
+from concurrent.futures import ThreadPoolExecutor
+
+from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries,
+               sync, tags, tls)
 from .config import Config
 from .paths import to_physical
-from .service import Worker
+from .service import Syncer, Worker
 
 log = logging.getLogger("reifs.api")
 
@@ -40,7 +42,7 @@ class ApiError(Exception):
         self.status = status
 
 
-USER_ERRORS = (jobs.JobError, decisions.DecisionError, tags.TagError, nodes.NodeError,
+USER_ERRORS = (peers.PeerError, jobs.JobError, decisions.DecisionError, tags.TagError, nodes.NodeError,
                paths.VPathError, ValueError, KeyError)
 
 
@@ -114,22 +116,28 @@ def job_json(conn: sqlite3.Connection, j: sqlite3.Row) -> dict:
 # --- the API ------------------------------------------------------------------------
 
 
-Route = tuple[str, re.Pattern, Callable, bool]
+# Access levels: public (no auth), admin (the client, or a paired server acting
+# for it), client (the client only: login session management, pairing), peer
+# (paired servers only).
+Route = tuple[str, re.Pattern, Callable, str]
 
 
 class Api:
-    def __init__(self, cfg: Config, worker: Worker | None):
+    def __init__(self, cfg: Config, worker: Worker | None, syncer: Syncer | None = None):
         self.cfg = cfg
         self.worker = worker
+        self.syncer = syncer
+        self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="reifs-peer")
         self.tokens: dict[str, float] = {}
         self.tokens_lock = threading.Lock()
         self.server_id = ""
         self.routes: list[Route] = []
         r = self._route
-        r("POST", r"/api/login", self.login, public=True)
-        r("POST", r"/api/logout", self.logout)
+        r("POST", r"/api/login", self.login, "public")
+        r("POST", r"/api/logout", self.logout, "client")
         r("GET", r"/api/status", self.status)
         r("GET", r"/api/nodes", self.list_nodes)
+        r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/stop", self.stop)
@@ -149,9 +157,27 @@ class Api:
         r("POST", r"/api/jobs/(?P<id>\d+)/(?P<action>cancel|retry)", self.job_action)
         r("GET", r"/api/marked", self.list_marked)
         r("POST", r"/api/unmark", self.unmark)
+        # pairing management (client only)
+        r("GET", r"/api/peers", self.list_peers, "client")
+        r("POST", r"/api/peers/probe", self.probe_peer, "client")
+        r("POST", r"/api/peers/pair", self.pair_peer, "client")
+        r("POST", r"/api/peers/sync", self.sync_now, "client")
+        r("POST", r"/api/peers/requests/(?P<id>\d+)/(?P<action>accept|reject)",
+          self.pair_request_action, "client")
+        r("POST", r"/api/peers/(?P<peer>[^/]+)/unpair", self.unpair_peer, "client")
+        # server-to-server
+        r("GET", r"/api/peer/hello", self.peer_hello, "public")
+        r("POST", r"/api/peer/pair-request", self.peer_pair_request, "public")
+        r("POST", r"/api/peer/pair-confirm", self.peer_pair_confirm, "public")
+        r("POST", r"/api/peer/pair-reject", self.peer_pair_reject, "public")
+        r("GET", r"/api/peer/changes", self.peer_changes, "peer")
+        r("POST", r"/api/peer/mark", self.peer_mark, "peer")
+        r("POST", r"/api/peer/wanted", self.peer_wanted, "peer")
+        r("POST", r"/api/peer/poke", self.peer_poke, "peer")
+        r("POST", r"/api/peer/unpair", self.peer_unpair, "peer")
 
-    def _route(self, method: str, pattern: str, fn: Callable, public: bool = False) -> None:
-        self.routes.append((method, re.compile(pattern + "$"), fn, public))
+    def _route(self, method: str, pattern: str, fn: Callable, access: str = "admin") -> None:
+        self.routes.append((method, re.compile(pattern + "$"), fn, access))
 
     # --- auth -----------------------------------------------------------------------
 
@@ -208,40 +234,86 @@ class Api:
             "active_jobs": conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running', 'waiting')"
             ).fetchone()[0],
+            "peers_total": conn.execute("SELECT COUNT(*) FROM servers WHERE paired = 1"
+                                        ).fetchone()[0],
+            "peers_online": conn.execute("SELECT COUNT(*) FROM servers WHERE paired = 1"
+                                         " AND online = 1").fetchone()[0],
+            "pair_requests": conn.execute(
+                "SELECT COUNT(*) FROM pair_requests WHERE direction = 'in' AND status = 'pending'"
+            ).fetchone()[0],
         }
 
     def list_nodes(self, conn, q, body, **_):
         me = nodes.self_id(conn)
         out = []
         for r in conn.execute(
-            "SELECT n.*, s.name AS owner, (SELECT COUNT(*) FROM copies c WHERE c.node_id = n.id)"
+            "SELECT n.*, s.name AS owner, s.online AS owner_online,"
+            " (SELECT COUNT(*) FROM copies c WHERE c.node_id = n.id)"
             " AS files, (SELECT COALESCE(SUM(size), 0) FROM copies c WHERE c.node_id = n.id)"
             " AS bytes FROM nodes n JOIN servers s ON s.id = n.owner_id ORDER BY n.name"
         ):
             out.append({
                 "id": r["id"], "name": r["name"], "kind": r["kind"], "online": bool(r["online"]),
                 "owner": "self" if r["owner_id"] == me else r["owner"],
+                "owner_id": r["owner_id"],
+                "reachable": bool(r["online"]) and (r["owner_id"] == me or bool(r["owner_online"])),
                 "files": r["files"], "bytes": r["bytes"],
                 "case_sensitive": bool(r["case_sensitive"]),
                 "restricted_names": bool(r["restricted_names"]), "priority": r["priority"],
                 "replication_target": bool(r["replication_target"]),
                 "root": r["root_path"] or "", "last_scan": r["last_scan"] or "",
             })
-        return {"nodes": out}
+        foreign = [{"node_id": f["node_id"], "name": f["name"], "path": f["path"],
+                    "owner": (conn.execute("SELECT name FROM servers WHERE id = ?",
+                                           (f["owner_id"],)).fetchone() or [f["owner_id"][:8]])[0],
+                    "seen": f["seen"]}
+                   for f in conn.execute("SELECT * FROM foreign_sightings ORDER BY name")]
+        return {"nodes": out, "foreign": foreign}
 
     def update_node(self, conn, q, body, node, **_):
         row = nodes.get_node(conn, unquote(node))
-        if "priority" in body:
-            conn.execute("UPDATE nodes SET priority = ? WHERE id = ?",
-                         (int(body["priority"]), row["id"]))
-        if "replication_target" in body:
-            conn.execute("UPDATE nodes SET replication_target = ? WHERE id = ?",
-                         (int(bool(body["replication_target"])), row["id"]))
+        if row["owner_id"] != nodes.self_id(conn):
+            # Settings of a node are facts its owner publishes.
+            return peers.forward(conn, row["owner_id"], "POST", f"/api/nodes/{row['id']}", body)
+        with db.transaction(conn):
+            if "priority" in body:
+                conn.execute("UPDATE nodes SET priority = ? WHERE id = ?",
+                             (int(body["priority"]), row["id"]))
+            if "replication_target" in body:
+                conn.execute("UPDATE nodes SET replication_target = ? WHERE id = ?",
+                             (int(bool(body["replication_target"])), row["id"]))
+            index.log_node(conn, row["id"])
+        self._poke()
         return {"ok": True}
 
+    def adopt_node(self, conn, q, body, node, **_):
+        name = nodes.adopt_node(conn, unquote(node))
+        if self.worker:
+            self.worker.request_scan([name])
+        if self.syncer:
+            self.syncer.request_daemon_update()
+            self.syncer.request_poke()
+        return {"ok": True, "name": name}
+
     def scan(self, conn, q, body, **_):
-        self._need_worker().request_scan(body.get("nodes") or None, bool(body.get("verify")))
+        me = nodes.self_id(conn)
+        local, remote = [], {}
+        for name in body.get("nodes") or []:
+            row = nodes.get_node(conn, name)
+            if row["owner_id"] == me:
+                local.append(row["id"])
+            else:
+                remote.setdefault(row["owner_id"], []).append(row["id"])
+        for owner, ids in remote.items():
+            peers.forward(conn, owner, "POST", "/api/scan",
+                          {"nodes": ids, "verify": bool(body.get("verify"))})
+        if local or not remote:
+            self._need_worker().request_scan(local or None, bool(body.get("verify")))
         return {"ok": True, "queued": True}
+
+    def _poke(self) -> None:
+        if self.syncer:
+            self.syncer.request_poke()
 
     def stop(self, conn, q, body, **_):
         self._need_worker().request_stop()
@@ -301,10 +373,10 @@ class Api:
 
     # --- decisions and wanted ---------------------------------------------------------
 
-    def list_decisions(self, conn, q, body, **_):
+    def list_decisions(self, conn, q, body, caller=None, **_):
         names = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM nodes")}
-        return {"decisions": [decision_json(d, names)
-                              for d in decisions.list_decisions(conn)]}
+        items = [decision_json(d, names) for d in decisions.list_decisions(conn)]
+        return self._everywhere(conn, q, caller, "/api/decisions", "decisions", items)
 
     def resolve_decision(self, conn, q, body, id, **_):
         summary = decisions.resolve(conn, int(id), str(body.get("option", "")))
@@ -312,7 +384,7 @@ class Api:
             self.worker.request_jobs()
         return {"ok": True, "summary": summary}
 
-    def list_wanted(self, conn, q, body, **_):
+    def list_wanted(self, conn, q, body, caller=None, **_):
         out = []
         for r in conn.execute(
             "SELECT w.*, f.vpath, s.name AS src, d.name AS dst FROM wanted w"
@@ -323,7 +395,7 @@ class Api:
             path = f"{data['from']} -> {data['to']}" if r["op"] == "rename" else r["vpath"]
             out.append({"id": r["id"], "op": r["op"], "path": path or "",
                         "from": r["src"] or "", "to": r["dst"] or "", "reason": r["reason"]})
-        return {"wanted": out}
+        return self._everywhere(conn, q, caller, "/api/wanted", "wanted", out)
 
     def act_wanted(self, conn, q, body, **_):
         ids = None if body.get("all") else [int(i) for i in body.get("ids", [])]
@@ -340,12 +412,14 @@ class Api:
 
     # --- jobs ------------------------------------------------------------------------
 
-    def list_jobs(self, conn, q, body, **_):
+    def list_jobs(self, conn, q, body, caller=None, **_):
         sql = "SELECT * FROM jobs"
         if q.get("all") != "1":
             sql += " WHERE status NOT IN ('done', 'cancelled')"
         sql += " ORDER BY id DESC LIMIT 200"
-        return {"jobs": [job_json(conn, j) for j in conn.execute(sql).fetchall()]}
+        items = [job_json(conn, j) for j in conn.execute(sql).fetchall()]
+        path = "/api/jobs" + ("?all=1" if q.get("all") == "1" else "")
+        return self._everywhere(conn, q, caller, path, "jobs", items)
 
     def show_job(self, conn, q, body, id, **_):
         j = jobs.get_job(conn, int(id))
@@ -366,9 +440,15 @@ class Api:
         kind = body.get("kind")
         if kind not in ("copy", "move"):
             raise ApiError(400, "kind must be 'copy' or 'move'")
-        rep = jobs.create_transfer_job(conn, list(body.get("paths", [])), body.get("tag") or None,
-                                       str(body.get("to", "")), body.get("from") or None,
-                                       move=kind == "move")
+        try:
+            rep = jobs.create_transfer_job(conn, list(body.get("paths", [])),
+                                           body.get("tag") or None, str(body.get("to", "")),
+                                           body.get("from") or None, move=kind == "move")
+        except jobs.RemoteDestination as e:
+            # The destination's owner runs transfers into its nodes.
+            out = peers.forward(conn, e.owner_id, "POST", "/api/jobs", body)
+            out["server"] = e.owner_id
+            return out
         if rep.job_id is not None and self.worker:
             self.worker.request_jobs()
         return {"job_id": rep.job_id, "items": rep.items,
@@ -403,42 +483,217 @@ class Api:
             raise ApiError(400, "give 'paths' or 'all'")
         return {"unmarked": jobs.unmark(conn, paths_, body.get("node") or None)}
 
+    # --- several servers ------------------------------------------------------------
+
+    def _everywhere(self, conn, q, caller, path: str, key: str, items: list) -> dict:
+        """Merge a list from every paired server when the client asks for it."""
+        me = nodes.self_id(conn)
+        for item in items:
+            item["server"], item["server_name"] = me, self.cfg.server.name
+        out = {key: items, "unreachable": []}
+        if q.get("everywhere") != "1" or caller != "client":
+            return out
+        targets = [(p["id"], p["name"], peers.client_for(conn, p["id"], timeout=6))
+                   for p in peers.paired_peers(conn)]
+
+        def fetch(target):
+            sid, name, client = target
+            try:
+                return sid, name, client.request("GET", path)[key]
+            except (peers.PeerError, KeyError) as e:
+                return sid, name, e
+
+        for sid, name, result in self.pool.map(fetch, targets):
+            if isinstance(result, Exception):
+                out["unreachable"].append(name)
+                continue
+            for item in result:
+                item["server"], item["server_name"] = sid, name
+                items.append(item)
+        return out
+
+    # --- pairing (client) ---------------------------------------------------------
+
+    def list_peers(self, conn, q, body, **_):
+        rows = peers.paired_peers(conn)
+        reqs = conn.execute("SELECT * FROM pair_requests WHERE status = 'pending'"
+                            " ORDER BY id").fetchall()
+        return {
+            "self": {"id": nodes.self_id(conn), "name": self.cfg.server.name,
+                     "fingerprint": peers.my_fingerprint(self.cfg)},
+            "peers": [{"id": r["id"], "name": r["name"], "address": r["address"],
+                       "online": bool(r["online"]), "last_sync": r["last_sync"] or "",
+                       "last_error": r["last_error"] or "", "fingerprint": r["fingerprint"],
+                       "outbox": conn.execute("SELECT COUNT(*) FROM outbox WHERE server_id = ?",
+                                              (r["id"],)).fetchone()[0]}
+                      for r in rows],
+            "requests": [{"id": r["id"], "direction": r["direction"], "name": r["name"],
+                          "address": r["address"], "fingerprint": r["fingerprint"],
+                          "created": r["created"], "message": r["message"] or ""}
+                         for r in reqs],
+        }
+
+    def probe_peer(self, conn, q, body, **_):
+        info, fp = peers.hello(str(body.get("address", "")))
+        return {"id": info.get("id"), "name": info.get("name"), "fingerprint": fp,
+                "version": info.get("version")}
+
+    def pair_peer(self, conn, q, body, **_):
+        info = peers.request_pairing(conn, self.cfg, str(body.get("address", "")),
+                                     str(body.get("fingerprint", "")))
+        return {"ok": True, "name": info.get("name")}
+
+    def pair_request_action(self, conn, q, body, id, action, **_):
+        if action == "reject":
+            peers.reject_pairing(conn, int(id))
+            return {"ok": True}
+        name = peers.accept_pairing(conn, self.cfg, int(id))
+        if self.syncer:
+            self.syncer.request_daemon_update()
+            self.syncer.request_sync()
+        return {"ok": True, "name": name}
+
+    def unpair_peer(self, conn, q, body, peer, **_):
+        row = peers.find_peer(conn, unquote(peer))
+        peers.unpair(conn, row["id"])
+        if self.syncer:
+            self.syncer.request_daemon_update()
+        return {"ok": True}
+
+    def sync_now(self, conn, q, body, **_):
+        if self.syncer is None:
+            raise ApiError(503, "sync not running")
+        self.syncer.request_sync()
+        return {"ok": True}
+
+    # --- server to server ------------------------------------------------------------
+
+    def peer_hello(self, conn, q, body, **_):
+        return {"id": nodes.self_id(conn), "name": self.cfg.server.name, "version": __version__}
+
+    def peer_pair_request(self, conn, q, body, client_ip="", **_):
+        peers.receive_pair_request(conn, body, client_ip)
+        return {"ok": True, "message": "waiting for the administrator to accept"}
+
+    def peer_pair_confirm(self, conn, q, body, **_):
+        out = peers.confirm_pairing(conn, self.cfg, body)
+        if self.syncer:
+            self.syncer.request_daemon_update()
+            self.syncer.request_sync()
+        return out
+
+    def peer_pair_reject(self, conn, q, body, **_):
+        peers.receive_pair_reject(conn, body)
+        return {"ok": True}
+
+    def peer_changes(self, conn, q, body, caller=None, **_):
+        return sync.export_changes(conn, int(q.get("since", 0)),
+                                   min(int(q.get("limit", sync.BATCH)), sync.BATCH),
+                                   exclude_origin=caller)
+
+    def _owned_copy(self, conn, body) -> tuple[int, str]:
+        node_id = str(body.get("node_id", ""))
+        if index.owner_of(conn, node_id) != nodes.self_id(conn):
+            raise ApiError(409, "that node is not owned by this server")
+        fid = index.file_id(conn, str(body.get("vpath", "")))
+        if fid is None or not conn.execute(
+                "SELECT 1 FROM copies WHERE file_id = ? AND node_id = ?", (fid, node_id)).fetchone():
+            raise ApiError(404, "no such copy")
+        return fid, node_id
+
+    def peer_mark(self, conn, q, body, **_):
+        with db.transaction(conn):
+            fid, node_id = self._owned_copy(conn, body)
+            if body.get("marked") and body.get("hash") and not conn.execute(
+                    "SELECT 1 FROM copies WHERE file_id = ? AND node_id = ? AND hash = ?",
+                    (fid, node_id, body["hash"])).fetchone():
+                raise ApiError(409, "the copy changed since it was copied; not marking it")
+            index.set_marked(conn, fid, node_id, bool(body.get("marked")))
+        return {"ok": True}
+
+    def peer_wanted(self, conn, q, body, caller=None, **_):
+        if body.get("op") != "rename":
+            raise ApiError(400, "only renames can be proposed")
+        with db.transaction(conn):
+            fid, node_id = self._owned_copy(conn, {"node_id": body.get("node_id"),
+                                                   "vpath": body.get("from")})
+            index.add_wanted(conn, "rename", fid, node_id, node_id,
+                             str(body.get("reason") or "rename"),
+                             {"from": body["from"], "to": paths.normalize(str(body["to"]))})
+        return {"ok": True}
+
+    def peer_poke(self, conn, q, body, **_):
+        if self.syncer:
+            self.syncer.request_sync()
+        return {"ok": True}
+
+    def peer_unpair(self, conn, q, body, caller=None, **_):
+        peers.forget_peer(conn, caller)
+        if self.syncer:
+            self.syncer.request_daemon_update()
+        return {"ok": True}
+
     # --- dispatch ---------------------------------------------------------------------
 
-    def dispatch(self, method: str, raw_path: str, headers, body_bytes: bytes) -> tuple[int, dict]:
+    def dispatch(self, method: str, raw_path: str, headers, body_bytes: bytes,
+                 client_ip: str = "") -> tuple[int, dict]:
         parts = urlsplit(raw_path)
         query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
-        for m, pattern, fn, public in self.routes:
+        route = None
+        for m, pattern, fn, access in self.routes:
             match = pattern.match(parts.path)
-            if not match:
-                continue
-            if m != method:
-                continue
-            token = None
-            if not public:
-                header = headers.get("Authorization")
-                if not self.check_token(header):
-                    return 401, {"error": "not logged in"}
-                token = header[7:].strip()
-            try:
-                body = json.loads(body_bytes or b"{}")
-                if not isinstance(body, dict):
-                    raise ValueError("body must be a JSON object")
-            except ValueError as e:
-                return 400, {"error": f"bad JSON body: {e}"}
-            conn = db.open_existing(self.cfg.db_path)
-            try:
-                return 200, fn(conn, query, body, token=token, **match.groupdict())
-            except ApiError as e:
-                return e.status, {"error": str(e)}
-            except USER_ERRORS as e:
-                return 400, {"error": str(e).strip("'\"")}
-            except sqlite3.OperationalError as e:
-                log.warning("database busy: %s", e)
-                return 503, {"error": f"database busy, try again ({e})"}
-            finally:
-                conn.close()
-        return 404, {"error": f"no such endpoint: {method} {parts.path}"}
+            if match and m == method:
+                route = (fn, access, match)
+                break
+        if route is None:
+            return 404, {"error": f"no such endpoint: {method} {parts.path}"}
+        fn, access, match = route
+        try:
+            body = json.loads(body_bytes or b"{}")
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except ValueError as e:
+            return 400, {"error": f"bad JSON body: {e}"}
+        conn = db.open_existing(self.cfg.db_path)
+        try:
+            # Who is calling: the client (bearer token) or a paired server.
+            header = headers.get("Authorization")
+            token, caller = None, None
+            if self.check_token(header):
+                token, caller = header[7:].strip(), "client"
+            else:
+                caller = peers.authenticate(conn, header)  # peer server id
+            if access == "client" and caller != "client":
+                return 401, {"error": "not logged in"}
+            if access == "admin" and caller is None:
+                return 401, {"error": "not logged in"}
+            if access == "peer" and (caller is None or caller == "client"):
+                return 401, {"error": "peer authentication required"}
+
+            # The client may address another server: forward the request.
+            target = query.pop("server", None) if method == "GET" else body.pop("server", None)
+            if target and access == "admin" and caller == "client" \
+                    and target != nodes.self_id(conn):
+                path = parts.path + ("?" + urlencode(query) if query else "")
+                try:
+                    return 200, peers.forward(conn, target, method, path,
+                                              body if method == "POST" else None)
+                except peers.PeerError as e:
+                    return (e.status if 400 <= e.status < 500 else 502), {"error": str(e)}
+
+            return 200, fn(conn, query, body, token=token, caller=caller,
+                           client_ip=client_ip, **match.groupdict())
+        except ApiError as e:
+            return e.status, {"error": str(e)}
+        except peers.PeerError as e:
+            return (e.status if 400 <= e.status < 500 else 502), {"error": str(e)}
+        except USER_ERRORS as e:
+            return 400, {"error": str(e).strip("'\"")}
+        except sqlite3.OperationalError as e:
+            log.warning("database busy: %s", e)
+            return 503, {"error": f"database busy, try again ({e})"}
+        finally:
+            conn.close()
 
 
 # --- HTTP plumbing -------------------------------------------------------------------
@@ -456,7 +711,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(length) if length else b""
         try:
-            status, payload = self.server.api.dispatch(method, self.path, self.headers, body)
+            status, payload = self.server.api.dispatch(method, self.path, self.headers, body,
+                                                       self.client_address[0])
         except Exception as e:  # noqa: BLE001
             log.exception("internal error")
             status, payload = 500, {"error": f"internal error: {e}"}
@@ -518,8 +774,9 @@ def parse_listen(listen: str) -> tuple[str, int]:
     return host.strip("[]") or "0.0.0.0", int(port)
 
 
-def make_server(cfg: Config, worker: Worker | None, listen: str | None = None) -> TLSServer:
+def make_server(cfg: Config, worker: Worker | None, listen: str | None = None,
+                syncer: Syncer | None = None) -> TLSServer:
     cert, key = tls.ensure_certificate(cfg.home, cfg.server.name)
-    api = Api(cfg, worker)
+    api = Api(cfg, worker, syncer)
     return TLSServer(parse_listen(listen or cfg.server.listen), api,
                      tls.server_context(cert, key))

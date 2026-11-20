@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -178,6 +178,107 @@ CREATE TABLE job_items (
     updated     TEXT NOT NULL
 );
 CREATE INDEX job_items_job ON job_items(job_id, state);
+""",
+    3: """
+-- Pairing and peers (milestone 4).
+ALTER TABLE servers ADD COLUMN fingerprint TEXT;      -- pinned certificate of the peer
+ALTER TABLE servers ADD COLUMN token_out TEXT;        -- token we present to the peer
+ALTER TABLE servers ADD COLUMN token_in_hash TEXT;    -- sha256 of the token the peer presents
+ALTER TABLE servers ADD COLUMN rsync_port INTEGER;    -- the peer's rsync daemon
+ALTER TABLE servers ADD COLUMN rsync_user TEXT;       -- our credentials on that daemon
+ALTER TABLE servers ADD COLUMN rsync_password TEXT;
+ALTER TABLE servers ADD COLUMN rsync_in_user TEXT;    -- the peer's credentials on ours
+ALTER TABLE servers ADD COLUMN rsync_in_password TEXT;
+ALTER TABLE servers ADD COLUMN pull_cursor INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN online INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN last_sync TEXT;
+ALTER TABLE servers ADD COLUMN last_error TEXT;
+
+ALTER TABLE nodes ADD COLUMN owner_since TEXT NOT NULL DEFAULT '';
+UPDATE nodes SET owner_since = COALESCE(last_seen, '2000-01-01T00:00:00+00:00');
+
+CREATE TABLE pair_requests (
+    id          INTEGER PRIMARY KEY,
+    direction   TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    server_id   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    nonce       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'accepted', 'rejected', 'failed')),
+    message     TEXT,
+    created     TEXT NOT NULL
+);
+
+-- The change log becomes a replicated, typed log. Every entry carries its
+-- origin server and a per-origin sequence number; entries learned from peers
+-- are appended too, so they are forwarded to other peers.
+CREATE TABLE changes_v3 (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_id  TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('copy', 'node', 'tag', 'mark')),
+    data       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    UNIQUE (origin_id, origin_seq)
+);
+INSERT INTO changes_v3(seq, origin_id, origin_seq, kind, data, ts)
+    SELECT seq, (SELECT value FROM meta WHERE key = 'server_id'), seq, 'copy',
+           json_object('node_id', node_id, 'vpath', vpath, 'op', op, 'size', size,
+                       'mtime_ns', mtime_ns, 'hash', hash),
+           ts
+    FROM changes;
+DROP TABLE changes;
+ALTER TABLE changes_v3 RENAME TO changes;
+
+-- Highest origin_seq applied per origin server.
+CREATE TABLE origin_progress (
+    origin_id TEXT PRIMARY KEY,
+    last_seq  INTEGER NOT NULL
+);
+
+-- Calls to peers that must eventually happen (delivered by the sync thread).
+CREATE TABLE outbox (
+    id         INTEGER PRIMARY KEY,
+    server_id  TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created    TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+-- Tags received for a vpath not (yet) in the index.
+CREATE TABLE orphan_tags (
+    vpath      TEXT NOT NULL,
+    tag        TEXT NOT NULL,
+    present    INTEGER NOT NULL,
+    updated    TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    PRIMARY KEY (vpath, tag)
+);
+
+-- Snapshot existing owned nodes and tags into the log so peers learn them.
+INSERT INTO changes(origin_id, origin_seq, kind, data, ts)
+    SELECT m.value,
+           (SELECT IFNULL(MAX(origin_seq), 0) FROM changes) + ROW_NUMBER() OVER (ORDER BY n.id),
+           'node',
+           json_object('id', n.id, 'name', n.name, 'kind', n.kind, 'owner_id', n.owner_id,
+                       'owner_name', (SELECT name FROM servers WHERE id = n.owner_id),
+                       'owner_since', n.owner_since, 'case_sensitive', n.case_sensitive,
+                       'restricted_names', n.restricted_names, 'priority', n.priority,
+                       'replication_target', n.replication_target, 'online', n.online),
+           strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    FROM nodes n JOIN meta m ON m.key = 'server_id' AND n.owner_id = m.value;
+INSERT INTO changes(origin_id, origin_seq, kind, data, ts)
+    SELECT m.value,
+           (SELECT IFNULL(MAX(origin_seq), 0) FROM changes) + ROW_NUMBER() OVER (ORDER BY t.file_id, t.tag),
+           'tag',
+           json_object('vpath', f.vpath, 'tag', t.tag, 'present', t.present,
+                       'updated', t.updated, 'updated_by', t.updated_by),
+           strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    FROM tags t JOIN files f ON f.id = t.file_id JOIN meta m ON m.key = 'server_id';
 """,
 }
 

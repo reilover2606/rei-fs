@@ -12,8 +12,9 @@ least two nodes. Servers never delete files.
   See its [README](client/README.md).
 * [`docs/DESIGN.md`](docs/DESIGN.md): architecture and behaviour.
 
-Status: milestones 1 (index and scanning), 2 (resumable rsync jobs) and 3
-(HTTPS API and terminal client) are done. See the server's
+Status: milestones 1 (index and scanning), 2 (resumable rsync jobs), 3 (HTTPS
+API and terminal client) and 4 (pairing, metadata sync, transfers between
+servers) are done. Next: automatic replication to two copies. See the server's
 [README](server/README.md) to try it.
 
 License: MIT.

@@ -29,7 +29,14 @@ def ensure_file(conn: sqlite3.Connection, vpath: str) -> int:
         (vpath, vkey, paths.encode_issues(paths.portability_issues(vpath)), db.now()),
     )
     refresh_case_flags(conn, vkey)
-    return cur.lastrowid
+    fid = cur.lastrowid
+    # Tags a peer sent before the file reached us.
+    conn.execute(
+        "INSERT OR REPLACE INTO tags(file_id, tag, present, updated, updated_by)"
+        " SELECT ?, tag, present, updated, updated_by FROM orphan_tags WHERE vpath = ?",
+        (fid, vpath))
+    conn.execute("DELETE FROM orphan_tags WHERE vpath = ?", (vpath,))
+    return fid
 
 
 def refresh_case_flags(conn: sqlite3.Connection, vkey: str) -> None:
@@ -56,18 +63,123 @@ def drop_file_if_orphan(conn: sqlite3.Connection, fid: int) -> bool:
     return True
 
 
-# --- change log --------------------------------------------------------------
+# --- change log ---------------------------------------------------------------
+#
+# Every fact this server is authoritative for is appended to ``changes`` with
+# origin = this server and a per-origin sequence number. Peers pull the log
+# (see sync.py). Kinds:
+#
+#   copy  {node_id, vpath, op: upsert|missing|remove, size, mtime_ns, hash}
+#   node  {id, name, kind, owner_id, owner_name, owner_since, ...settings}
+#   tag   {vpath, tag, present, updated, updated_by}
+#   mark  {node_id, vpath, marked}
+
+
+def self_id(conn: sqlite3.Connection) -> str:
+    return db.get_meta(conn, "server_id") or ""
+
+
+def append_change(conn: sqlite3.Connection, kind: str, data: dict,
+                  origin_id: str | None = None, origin_seq: int | None = None,
+                  ts: str | None = None) -> None:
+    """Append to the log: our own change (origin None) or one learned from a peer."""
+    if origin_id is None:
+        origin_id = self_id(conn)
+        origin_seq = conn.execute(
+            "SELECT IFNULL(MAX(origin_seq), 0) + 1 FROM changes WHERE origin_id = ?",
+            (origin_id,)).fetchone()[0]
+    conn.execute(
+        "INSERT OR IGNORE INTO changes(origin_id, origin_seq, kind, data, ts)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (origin_id, origin_seq, kind, json.dumps(data, separators=(",", ":")), ts or db.now()),
+    )
 
 
 def log_change(
     conn: sqlite3.Connection, node_id: str, vpath: str, op: str,
     size: int | None = None, mtime_ns: int | None = None, hash_: str | None = None,
 ) -> None:
-    conn.execute(
-        "INSERT INTO changes(node_id, vpath, op, size, mtime_ns, hash, ts)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (node_id, vpath, op, size, mtime_ns, hash_, db.now()),
-    )
+    append_change(conn, "copy", {"node_id": node_id, "vpath": vpath, "op": op, "size": size,
+                                 "mtime_ns": mtime_ns, "hash": hash_})
+
+
+def node_payload(conn: sqlite3.Connection, node_id: str) -> dict | None:
+    r = conn.execute(
+        "SELECT n.*, s.name AS owner_name FROM nodes n LEFT JOIN servers s ON s.id = n.owner_id"
+        " WHERE n.id = ?", (node_id,)).fetchone()
+    if r is None:
+        return None
+    return {"id": r["id"], "name": r["name"], "kind": r["kind"], "owner_id": r["owner_id"],
+            "owner_name": r["owner_name"], "owner_since": r["owner_since"],
+            "case_sensitive": r["case_sensitive"], "restricted_names": r["restricted_names"],
+            "priority": r["priority"], "replication_target": r["replication_target"],
+            "online": r["online"]}
+
+
+def log_node(conn: sqlite3.Connection, node_id: str) -> None:
+    """Announce the current state of a node we own."""
+    payload = node_payload(conn, node_id)
+    if payload and payload["owner_id"] == self_id(conn):
+        append_change(conn, "node", payload)
+
+
+def log_tag(conn: sqlite3.Connection, fid: int, tag: str) -> None:
+    r = conn.execute(
+        "SELECT f.vpath, t.present, t.updated, t.updated_by FROM tags t"
+        " JOIN files f ON f.id = t.file_id WHERE t.file_id = ? AND t.tag = ?",
+        (fid, tag)).fetchone()
+    if r:
+        append_change(conn, "tag", {"vpath": r["vpath"], "tag": tag, "present": r["present"],
+                                    "updated": r["updated"], "updated_by": r["updated_by"]})
+
+
+def log_mark(conn: sqlite3.Connection, fid: int, node_id: str) -> None:
+    r = conn.execute("SELECT marked_delete FROM copies WHERE file_id = ? AND node_id = ?",
+                     (fid, node_id)).fetchone()
+    if r is not None:
+        append_change(conn, "mark", {"node_id": node_id, "vpath": vpath_of(conn, fid),
+                                     "marked": r[0]})
+
+
+def set_marked(conn: sqlite3.Connection, fid: int, node_id: str, marked: bool) -> bool:
+    cur = conn.execute(
+        "UPDATE copies SET marked_delete = ? WHERE file_id = ? AND node_id = ?"
+        " AND marked_delete != ?", (int(marked), fid, node_id, int(marked)))
+    if cur.rowcount:
+        log_mark(conn, fid, node_id)
+    return bool(cur.rowcount)
+
+
+def owner_of(conn: sqlite3.Connection, node_id: str) -> str | None:
+    r = conn.execute("SELECT owner_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    return r[0] if r else None
+
+
+def queue_peer_call(conn: sqlite3.Connection, server_id: str, path: str, body: dict) -> None:
+    """Queue a POST to a peer; the sync thread delivers it (with retries)."""
+    conn.execute("INSERT INTO outbox(server_id, path, body, created) VALUES (?, ?, ?, ?)",
+                 (server_id, path, json.dumps(body), db.now()))
+
+
+def mark_copy(conn: sqlite3.Connection, fid: int, node_id: str, marked: bool,
+              expect_hash: str | None = None) -> None:
+    """Set the deletion mark of a copy: directly if we own the node, otherwise by
+    asking its owner (only the owner writes facts about its node)."""
+    owner = owner_of(conn, node_id)
+    if owner == self_id(conn):
+        if expect_hash is None or conn.execute(
+                "SELECT 1 FROM copies WHERE file_id = ? AND node_id = ? AND hash = ?",
+                (fid, node_id, expect_hash)).fetchone():
+            set_marked(conn, fid, node_id, marked)
+    elif owner:
+        queue_peer_call(conn, owner, "/api/peer/mark",
+                        {"node_id": node_id, "vpath": vpath_of(conn, fid), "marked": marked,
+                         "hash": expect_hash})
+
+
+def owned_node_ids(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT id FROM nodes WHERE owner_id = ?",
+                                       (self_id(conn),))}
 
 
 def vpath_of(conn: sqlite3.Connection, fid: int) -> str:
@@ -138,7 +250,11 @@ def current_version(conn: sqlite3.Connection, fid: int) -> Version | None:
 
 
 def evaluate_divergence(conn: sqlite3.Connection, fid: int) -> None:
-    """Keep the ``divergent`` decision for a file in sync with its copies."""
+    """Keep the ``divergent`` decision for a file in sync with its copies.
+
+    Each server raises it only for stale copies on nodes it owns (it is the
+    one able to update them), so peers never raise duplicates.
+    """
     rows = conn.execute(
         "SELECT node_id, hash FROM copies WHERE file_id = ? AND state = 'present'"
         " ORDER BY node_id",
@@ -150,7 +266,9 @@ def evaluate_divergence(conn: sqlite3.Connection, fid: int) -> None:
         " AND status IN ('open', 'dismissed')",
         (fid,),
     ).fetchall()
-    if len(hashes) <= 1:
+    cur = current_version(conn, fid) if len(hashes) > 1 else None
+    owned = owned_node_ids(conn)
+    if cur is None or not any(r["hash"] != cur.hash and r["node_id"] in owned for r in rows):
         obsolete_decisions(conn, fid, ("divergent",), statuses=("open", "dismissed"))
         return
     signature = [[r["node_id"], r["hash"]] for r in rows]
@@ -158,8 +276,6 @@ def evaluate_divergence(conn: sqlite3.Connection, fid: int) -> None:
         if json.loads(d["data"]).get("signature") == signature:
             return  # unchanged since raised (or since the user kept it as is)
     obsolete_decisions(conn, fid, ("divergent",), statuses=("open", "dismissed"))
-    cur = current_version(conn, fid)
-    assert cur is not None
     add_decision(
         conn, "divergent", fid, None,
         {
@@ -167,7 +283,8 @@ def evaluate_divergence(conn: sqlite3.Connection, fid: int) -> None:
             "current_hash": cur.hash,
             "tie": cur.tie,
             "current_nodes": [r["node_id"] for r in rows if r["hash"] == cur.hash],
-            "stale_nodes": [r["node_id"] for r in rows if r["hash"] != cur.hash],
+            "stale_nodes": [r["node_id"] for r in rows
+                            if r["hash"] != cur.hash and r["node_id"] in owned],
         },
     )
 
@@ -194,6 +311,8 @@ def copy_tags(conn: sqlite3.Connection, from_fid: int, to_fid: int) -> None:
         " WHERE excluded.updated > tags.updated",
         (to_fid, from_fid),
     )
+    for (tag,) in conn.execute("SELECT tag FROM tags WHERE file_id = ?", (to_fid,)).fetchall():
+        log_tag(conn, to_fid, tag)
 
 
 def record_copy(conn: sqlite3.Connection, fid: int, node_id: str, size: int,

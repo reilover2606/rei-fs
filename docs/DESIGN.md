@@ -1,7 +1,7 @@
 # rei-fs design
 
-Status: approved. Milestones 1 (index), 2 (jobs) and 3 (API and client) are
-implemented.
+Status: approved. Milestones 1 (index), 2 (jobs), 3 (API and client) and 4
+(pairing and sync) are implemented.
 
 ## 1. Goals
 
@@ -221,10 +221,11 @@ Scans and job runs take a per-server lock, so they never overlap.
   `conflict` decision (overwrite / skip). Nothing is ever overwritten without
   the user's confirmation, except via an explicit "update stale copies"
   decision.
-* Server-to-server: each server runs `rsync --daemon` itself on a dedicated
-  port, with a module per owned node and credentials generated at pairing.
-  Intended for a LAN or a VPN (e.g. WireGuard, Tailscale). rsync over SSH may
-  be added later as an option.
+* Server-to-server: the destination's owner pulls from the source server's
+  read-only rsync daemon (section 7.3). Credentials are generated at
+  pairing. The rsync protocol is not encrypted, so this is intended for a
+  LAN or a VPN (e.g. WireGuard, Tailscale). rsync over SSH may be added
+  later as an option.
 * On Windows the rsync binary (cwRsync, MSYS2, ...) is set in the config.
   rei-fs translates paths to the `/cygdrive/c/...` form as needed.
 
@@ -258,25 +259,103 @@ excluded as replication targets or incompatible.
 
 ## 7. Metadata and server-to-server sync (milestone 4)
 
+### 7.1 The replicated log
+
 * Each server keeps a SQLite database (`reifs.db`) in its home directory.
-* The owner of a node is the only writer of facts about that node's copies.
-  Every change is appended to a `changes` log with a monotonic sequence
-  number.
-* Paired servers pull each other's logs from their last seen sequence
-  number, so propagation works whenever servers can talk and catches up
-  after downtime. Changes from a peer are forwarded as well, so a server
-  learns about nodes it never talks to directly.
-* Tags belong to the vpath and follow renames. Tag edits (add/remove) carry
-  a timestamp and server id, and the last writer wins per (file, tag).
-* Decisions about a node are owned by the node's owner. Resolving one from
-  another server forwards the resolution to the owner.
+* The owner of a node is the only writer of facts about that node. Every
+  fact is appended to the `changes` log as one of four kinds:
+  * `copy`: add/update, missing or removed;
+  * `node`: its settings, online state and owner;
+  * `tag`;
+  * `mark`: deletion mark.
 
-### 7.1 Pairing
+  Each entry carries its **origin server** and a **per-origin sequence
+  number**.
+* A server pulls each peer's log from a cursor. Entries learned from one
+  peer are appended to the local log, so they are passed on to servers that
+  never talk to the origin directly (A–B–C: C learns about A through B). An
+  entry is applied only once, tracked by `origin_progress`.
+* Authority on apply:
+  * `copy` and `mark` entries count only if their origin owns the node;
+  * a `node` entry counts only from the node's owner;
+  * an ownership change wins if its `owner_since` is newer.
+* Tags belong to the vpath and follow renames. Each edit carries a
+  timestamp and server id, and the newest wins per (file, tag). Tags for a
+  vpath not yet known are kept until the file arrives.
+* Node names are unique. Another server's node with a clashing name is
+  shown as `name@server`.
+* Each server raises `divergent` decisions only for stale copies on nodes
+  it owns, since it is the one able to update them. `missing` decisions are
+  raised by the node's owner. Decisions, wanted jobs and jobs are local to
+  each server; the client sees them merged (see 7.4).
+* **Propagation timing.**
+  * The sync thread pulls every 30 s, or every 5 s while a peer is
+    unreachable.
+  * It also pulls immediately when poked. A server pokes its peers whenever
+    it has new local facts, including facts written by the CLI in another
+    process, and after it applied news from another peer.
+  * A change typically crosses two hops in about a second.
+* **Outbox.** Effects on another server's node are queued and delivered by
+  the sync thread, with retries while the peer is unreachable:
+  * marking a moved source for deletion;
+  * removing a mark;
+  * proposing a rename.
 
-Server A sends a pairing request to B (address entered manually or found via
-mDNS on the LAN). The user must accept it in the client on **both** sides.
-After that, the servers exchange rsync credentials and API tokens. Paired
-servers obey each other's send/receive requests without further prompts.
+  A refusal is final: for example, the owner refuses to mark a copy whose
+  content changed since it was copied.
+
+### 7.2 Pairing
+
+* A's administrator enters B's address. A shows B's certificate
+  fingerprint to compare with `reifs fingerprint` on B; sending the request
+  is acceptance on A's side.
+* A's request carries A's id, name, address, fingerprint and a random
+  nonce. B lists it as an incoming request.
+* B's administrator accepts it (client Servers tab, or `reifs peer
+  accept`). B then connects back to A, pinning the fingerprint A sent, and
+  completes the handshake with the nonce.
+* The two servers exchange API tokens (each stores only a hash of the token
+  it issued) and credentials for each other's rsync daemon.
+* Peers authenticate with `Authorization: Peer <id>:<token>` and may call
+  every admin endpoint, as paired servers obey each other. They cannot call
+  login or pairing management.
+* Unpairing (from either side) revokes the tokens on both sides when
+  reachable.
+
+### 7.3 Transfers between servers
+
+* **The destination's owner runs every transfer into its nodes.**
+  * A job targeting another server's node is forwarded to that server, by
+    the API or by the CLI.
+  * It pulls the files from the source's rsync daemon, verifies the hash and
+    records the copy itself.
+  * For a move, it asks the source's owner, through the outbox, to mark the
+    verified copy for deletion.
+* Each server runs `rsync --daemon` while it has at least one peer:
+  * one module per online node it owns;
+  * a user per paired server;
+  * **read-only**, with every delete option refused, so no server can write
+    or delete through it;
+  * its configuration is rewritten when nodes or pairings change.
+* A source is usable if it is attached locally, or if its node is online on
+  a paired server that answered the last sync. A transfer therefore needs
+  the destination's server to be paired with a server that holds the file.
+  Facts relayed through a third server are visible, but files are not
+  relayed.
+
+### 7.4 Several servers in the API and client
+
+* A request with `server=<id>` (a query parameter for GET, a body field for
+  POST) is forwarded to that paired server.
+* `GET decisions|wanted|jobs?everywhere=1` merges the lists of every paired
+  server. Each item is labelled with its server, and unreachable servers
+  are listed.
+* Node settings, scans, deletion marks and new jobs are routed to the
+  owning server automatically.
+* A storage node owned by another server that is plugged in here appears
+  as *foreign* and can be **adopted**. The marker is rewritten and the new
+  owner announces itself with a newer `owner_since`; the former owner stops
+  managing the node when it syncs.
 
 ## 8. Client and API (milestone 3)
 
@@ -316,6 +395,11 @@ Endpoints (all JSON, under `/api`):
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
 | `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |
 | `GET marked?node=`, `POST unmark {paths, node, all}` | Deletion marks |
+| `POST nodes/<name>/adopt` | Adopt another server's drive attached here |
+| `GET peers`, `POST peers/probe`, `POST peers/pair` | Pairing (client only) |
+| `POST peers/requests/<id>/accept\|reject`, `POST peers/<id>/unpair`, `POST peers/sync` | Pairing (client only) |
+| `GET peer/hello`, `POST peer/pair-request\|pair-confirm\|pair-reject` | Server to server, public |
+| `GET peer/changes?since=`, `POST peer/mark\|wanted\|poke\|unpair` | Server to server, peer token |
 
 ### 8.2 Client
 
@@ -327,9 +411,10 @@ Endpoints (all JSON, under `/api`):
   `reifs fingerprint`, then pins it per `host:port`. A changed fingerprint
   is refused with a warning unless the user explicitly trusts the new one.
   The CA chain and host name are not used.
-* Tabs: Overview, Tree, Search, Decisions, Wanted, Jobs, Nodes, Marked. A
-  background thread polls `GET status` every 2 s for the status bar and the
-  live Jobs view.
+* Tabs: Overview, Tree, Search, Decisions, Wanted, Jobs, Nodes, Marked,
+  Servers. A background thread polls `GET status` every 2 s for the status
+  bar and the live Jobs view. Decisions, Wanted and Jobs show every paired
+  server's items.
 
 ## 9. Server configuration
 
@@ -343,6 +428,7 @@ name = "desktop"
 listen = "0.0.0.0:7420"
 password_hash = ""            # set with `reifs passwd`
 auto_replicate = false
+advertise = ""                # HOST:PORT peers use to reach us ("" = detect)
 
 [storage]
 root = "/home/me/rei"         # this server's own node root
@@ -359,6 +445,7 @@ max_depth = 3
 
 [rsync]
 path = "rsync"
+daemon_port = 7421            # read-only rsync daemon for paired servers
 ```
 
 ## 10. Milestones
