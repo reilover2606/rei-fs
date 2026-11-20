@@ -25,7 +25,8 @@ DEFAULT_IGNORE = [
 ]
 
 
-SECTIONS = ("server", "storage", "scan", "discovery", "rsync", "transfers")
+SECTIONS = ("server", "storage", "scan", "discovery", "rsync", "transfers", "replication",
+            "ssh")
 PATH_STYLES = ("auto", "native", "cygwin", "msys")
 
 
@@ -86,6 +87,27 @@ class RsyncSection:
 
 
 @dataclass
+class ReplicationSection:
+    # Good copies every file should have (on different nodes).
+    copies: int = 2
+    # More copies for files with these tags, e.g. {"important": 3}.
+    tag_copies: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class SshSection:
+    # Let paired servers pull from this machine over SSH instead of the rsync
+    # daemon (for servers that are not on the same LAN or VPN). Needs an SSH
+    # server here; 'reifs ssh authorize' installs the peers' keys.
+    enabled: bool = False
+    host: str = ""      # host peers connect to ("" = our address as they know it)
+    port: int = 22
+    user: str = ""      # account on this machine ("" = the user running rei-fs)
+    # ssh client used when this server pulls from peers over SSH.
+    command: str = "ssh"
+
+
+@dataclass
 class TransfersSection:
     batch_files: int = 500
     batch_mb: int = 1024
@@ -102,6 +124,8 @@ class Config:
     discovery: DiscoverySection = field(default_factory=DiscoverySection)
     rsync: RsyncSection = field(default_factory=RsyncSection)
     transfers: TransfersSection = field(default_factory=TransfersSection)
+    replication: ReplicationSection = field(default_factory=ReplicationSection)
+    ssh: SshSection = field(default_factory=SshSection)
 
     @property
     def config_path(self) -> Path:
@@ -134,7 +158,13 @@ class Config:
                     )
                 if expected is list and not all(isinstance(i, str) for i in v):
                     raise ConfigError(f"{path}: [{section_name}].{k} must be a list of strings")
+                if expected is dict and not all(
+                        isinstance(a, str) and isinstance(b, int) and not isinstance(b, bool)
+                        for a, b in v.items()):
+                    raise ConfigError(f"{path}: [{section_name}].{k} must map names to numbers")
                 setattr(section, k, v)
+        if cfg.replication.copies < 1 or any(n < 1 for n in cfg.replication.tag_copies.values()):
+            raise ConfigError(f"{path}: copy goals must be at least 1")
         if cfg.rsync.path_style not in PATH_STYLES:
             raise ConfigError(f"{path}: [rsync].path_style must be one of {', '.join(PATH_STYLES)}")
         return cfg
@@ -157,6 +187,10 @@ class Config:
 
         def b(v: bool) -> str:
             return "true" if v else "false"
+
+        def tbl(d: dict[str, int]) -> str:
+            return "{ " + ", ".join(f"{s(k)} = {v}" for k, v in sorted(d.items())) + " }" \
+                if d else "{}"
 
         return f"""\
 # rei-fs server configuration. See docs/DESIGN.md.
@@ -204,4 +238,22 @@ batch_mb = {self.transfers.batch_mb}
 min_free_mb = {self.transfers.min_free_mb}
 # Transient failures before an item is marked failed.
 max_attempts = {self.transfers.max_attempts}
+
+[replication]
+# Good copies every file should have, on different nodes.
+copies = {self.replication.copies}
+# More copies for files with these tags (the highest goal applies),
+# e.g. {{ "important" = 3, "photos" = 3 }}.
+tag_copies = {tbl(self.replication.tag_copies)}
+
+[ssh]
+# Let paired servers pull from this machine over SSH instead of the rsync
+# daemon (encrypted; for servers not on the same LAN/VPN). Install their keys
+# with 'reifs ssh authorize'.
+enabled = {b(self.ssh.enabled)}
+host = {s(self.ssh.host)}
+port = {self.ssh.port}
+user = {s(self.ssh.user)}
+# ssh client used when pulling from peers over SSH.
+command = {s(self.ssh.command)}
 """

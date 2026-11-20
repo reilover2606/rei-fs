@@ -23,7 +23,9 @@ openssl_dep = dependency('openssl', version: '>=3.0')
 httplib_dep = dependency('cpp-httplib', version: '>=0.66',
                          fallback: ['cpp-httplib', 'cpp_httplib_dep'],
                          default_options: ['tls=enabled', 'zlib=disabled',
-                                           'brotli=disabled', 'zstd=disabled'])
+                                           'brotli=disabled', 'zstd=disabled',
+                                           # needs GetAddrInfoExCancel, missing in MinGW
+                                           'non_blocking_getaddrinfo=disabled'])
 thread_dep = dependency('threads')
 
 deps = [ftxui_dep, json_dep, openssl_dep, httplib_dep, thread_dep]

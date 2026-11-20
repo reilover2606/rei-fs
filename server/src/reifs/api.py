@@ -68,6 +68,7 @@ def file_json(info: queries.FileInfo, full: bool = True) -> dict:
         "size": info.size,
         "mtime": _secs(cur.mtime_ns) if cur else 0,
         "good_copies": info.good_copies,
+        "goal": info.goal,
         "tags": info.tags,
         "issues": sorted(info.issues),
         "flags": flags,
@@ -222,7 +223,7 @@ class Api:
     # --- status and nodes -----------------------------------------------------------
 
     def status(self, conn, q, body, **_):
-        s = queries.status(conn)
+        s = queries.status(conn, replication.policy(self.cfg))
         online, total = conn.execute(
             "SELECT COALESCE(SUM(online), 0), COUNT(*) FROM nodes").fetchone()
         return {
@@ -332,7 +333,7 @@ class Api:
 
     def tree(self, conn, q, body, **_):
         vdir = paths.normalize(q.get("path", "/"))
-        entries = queries.list_dir(conn, vdir)
+        entries = queries.list_dir(conn, vdir, replication.policy(self.cfg))
         if entries is None:
             raise ApiError(404, f"not a directory in the virtual tree: {vdir}")
         out = []
@@ -346,7 +347,7 @@ class Api:
         return {"path": vdir, "entries": out}
 
     def file(self, conn, q, body, **_):
-        info = queries.lookup(conn, q.get("path", ""))
+        info = queries.lookup(conn, q.get("path", ""), replication.policy(self.cfg))
         if info is None:
             raise ApiError(404, f"not a file in the virtual tree: {q.get('path')}")
         return file_json(info)
@@ -355,7 +356,8 @@ class Api:
         limit = min(int(q.get("limit", FIND_LIMIT)), FIND_LIMIT)
         results = queries.find(conn, q.get("q") or None, tag=q.get("tag") or None,
                                node=q.get("node") or None, issues_only=q.get("issues") == "1",
-                               under_replicated=q.get("under") == "1")
+                               under_replicated=q.get("under") == "1",
+                               policy=replication.policy(self.cfg))
         return {"total": len(results), "truncated": len(results) > limit,
                 "files": [file_json(f, full=False) for f in results[:limit]]}
 
@@ -483,8 +485,10 @@ class Api:
     # --- replication ----------------------------------------------------------------
 
     def replication_status(self, conn, q, body, **_):
-        s = queries.status(conn)
-        return {"target": replication.TARGET, "auto_replicate": self.cfg.server.auto_replicate,
+        s = queries.status(conn, replication.policy(self.cfg))
+        return {"copies": self.cfg.replication.copies,
+                "tag_copies": self.cfg.replication.tag_copies,
+                "auto_replicate": self.cfg.server.auto_replicate,
                 "satisfied": s.satisfied, "under_replicated": s.under_replicated,
                 "single_copy": s.single_copy,
                 "open_proposals": conn.execute(
@@ -493,12 +497,25 @@ class Api:
                 "last_plan": replication.last_plan(conn)}
 
     def replication_settings(self, conn, q, body, **_):
+        if "copies" in body:
+            n = int(body["copies"])
+            if n < 1:
+                raise ApiError(400, "copies must be at least 1")
+            self.cfg.replication.copies = n
+        if "tag_copies" in body:
+            tc = body["tag_copies"]
+            if not isinstance(tc, dict) or not all(
+                    isinstance(k, str) and isinstance(v, int) and v >= 1 for k, v in tc.items()):
+                raise ApiError(400, "tag_copies must map tags to numbers >= 1")
+            self.cfg.replication.tag_copies = dict(tc)
         if "auto_replicate" in body:
             self.cfg.server.auto_replicate = bool(body["auto_replicate"])
-            self.cfg.save()
-            if self.cfg.server.auto_replicate and self.worker:
-                self.worker.request_plan()
-        return {"auto_replicate": self.cfg.server.auto_replicate}
+        self.cfg.save()
+        if self.worker:
+            self.worker.request_plan()
+        return {"auto_replicate": self.cfg.server.auto_replicate,
+                "copies": self.cfg.replication.copies,
+                "tag_copies": self.cfg.replication.tag_copies}
 
     def replication_plan(self, conn, q, body, **_):
         self._need_worker().request_plan()

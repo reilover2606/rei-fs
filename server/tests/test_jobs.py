@@ -1,3 +1,4 @@
+import sys
 import os
 import shutil
 import sqlite3
@@ -127,6 +128,7 @@ def test_conflict_overwrite_refused_if_destination_changed_again(two):
     assert (two.ssd / "docs" / "a.txt").read_text() == "changed after the decision"
 
 
+@pytest.mark.skipif(sys.platform == 'win32', reason='Windows cannot create such names')
 def test_restricted_names_skipped_but_legal_nodes_ok(two):
     write(two.root / "odd" / "what?.txt", "q")
     two.scan()

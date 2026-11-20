@@ -9,7 +9,28 @@ from dataclasses import dataclass, field
 from . import index, paths
 from .tags import tags_of
 
-REPLICATION_TARGET = 2
+DEFAULT_COPIES = 2
+
+
+@dataclass(frozen=True)
+class GoalPolicy:
+    """How many good copies a file should have: ``copies``, or more for files
+    carrying a tag listed in ``tag_copies`` (the highest goal applies)."""
+
+    copies: int = DEFAULT_COPIES
+    tag_copies: tuple[tuple[str, int], ...] = ()
+
+    @classmethod
+    def from_config(cls, cfg) -> "GoalPolicy":
+        r = cfg.replication
+        return cls(max(1, r.copies), tuple(sorted((t, max(1, n)) for t, n in r.tag_copies.items())))
+
+    def goal(self, tags) -> int:
+        extra = dict(self.tag_copies)
+        return max([self.copies] + [extra[t] for t in tags if t in extra])
+
+
+DEFAULT_POLICY = GoalPolicy()
 
 
 @dataclass
@@ -32,6 +53,7 @@ class FileInfo:
     issues: set[str]
     tags: list[str]
     copies: list[CopyInfo] = field(default_factory=list)
+    goal: int = DEFAULT_COPIES
 
     @property
     def good_copies(self) -> int:
@@ -45,10 +67,13 @@ class FileInfo:
         return cur[0].size if cur else 0
 
 
-def file_info(conn: sqlite3.Connection, fid: int) -> FileInfo:
+def file_info(conn: sqlite3.Connection, fid: int,
+              policy: GoalPolicy = DEFAULT_POLICY) -> FileInfo:
     f = conn.execute("SELECT * FROM files WHERE id = ?", (fid,)).fetchone()
     version = index.current_version(conn, fid)
-    info = FileInfo(fid, f["vpath"], paths.decode_issues(f["issues"]), tags_of(conn, fid))
+    file_tags = tags_of(conn, fid)
+    info = FileInfo(fid, f["vpath"], paths.decode_issues(f["issues"]), file_tags,
+                    goal=policy.goal(file_tags))
     for c in conn.execute(
         "SELECT c.*, n.name, n.online FROM copies c JOIN nodes n ON n.id = c.node_id"
         " WHERE c.file_id = ? ORDER BY n.name",
@@ -62,9 +87,10 @@ def file_info(conn: sqlite3.Connection, fid: int) -> FileInfo:
     return info
 
 
-def lookup(conn: sqlite3.Connection, vpath: str) -> FileInfo | None:
+def lookup(conn: sqlite3.Connection, vpath: str,
+           policy: GoalPolicy = DEFAULT_POLICY) -> FileInfo | None:
     fid = index.file_id(conn, paths.normalize(vpath))
-    return file_info(conn, fid) if fid is not None else None
+    return file_info(conn, fid, policy) if fid is not None else None
 
 
 @dataclass
@@ -75,7 +101,8 @@ class DirEntry:
     file: FileInfo | None = None
 
 
-def list_dir(conn: sqlite3.Connection, vdir: str) -> list[DirEntry] | None:
+def list_dir(conn: sqlite3.Connection, vdir: str,
+             policy: GoalPolicy = DEFAULT_POLICY) -> list[DirEntry] | None:
     """Immediate children of a virtual directory. None if it does not exist."""
     vdir = paths.normalize(vdir)
     lo, hi = paths.prefix_range(vdir) if vdir != "/" else ("/", "0")
@@ -88,7 +115,7 @@ def list_dir(conn: sqlite3.Connection, vdir: str) -> list[DirEntry] | None:
         if sep:
             dirs[head] = dirs.get(head, 0) + 1
         else:
-            files.append(DirEntry(head, False, 1, file_info(conn, r["id"])))
+            files.append(DirEntry(head, False, 1, file_info(conn, r["id"], policy)))
     if not dirs and not files and vdir != "/":
         return None
     out = [DirEntry(name, True, n) for name, n in sorted(dirs.items())]
@@ -97,7 +124,8 @@ def list_dir(conn: sqlite3.Connection, vdir: str) -> list[DirEntry] | None:
 
 def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
          node: str | None = None, issues_only: bool = False,
-         under_replicated: bool = False) -> list[FileInfo]:
+         under_replicated: bool = False,
+         policy: GoalPolicy = DEFAULT_POLICY) -> list[FileInfo]:
     q = "SELECT DISTINCT f.id, f.vpath FROM files f"
     where, args = [], []
     if tag:
@@ -120,8 +148,8 @@ def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None =
             target = r["vpath"] if "/" in pat else paths.basename(r["vpath"])
             if not fnmatch.fnmatchcase(target.casefold(), pat):
                 continue
-        info = file_info(conn, r["id"])
-        if under_replicated and info.good_copies >= REPLICATION_TARGET:
+        info = file_info(conn, r["id"], policy)
+        if under_replicated and info.good_copies >= info.goal:
             continue
         out.append(info)
     return out
@@ -142,7 +170,7 @@ class Status:
     open_wanted: int
 
 
-def status(conn: sqlite3.Connection) -> Status:
+def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Status:
     # Per file: size of the current version and number of good copies, in SQL
     # so it stays fast for tens of thousands of files.
     rows = conn.execute("""
@@ -160,12 +188,17 @@ def status(conn: sqlite3.Connection) -> Status:
         FROM cur
     """).fetchall()
     one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
+    file_tags: dict[int, list[str]] = {}
+    if policy.tag_copies:
+        for fid, tag in conn.execute("SELECT file_id, tag FROM tags WHERE present = 1"):
+            file_tags.setdefault(fid, []).append(tag)
+    goals = {r["file_id"]: policy.goal(file_tags.get(r["file_id"], ())) for r in rows}
     return Status(
         files=one("SELECT COUNT(*) FROM files"),
         bytes=sum(r["size"] for r in rows),
-        satisfied=sum(1 for r in rows if r["good"] >= REPLICATION_TARGET),
-        under_replicated=sum(1 for r in rows if r["good"] < REPLICATION_TARGET),
-        single_copy=sum(1 for r in rows if r["good"] == 1),
+        satisfied=sum(1 for r in rows if r["good"] >= goals[r["file_id"]]),
+        under_replicated=sum(1 for r in rows if r["good"] < goals[r["file_id"]]),
+        single_copy=sum(1 for r in rows if r["good"] == 1 and goals[r["file_id"]] > 1),
         divergent=one("SELECT COUNT(*) FROM decisions WHERE kind = 'divergent' AND status = 'open'"),
         missing_copies=one("SELECT COUNT(*) FROM copies WHERE state = 'missing'"),
         marked_delete=one("SELECT COUNT(*) FROM copies WHERE marked_delete = 1"),
