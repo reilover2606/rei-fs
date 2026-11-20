@@ -16,6 +16,10 @@ uv run reifs serve           # HTTPS API for the client + background work
 Ctrl+C (or SIGTERM) stops the server: the current scan or transfer is
 interrupted (partial files are kept and resumed next time) and the rsync
 processes it started are ended. A second Ctrl+C forces an immediate exit.
+If shutdown ever gets stuck, after 8 s it prints where every thread is (send
+that output with a bug report) and after 20 s it exits anyway; set
+`REIFS_SHUTDOWN_SECONDS` to change that. `kill -USR1 PID` prints the thread
+stacks of a running server at any time.
 
 `reifs serve` listens on `[server] listen` (default `0.0.0.0:7420`). It
 creates a self-signed certificate on first start and prints its
