@@ -6,8 +6,9 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
+# Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
@@ -142,6 +143,45 @@ CREATE TABLE foreign_sightings (
 """
 
 
+MIGRATIONS: dict[int, str] = {
+    2: """
+-- Transfer jobs (milestone 2). Items refer to files by vpath so they survive
+-- re-keying of files.
+CREATE TABLE jobs (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK (kind IN ('copy', 'move', 'wanted')),
+    description TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'running', 'waiting', 'done', 'failed', 'cancelled')),
+    created     TEXT NOT NULL,
+    started     TEXT,
+    finished    TEXT
+);
+
+CREATE TABLE job_items (
+    id          INTEGER PRIMARY KEY,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    op          TEXT NOT NULL CHECK (op IN ('copy', 'overwrite', 'rename')),
+    vpath       TEXT NOT NULL,
+    new_vpath   TEXT,                       -- rename target
+    src_node    TEXT REFERENCES nodes(id) ON DELETE SET NULL,  -- NULL: any current copy
+    dst_node    TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    size        INTEGER NOT NULL DEFAULT 0,
+    mark_source INTEGER NOT NULL DEFAULT 0, -- move: mark the source copy for deletion
+    allow_hash  TEXT,                       -- destination content we may overwrite
+    wanted_id   INTEGER REFERENCES wanted(id) ON DELETE SET NULL,
+    state       TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'running', 'done', 'failed', 'skipped',
+                                 'conflict', 'cancelled')),
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    message     TEXT,
+    updated     TEXT NOT NULL
+);
+CREATE INDEX job_items_job ON job_items(job_id, state);
+""",
+}
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -158,16 +198,25 @@ def connect(path: Path | str) -> sqlite3.Connection:
 def create(path: Path | str) -> sqlite3.Connection:
     conn = connect(path)
     # executescript() manages its own transaction; keep schema + version atomic.
-    conn.executescript(
-        f"BEGIN;\n{SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;"
-    )
+    conn.executescript(f"BEGIN;\n{SCHEMA}\nPRAGMA user_version = 1;\nCOMMIT;")
+    migrate(conn)
     return conn
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for target in range(version + 1, SCHEMA_VERSION + 1):
+        conn.executescript(
+            f"BEGIN;\n{MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;"
+        )
 
 
 def open_existing(path: Path | str) -> sqlite3.Connection:
     conn = connect(path)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version != SCHEMA_VERSION:
+    if 1 <= version < SCHEMA_VERSION:
+        migrate(conn)
+    elif version != SCHEMA_VERSION:
         conn.close()
         raise RuntimeError(
             f"{path}: database schema version {version}, expected {SCHEMA_VERSION}"

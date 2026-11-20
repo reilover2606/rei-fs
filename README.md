@@ -12,7 +12,8 @@ least two nodes. Servers never delete files.
   (milestone 3).
 * [`docs/DESIGN.md`](docs/DESIGN.md): architecture and behaviour.
 
-Status: milestone 1 (index and scanning) is done. See the server's
+Status: milestones 1 (index and scanning) and 2 (resumable rsync jobs) are
+done. See the server's
 [README](server/README.md) to try it.
 
 License: MIT.

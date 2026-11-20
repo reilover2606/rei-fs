@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import db, index, paths
+from . import db, fsops, index, paths
 from .config import Config, ScanSection
 from .hashing import hash_file
 from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
@@ -391,20 +391,12 @@ def _reconcile_vanished(conn, node, root, scan_id, existing, seen, walker, ignor
         touched.add(fid)
 
     for vdir in sorted(prune, key=lambda p: -p.count("/")):
-        stats.pruned_dirs += _prune(root, vdir)
+        stats.pruned_dirs += fsops.prune(root, vdir)
 
 
 def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
                    new_fid: int, new_vpath: str) -> None:
-    # Tags follow the rename (newest edit wins if the target already has the tag).
-    conn.execute(
-        "INSERT INTO tags(file_id, tag, present, updated, updated_by)"
-        " SELECT ?, tag, present, updated, updated_by FROM tags WHERE file_id = ?"
-        " ON CONFLICT(file_id, tag) DO UPDATE SET present = excluded.present,"
-        " updated = excluded.updated, updated_by = excluded.updated_by"
-        " WHERE excluded.updated > tags.updated",
-        (new_fid, old_fid),
-    )
+    index.copy_tags(conn, old_fid, new_fid)  # tags follow the rename
     conn.execute(
         "UPDATE files SET created = MIN(created, (SELECT created FROM files WHERE id = ?))"
         " WHERE id = ?",
@@ -419,20 +411,6 @@ def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
     if others:
         index.add_decision(conn, "rename", old_fid, node_id,
                            {"from": old_vpath, "to": new_vpath, "nodes": others})
-
-
-def _prune(root: Path, vdir: str) -> int:
-    removed = 0
-    while vdir != "/":
-        try:
-            os.rmdir(paths.to_physical(root, vdir))
-            removed += 1
-        except FileNotFoundError:
-            pass
-        except OSError:
-            break  # not empty (or not ours to touch): stop climbing
-        vdir = paths.parent(vdir)
-    return removed
 
 
 def scan_all(

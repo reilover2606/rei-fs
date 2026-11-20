@@ -6,7 +6,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-from . import db, index
+from . import db, index, jobs
 
 
 class DecisionError(Exception):
@@ -61,6 +61,11 @@ def options_for(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, str]:
         return {
             "apply": "Rename the copies on the other nodes too",
             "ignore": "Leave the other copies at the old path",
+        }
+    if kind == "conflict":
+        return {
+            "overwrite": "Replace the file on this node with the job's version",
+            "skip": "Keep the file on this node; skip this item",
         }
     if kind == "divergent":
         return {
@@ -163,4 +168,24 @@ def _apply_divergent(conn, row, data, option) -> str:
     return f"queued {len(stale)} overwrite(s) (see 'reifs wanted')"
 
 
-_APPLY = {"missing": _apply_missing, "rename": _apply_rename, "divergent": _apply_divergent}
+def _apply_conflict(conn, row, data, option) -> str:
+    item = conn.execute("SELECT * FROM job_items WHERE id = ?", (data["item_id"],)).fetchone()
+    if item is None or item["state"] != "conflict":
+        return "the job item no longer exists or is not in conflict; nothing to do"
+    if option == "overwrite":
+        # Only the exact content seen at conflict time may be replaced; if the
+        # destination changes again, a new conflict is raised.
+        conn.execute(
+            "UPDATE job_items SET state = 'pending', allow_hash = ?, message = NULL,"
+            " updated = ? WHERE id = ?", (data["dst_hash"], db.now(), item["id"]))
+        summary = f"item will overwrite the file on the next run of job #{item['job_id']}"
+    else:
+        conn.execute("UPDATE job_items SET state = 'skipped', message = 'skipped by user',"
+                     " updated = ? WHERE id = ?", (db.now(), item["id"]))
+        summary = "item skipped"
+    jobs.refresh_status(conn, item["job_id"])
+    return summary
+
+
+_APPLY = {"missing": _apply_missing, "rename": _apply_rename, "divergent": _apply_divergent,
+          "conflict": _apply_conflict}
