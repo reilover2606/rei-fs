@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import socket
@@ -18,6 +19,7 @@ import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
@@ -138,6 +140,7 @@ class Api:
         r("POST", r"/api/logout", self.logout, "client")
         r("GET", r"/api/status", self.status)
         r("GET", r"/api/nodes", self.list_nodes)
+        r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
@@ -283,6 +286,8 @@ class Api:
         if row["owner_id"] != nodes.self_id(conn):
             # Settings of a node are facts its owner publishes.
             return peers.forward(conn, row["owner_id"], "POST", f"/api/nodes/{row['id']}", body)
+        if "name" in body:
+            nodes.rename_node(conn, row["id"], str(body["name"]))
         with db.transaction(conn):
             if "priority" in body:
                 conn.execute("UPDATE nodes SET priority = ? WHERE id = ?",
@@ -293,6 +298,26 @@ class Api:
             index.log_node(conn, row["id"])
         self._poke()
         return {"ok": True}
+
+    def add_node(self, conn, q, body, **_):
+        """Register a storage node (an external drive, a folder) on this machine."""
+        raw = str(body.get("path", "")).strip()
+        if not raw:
+            raise ApiError(400, "give the path of the drive's folder on the server machine")
+        path = Path(os.path.expanduser(raw))
+        if not path.is_absolute():
+            raise ApiError(400, f"{raw!r} is not an absolute path (it is read on the server)")
+        if not path.is_dir():
+            raise ApiError(400, f"{path} is not a folder on the server machine "
+                                "(is the drive mounted?)")
+        name = nodes.clean_name(str(body.get("name") or path.name))
+        node_id = nodes.register_node(conn, path, name)
+        if self.worker:
+            self.worker.request_scan([name])
+        if self.syncer:
+            self.syncer.request_daemon_update()
+            self.syncer.request_poke()
+        return {"ok": True, "id": node_id, "name": name}
 
     def adopt_node(self, conn, q, body, node, **_):
         name = nodes.adopt_node(conn, unquote(node))

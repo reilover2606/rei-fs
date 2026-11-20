@@ -1135,7 +1135,8 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "s/S: scan node/all  v: verify  p: priority  t: backup target  o: adopt foreign drive";
+    return "n: add drive  R: rename  s/S: scan  v: verify  p: priority  t: backup target  "
+           "o: adopt";
   }
 
   void refresh() override {
@@ -1208,6 +1209,32 @@ class NodesView : public View {
       if (ctx_.attempt([&] { ctx_.api->post("/api/scan"); })) ctx_.notify("scan of all nodes queued");
       return true;
     }
+    if (key(e, "n")) {
+      ctx_.dialogs->ask_text(
+          "Add a drive: the path of its folder ON THE SERVER'S MACHINE (e.g. /media/me/SSD)", "",
+          [this](const std::string& path) {
+            if (path.empty()) return;
+            // Default name: the folder's name.
+            std::string trimmed = path;
+            while (trimmed.size() > 1 && (trimmed.back() == '/' || trimmed.back() == '\\'))
+              trimmed.pop_back();
+            auto slash = trimmed.find_last_of("/\\");
+            std::string suggestion =
+                slash == std::string::npos ? trimmed : trimmed.substr(slash + 1);
+            ctx_.dialogs->ask_text("Name of the new node", suggestion,
+                                   [this, path](const std::string& name) {
+                                     if (name.empty()) return;
+                                     ctx_.attempt([&] {
+                                       auto out = ctx_.api->post("/api/nodes",
+                                                                 {{"path", path}, {"name", name}});
+                                       ctx_.notify("added node " + out.value("name", name) +
+                                                   "; scanning it");
+                                     });
+                                     refresh();
+                                   });
+          });
+      return true;
+    }
     if (key(e, "o")) {
       if (!on_foreign()) {
         ctx_.error("select a foreign drive (listed after the nodes) to adopt it");
@@ -1228,6 +1255,19 @@ class NodesView : public View {
     }
     std::string name = current_name();
     if (name.empty()) return false;
+    if (key(e, "R")) {
+      ctx_.dialogs->ask_text("New name for node " + name, name,
+                             [this, name](const std::string& value) {
+                               if (value.empty() || value == name) return;
+                               if (ctx_.attempt([&] {
+                                     ctx_.api->post("/api/nodes/" + url_encode(name),
+                                                    {{"name", value}});
+                                   }))
+                                 ctx_.notify("renamed " + name + " to " + value);
+                               refresh();
+                             });
+      return true;
+    }
     if (key(e, "s")) {
       if (ctx_.attempt([&] { ctx_.api->post("/api/scan", {{"nodes", {name}}}); }))
         ctx_.notify("scan of " + name + " queued");

@@ -50,7 +50,7 @@ Run the tests with `uv run pytest`.
 | `reifs init --name N --root DIR` | Create the server home and this server's node |
 | `reifs passwd` | Set the admin password (used by the client) |
 | `reifs node add PATH --name N` | Register a storage node (drive/folder) owned by this server |
-| `reifs node list` / `node set` | List nodes; set priority, replication target, name |
+| `reifs node list` / `node set` | List nodes; set priority, replication target, name (also from the client: `n` add, `R` rename) |
 | `reifs discover` | Find which owned nodes are attached right now |
 | `reifs scan [NODE...] [--verify]` | Scan online nodes for changes |
 | `reifs ls [VDIR]` | List a virtual directory |

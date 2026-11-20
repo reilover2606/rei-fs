@@ -48,6 +48,8 @@ send 2; send Enter; send Left
 send 9; send k; send Escape
 send '?'; send Escape
 send 1; send g; send Escape
+send 7; send n; send Escape       # the add-drive dialog
+send 1
 sleep 3
 
 # Idle: the client must not spin.

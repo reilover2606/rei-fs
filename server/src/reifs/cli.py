@@ -121,23 +121,24 @@ def cmd_node_list(args) -> None:
 def cmd_node_set(args) -> None:
     _, conn = open_server(args.home)
     node = nodes.get_node(conn, args.node)
+    if args.priority is None and args.target is None and not args.rename:
+        raise CliError("nothing to change")
+    if node["owner_id"] != nodes.self_id(conn):
+        raise CliError(f"node {node['name']!r} belongs to another server; change it there "
+                       "(or from the client)")
+    if args.rename:
+        nodes.rename_node(conn, node["id"], args.rename)
     updates = {}
     if args.priority is not None:
         updates["priority"] = args.priority
     if args.target is not None:
         updates["replication_target"] = int(args.target == "yes")
-    if args.rename:
-        updates["name"] = args.rename
-    if not updates:
-        raise CliError("nothing to change")
-    sets = ", ".join(f"{k} = ?" for k in updates)
-    if node["owner_id"] != nodes.self_id(conn):
-        raise CliError(f"node {node['name']!r} belongs to another server; change it there "
-                       "(or from the client)")
-    with db.transaction(conn):
-        conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
-        index.log_node(conn, node["id"])
-    print(f"Updated node {node['name']!r}.")
+    if updates:
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        with db.transaction(conn):
+            conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
+            index.log_node(conn, node["id"])
+    print(f"Updated node {args.rename or node['name']!r}.")
 
 
 def cmd_discover(args) -> None:

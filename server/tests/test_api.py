@@ -227,3 +227,47 @@ def test_worker_scans_at_start_even_soon_after_boot(env, monkeypatch):
         assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
     finally:
         worker.close()
+
+
+def test_add_and_rename_a_node(server):
+    env, client, _ = server
+    login(client)
+    drive = env.tmp / "usb-stick"
+    drive.mkdir()
+    write(drive / "photo.jpg", "pixels", mtime=1_000_000)
+    out = client.post("/api/nodes", {"path": str(drive), "name": "usb"})
+    assert out["name"] == "usb"
+    from reifs import nodes as nodes_mod
+    marker = nodes_mod.read_marker(drive)
+    assert marker.name == "usb" and marker.node_id == out["id"]
+    names = {n["name"]: n for n in client.get("/api/nodes")["nodes"]}
+    assert names["usb"]["kind"] == "storage" and names["usb"]["online"]
+    wait_idle(client)                       # the new node is scanned right away
+    assert client.get("/api/file?path=/photo.jpg")["copies"][0]["node"] == "usb"
+
+    # The name defaults to the folder's name.
+    other = env.tmp / "Backup Disk"
+    other.mkdir()
+    assert client.post("/api/nodes", {"path": str(other)})["name"] == "Backup Disk"
+
+    # Mistakes are explained, not crashes.
+    err = lambda body: client.post("/api/nodes", body, expect=400)["error"]  # noqa: E731
+    assert "absolute" in err({"path": "relative/dir", "name": "x"})
+    assert "not a folder" in err({"path": str(env.tmp / "missing"), "name": "x"})
+    assert "overlaps node 'usb'" in err({"path": str(drive), "name": "other"})  # same drive
+    d2 = env.tmp / "d2"
+    d2.mkdir()
+    assert "already exists" in err({"path": str(d2), "name": "usb"})
+    assert "needs a name" in err({"path": str(d2), "name": "   "})
+    assert "without slashes" in err({"path": str(d2), "name": "a/b"})
+    (drive / "sub").mkdir()
+    assert "overlaps node 'usb'" in err({"path": str(drive / "sub"), "name": "nested"})
+    assert not (d2 / ".rei-fs").exists()      # failed attempts leave no marker behind
+
+    # Rename: database and the drive's own ID file.
+    client.post("/api/nodes/usb", {"name": "stick"})
+    assert nodes_mod.read_marker(drive).name == "stick"
+    assert "stick" in {n["name"] for n in client.get("/api/nodes")["nodes"]}
+    assert "already exists" in client.post("/api/nodes/stick", {"name": "ssd"}, expect=400)["error"]
+    assert "named after the server" in client.post("/api/nodes/srv", {"name": "x"},
+                                                   expect=400)["error"]
