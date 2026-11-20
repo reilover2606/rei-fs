@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import db, peers, runner, scanner, sync
+from . import db, peers, replication, runner, scanner, sync
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
@@ -31,6 +31,8 @@ log = logging.getLogger("reifs.service")
 DISCOVERY_SECONDS = 30
 JOBS_SECONDS = 60
 SYNC_SECONDS = 30
+PLAN_SECONDS = 600     # replication planning, at least this often
+PLAN_CHECK_SECONDS = 60  # ...and when the log changed (local or peer facts)
 RETRY_SECONDS = 5      # while a paired server is unreachable
 TICK_SECONDS = 2       # how often the pairing state is checked for changes
 
@@ -80,6 +82,9 @@ class Worker:
     def request_jobs(self) -> None:
         self._enqueue(("jobs",))
 
+    def request_plan(self) -> None:
+        self._enqueue(("plan",))
+
     def request_stop(self) -> None:
         """Interrupt the current operation and drop queued ones."""
         with self._lock:
@@ -114,6 +119,9 @@ class Worker:
         last_scan = 0.0 if self.cfg.scan.interval_minutes > 0 else float("inf")
         last_discovery = 0.0
         last_jobs = 0.0
+        last_plan = 0.0
+        last_plan_check = 0.0
+        planned_at_seq = None
         online: set[str] | None = None
         try:
             while not self.shutdown.is_set():
@@ -130,6 +138,12 @@ class Worker:
                     if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
                                     " LIMIT 1").fetchone():
                         self.request_jobs()
+                if now - last_plan_check >= PLAN_CHECK_SECONDS:
+                    last_plan_check = now
+                    seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+                    if seq != planned_at_seq or now - last_plan >= PLAN_SECONDS:
+                        planned_at_seq, last_plan = seq, now
+                        self.request_plan()
                 try:
                     task = self.tasks.get(timeout=1)
                 except queue.Empty:
@@ -161,8 +175,26 @@ class Worker:
 
     def _run(self, conn, task: tuple) -> None:
         kind = task[0]
-        self._set(state="scanning" if kind == "scan" else "running jobs", detail="",
-                  since=db.now())
+        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups"}[kind]
+        self._set(state=state, detail="", since=db.now())
+        if kind == "plan":
+            try:
+                report, approved = replication.cycle(conn, self.cfg)
+                msg = (f"backup plan: {report.proposed} proposed, "
+                       f"{report.no_destination} without destination")
+                if approved is not None:
+                    msg += f", {report.auto_approved} approved automatically"
+                    if approved.errors:
+                        msg += f" ({len(approved.errors)} error(s))"
+                self._set(last_result=msg)
+                if approved is not None and (approved.local_job is not None):
+                    self.request_jobs()
+            except Exception as e:  # noqa: BLE001
+                log.exception("planning failed")
+                self._set(last_error=f"planning failed: {e}")
+            finally:
+                self._set(state="idle", detail="", since=db.now())
+            return
         stop = self.stop_requested.is_set
         try:
             with ServerLock(self.cfg.home):
@@ -178,6 +210,7 @@ class Worker:
                               last_error="")
                     if any(r.stats.added or r.stats.changed for r in results):
                         self.request_jobs()
+                    self.request_plan()
                     if self.syncer is not None:
                         self.syncer.request_poke()
                 else:

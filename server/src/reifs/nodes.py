@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import string
 import sys
@@ -178,6 +179,8 @@ def register_node(
             " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
             (node_id, name, kind, owner, str(root), int(case_sensitive), int(restricted), ts, ts),
         )
+        _update_space(conn, conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone(),
+                      root)
         index.log_node(conn, node_id)
         write_marker(root, marker)
     return node_id
@@ -259,6 +262,7 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
             conn.execute(
                 "UPDATE nodes SET online = 1, last_seen = ? WHERE id = ?", (ts, node_id)
             )
+            announce = _update_space(conn, row, root) or announce
             if announce:
                 index.log_node(conn, node_id)
             result.online.append(Located(node_id, row["name"], root))
@@ -272,6 +276,25 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
             )
     result.foreign = [(m.name, m.owner_id, path) for m, path in foreign]
     return result
+
+
+SPACE_ANNOUNCE_BYTES = 256 * 1024 * 1024
+
+
+def _update_space(conn: sqlite3.Connection, row: sqlite3.Row, root: Path) -> bool:
+    """Record free space; True if it changed enough to announce to peers
+    (more than 1% of the disk or 256 MiB), so the log does not fill up."""
+    try:
+        usage = shutil.disk_usage(root)
+    except OSError:
+        return False
+    old = row["free_bytes"]
+    threshold = max(SPACE_ANNOUNCE_BYTES, usage.total // 100)
+    if old is not None and abs(old - usage.free) < threshold and row["total_bytes"] == usage.total:
+        return False
+    conn.execute("UPDATE nodes SET free_bytes = ?, total_bytes = ? WHERE id = ?",
+                 (usage.free, usage.total, row["id"]))
+    return True
 
 
 def adopt_node(conn: sqlite3.Connection, name_or_path: str) -> str:

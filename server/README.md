@@ -47,6 +47,7 @@ Run the tests with `uv run pytest`.
 | `reifs wanted [list\|approve\|reject] [ID...\|--all]` | Proposed jobs from decisions |
 | `reifs marked [--node N]` / `reifs unmark VPATH... \| --all` | Copies marked for deletion |
 | `reifs status` | Summary: copies, divergent, missing, non-portable... |
+| `reifs replication [plan\|auto on\|auto off]` | Two-copy report; propose second copies; automatic approval |
 | `reifs serve [--listen HOST:PORT]` | Run the API for the client, the background worker and sync |
 | `reifs peer pair HOST[:PORT]` | Ask another server to pair (shows its fingerprint first) |
 | `reifs peer [list\|accept ID\|reject ID\|remove NAME\|sync]` | Pairing requests and paired servers |

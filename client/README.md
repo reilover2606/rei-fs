@@ -58,7 +58,7 @@ results, or use `F1`-`F8`.
 
 | Tab | What it shows | Keys |
 |---|---|---|
-| Overview | Copies, under-replicated files, activity | `s` scan all, `j` run jobs, `x` stop |
+| Overview | Copies, activity, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `a` automatic approval on/off, `x` stop |
 | Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move |
 | Search | Find by name/path glob, tag, problems | `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
