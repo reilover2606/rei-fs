@@ -5,6 +5,7 @@
 // any later mismatch is refused.
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -90,6 +91,7 @@ class Api {
   std::shared_ptr<Session> session_;
   std::unique_ptr<httplib::SSLClient> client_;
   int read_timeout_ = 60;
+  std::atomic<bool> aborted_{false};
   std::mutex abort_mutex_;           // guards live_ against abort() racing a reset
   httplib::SSLClient* live_ = nullptr;
   mutable std::mutex mutex_;   // this connection: one request at a time

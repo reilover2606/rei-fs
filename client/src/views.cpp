@@ -516,6 +516,13 @@ class OverviewView : public View {
       if (dbs.value("busy_errors", 0) > 0)
         work.push_back(line("failed: database busy", std::to_string(dbs.value("busy_errors", 0)),
                             Color::Red, true));
+      json conns = s.value("connections", json::object());
+      if (conns.value("handshake_failed", 0) > 0 || conns.value("dropped", 0) > 0)
+        work.push_back(line("connections that failed",
+                            std::to_string(conns.value("handshake_failed", 0)) +
+                                " TLS handshakes, " + std::to_string(conns.value("dropped", 0)) +
+                                " dropped (details in the server's log)",
+                            Color::Yellow, true));
       work.push_back(text("Reading never waits for the write lock; only changes do.") | dim);
     }
     std::string goal = std::to_string(replication_.value("copies", 2)) + " copies of every file";
