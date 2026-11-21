@@ -361,3 +361,34 @@ def test_find_by_part_of_a_name(env):
     assert names("rep*") == ["/Report-2025.pdf"]
     assert names("report", tag="none") == []
     assert [f.vpath for f in queries.find(env.conn)] != []   # no pattern: everything
+
+
+def test_search_finds_folders_too(env):
+    for name in ("holiday/beach/a.jpg", "holiday/beach/b.jpg", "holiday/notes.txt",
+                 "work/Holiday-plan.docx", "work/projects/x.txt", "misc.txt"):
+        write(env.root / name, name)
+    env.scan()
+    ids, dirs = queries.search(env.conn, "holiday")
+    # The file "Holiday-plan.docx" matches by its name; the folder by its own.
+    assert [queries.file_info(env.conn, i).vpath for i in ids] == ["/work/Holiday-plan.docx"]
+    assert dirs == [("/holiday", 3)]                       # files below it, counted recursively
+    # Nested folders are listed too, each with its own count.
+    assert queries.search(env.conn, "beach")[1] == [("/holiday/beach", 2)]
+    assert queries.search(env.conn, "o")[1] == [         # "beach" has no "o": not listed
+        ("/holiday", 3), ("/work", 2), ("/work/projects", 1)]
+    assert queries.search(env.conn, "e")[1] == [("/holiday/beach", 2), ("/work/projects", 1)]
+    # A path pattern is matched against the folder's whole path.
+    assert queries.search(env.conn, "holiday/b")[1] == [("/holiday/beach", 2)]
+    # Globs match the whole folder name.
+    assert queries.search(env.conn, "pro*")[1] == [("/work/projects", 1)]
+    assert queries.search(env.conn, "proj")[1] == [("/work/projects", 1)]
+    assert queries.search(env.conn, "hol*")[1] == [("/holiday", 3)]
+    # No pattern: no folders (they would all match). Nothing matching: nothing.
+    assert queries.search(env.conn)[1] == []
+    assert queries.search(env.conn, "zzz") == ([], [])
+    # The other filters decide which files are counted below a folder.
+    tags.set_tag(env.conn, tags.resolve_targets(env.conn, "/holiday/beach/a.jpg", False),
+                 "keep", True, env.server_id)
+    assert queries.search(env.conn, "holiday", tag="keep")[1] == [("/holiday", 1)]
+    assert queries.search(env.conn, "beach", tag="keep")[1] == [("/holiday/beach", 1)]
+    assert queries.search(env.conn, "work", tag="keep")[1] == []   # nothing tagged below it

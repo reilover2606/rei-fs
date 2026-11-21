@@ -84,6 +84,8 @@ struct Context {
                              // cannot call get/post on the interface thread)
   Dialogs* dialogs = nullptr;
   std::function<void(const std::string&, bool)> notify_fn;
+  // Switch to the Tree tab showing a directory (and selecting an entry in it).
+  std::function<void(const std::string&, const std::string&)> show_in_tree;
 
   void start_workers(Api& main, std::function<void(std::function<void()>)> post);
   void stop_workers();
@@ -129,6 +131,11 @@ class View {
   virtual ftxui::Component component() = 0;
   virtual void refresh() = 0;
   virtual std::string help() const = 0;
+  // Show `dir` (and select `select` in it, if given). Only the Tree uses it.
+  virtual void navigate(const std::string& dir, const std::string& select = "") {
+    (void)dir;
+    (void)select;
+  }
   // True while a text field has focus (global letter/digit keys are off).
   virtual bool typing() const { return false; }
   // Called after every status poll while the view is visible.

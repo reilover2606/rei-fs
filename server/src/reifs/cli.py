@@ -238,9 +238,13 @@ def cmd_where(args) -> None:
 
 def cmd_find(args) -> None:
     cfg, conn = open_server(args.home)
-    results = queries.find(conn, args.pattern, tag=args.tag, node=args.node,
-                           issues_only=args.issues, under_replicated=args.under,
-                           policy=replication.policy(cfg))
+    pol = replication.policy(cfg)
+    ids, dirs = queries.search(conn, args.pattern, tag=args.tag, node=args.node,
+                               issues_only=args.issues, under_replicated=args.under, policy=pol)
+    results = [queries.file_info(conn, fid, pol) for fid in ids]
+    if dirs:
+        print(table([[d + "/", f"{n} file(s)"] for d, n in dirs], ["FOLDER", "CONTAINS"]))
+        print()
     rows = [[f.vpath, human_size(f.size), copies_badge(f),
              ",".join(c.node_name for c in f.copies if c.state == "present"),
              " ".join(f.tags)] for f in results]

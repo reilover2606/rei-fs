@@ -121,6 +121,11 @@ def test_browse(server):
     client.get("/api/tree?path=/nope", expect=404)
     f = client.get("/api/file?path=" + urllib.request.quote("/docs/a.txt"))
     assert f["good_copies"] == 1 and f["copies"][0]["node"] == "srv"
+    # Folders are searched too, with the number of files below them.
+    out = client.get("/api/find?q=doc")
+    assert out["dirs"] == [{"path": "/docs", "name": "docs", "files": 2}]
+    assert out["dirs_total"] == 1 and out["files"] == []
+    assert client.get("/api/find?q=top")["dirs"] == []
     found = client.get("/api/find?q=*.txt&issues=1")
     expected = [] if sys.platform == "win32" else ["/docs/b?.txt"]
     assert [x["path"] for x in found["files"]] == expected

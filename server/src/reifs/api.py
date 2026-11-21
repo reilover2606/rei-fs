@@ -407,12 +407,15 @@ class Api:
     def find(self, conn, q, body, **_):
         limit = min(int(q.get("limit", FIND_LIMIT)), FIND_LIMIT)
         pol = replication.policy(self.cfg)
-        ids = queries.find_ids(conn, q.get("q") or None, tag=q.get("tag") or None,
-                               node=q.get("node") or None, issues_only=q.get("issues") == "1",
-                               under_replicated=q.get("under") == "1", policy=pol)
+        ids, dirs = queries.search(conn, q.get("q") or None, tag=q.get("tag") or None,
+                                   node=q.get("node") or None, issues_only=q.get("issues") == "1",
+                                   under_replicated=q.get("under") == "1", policy=pol)
         return {"total": len(ids), "truncated": len(ids) > limit,
                 "files": [file_json(queries.file_info(conn, fid, pol), full=False)
-                          for fid in ids[:limit]]}
+                          for fid in ids[:limit]],
+                "dirs_total": len(dirs),
+                "dirs": [{"path": d, "name": paths.basename(d), "files": n}
+                         for d, n in dirs[:FIND_LIMIT]]}
 
     # --- tags -----------------------------------------------------------------------------
 

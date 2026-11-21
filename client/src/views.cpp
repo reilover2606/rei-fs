@@ -499,7 +499,19 @@ class TreeView : public View {
     return "Enter/→: open  ←/Backspace: up  t/T: tag/untag  c: copy  m: move  r: refresh";
   }
 
-  void refresh() override { refresh_selecting(current_name()); }
+  void refresh() override {
+    refresh_selecting(want_.empty() ? current_name() : want_);
+    want_.clear();
+  }
+  void navigate(const std::string& dir, const std::string& select) override {
+    path_ = dir.empty() ? "/" : dir;
+    want_ = select;
+    selected_ = 0;
+    entries_ = json::array();
+    labels_.clear();
+    detail_ = text("");
+    loading_ = true;
+  }
 
  private:
   // Load the listing of path_ and, when it arrives, select `name` in it.
@@ -627,6 +639,7 @@ class TreeView : public View {
 
   Context& ctx_;
   std::string path_ = "/";
+  std::string want_;   // entry to select when the next listing arrives
   bool loading_ = false;
   json entries_ = json::array();
   std::vector<std::string> labels_;
@@ -650,13 +663,14 @@ class SearchView : public View {
     auto button = Button("Search", [this] { search(); }, ButtonOption::Ascii());
     MenuOption mopt = MenuOption::Vertical();
     mopt.on_change = [this] { load_detail(); };
+    mopt.on_enter = [this] { show_in_tree(); };
     menu_ = Menu(&labels_, &selected_, mopt);
     auto form = Container::Horizontal({query_input_, tag_input_, issues, under, button});
     // Focusable line holding the keyboard focus while not typing, so that the
     // number keys keep switching tabs ("/" starts typing a search).
     hint_ = Renderer([this](bool focused) {
-      auto line = text(" / to type a search (a name or part of one; a tag in the second field)   "
-                       "tags: " + tags_line_);
+      auto line = text(" / to type a search (names of files and folders; a tag in the second "
+                       "field)   tags: " + tags_line_);
       return focused ? line | bold : line | dim;
     });
     auto layout = Container::Vertical({hint_, form, menu_});
@@ -667,10 +681,14 @@ class SearchView : public View {
           vbox({issues->Render(), under->Render()}),
           button->Render() | vcenter,
       });
-      std::string heading = searching_ ? "searching..."
-                            : results_.empty() ? "results"
-                                               : std::to_string(total_) + " result(s)" +
-                                                     (truncated_ ? " (first 1000 shown)" : "");
+      std::string heading = "results";
+      if (searching_) {
+        heading = "searching...";
+      } else if (!labels_.empty()) {
+        heading = (dirs_total_ > 0 ? std::to_string(dirs_total_) + " folder(s), " : "") +
+                  std::to_string(total_) + " file(s)" +
+                  (truncated_ ? " (first 1000 shown)" : "");
+      }
       return vbox({form_el, hint_->Render(),
                    with_detail(list_panel(heading, menu_, labels_.size(),
                                           "type a pattern and/or a tag, then Enter"),
@@ -683,8 +701,8 @@ class SearchView : public View {
   Component component() override { return root_; }
   bool typing() const override { return query_input_->Focused() || tag_input_->Focused(); }
   std::string help() const override {
-    return "/: type a search  Enter: search  Esc: leave the fields  t/T: tag  c/m: copy/move  "
-           "C/M: all results";
+    return "/: type a search  Enter: search, or show a result in the Tree  Esc: leave the fields  "
+           "t/T: tag  c/m: copy/move  C/M: all";
   }
 
   void refresh() override {
@@ -699,11 +717,25 @@ class SearchView : public View {
   }
 
  private:
+  // Folders come first, then files: row i is a folder if i < dirs_.size().
+  int ndirs() const { return static_cast<int>(dirs_.size()); }
+  bool on_dir() const { return selected_ >= 0 && selected_ < ndirs(); }
+  const json* current_file() const {
+    int i = selected_ - ndirs();
+    return i >= 0 && i < static_cast<int>(results_.size()) ? &results_[i] : nullptr;
+  }
+  // Path of the selected row (folder or file); "" if there is none.
+  std::string current_path() const {
+    if (on_dir()) return dirs_[selected_].value("path", "");
+    const json* f = current_file();
+    return f ? f->value("path", "") : "";
+  }
+
   // Only while this tab is the one on screen: taking the focus of a hidden
   // tab would switch to it.
   void leave_inputs() {
     if (!root_->Focused()) return;
-    if (!results_.empty())
+    if (!labels_.empty())
       menu_->TakeFocus();
     else
       hint_->TakeFocus();
@@ -719,13 +751,18 @@ class SearchView : public View {
     ctx_.get(q, [this, from_user](json out) {
       searching_ = false;
       results_ = out["files"];
+      dirs_ = out.value("dirs", json::array());
       total_ = out.value("total", 0);
-      truncated_ = out.value("truncated", false);
+      dirs_total_ = out.value("dirs_total", 0);
+      truncated_ = out.value("truncated", false) || dirs_total_ > ndirs();
       labels_.clear();
+      for (const auto& d : dirs_)
+        labels_.push_back(fit("▸ " + d.value("path", "") + "/", 50) + " " +
+                          std::to_string(d.value("files", 0)) + " file(s)");
       for (const auto& f : results_) {
         json shown = f;
         shown["name"] = f.value("path", "");
-        labels_.push_back(file_label(shown, 50));
+        labels_.push_back("  " + file_label(shown, 48));
       }
       selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
       load_detail();
@@ -734,24 +771,48 @@ class SearchView : public View {
   }
 
   void load_detail() {
-    if (selected_ < 0 || selected_ >= static_cast<int>(results_.size())) {
+    if (on_dir()) {
+      const json& d = dirs_[selected_];
+      detail_ = vbox({hard_wrap(d.value("path", "") + "/", kDetailWidth - 1) | bold, separator(),
+                      text("folder with " + std::to_string(d.value("files", 0)) +
+                           " matching file(s)"),
+                      text(""),
+                      text("Enter: show it in the Tree") | dim,
+                      text("t: tag every file below  c/m: copy/move it all") | dim});
+      return;
+    }
+    const json* cur = current_file();
+    if (!cur) {
       detail_ = text("");
       return;
     }
-    std::string path = results_[selected_].value("path", "");
+    std::string path = cur->value("path", "");
     ctx_.run(
         false, [path](Api& a) { return a.get("/api/file?path=" + url_encode(path)); },
         [this, path](json f) {
-          if (selected_ < 0 || selected_ >= static_cast<int>(results_.size()) ||
-              results_[selected_].value("path", "") != path)
-            return;   // selection moved on
+          const json* now = current_file();
+          if (!now || now->value("path", "") != path) return;   // selection moved on
           detail_ = file_details(f);
         },
         "search-detail");
   }
 
+  // Open the selected result in the Tree: a folder itself, a file in its folder.
+  void show_in_tree() {
+    std::string path = current_path();
+    if (path.empty()) return;
+    if (on_dir()) {
+      ctx_.show_in_tree(path, "");
+      return;
+    }
+    auto slash = path.rfind('/');
+    ctx_.show_in_tree(slash == 0 || slash == std::string::npos ? "/" : path.substr(0, slash),
+                      path.substr(slash + 1));
+  }
+
   std::vector<std::string> all_paths() const {
     std::vector<std::string> out;
+    for (const auto& d : dirs_) out.push_back(d.value("path", ""));
     for (const auto& f : results_) out.push_back(f.value("path", ""));
     return out;
   }
@@ -765,10 +826,11 @@ class SearchView : public View {
       query_input_->TakeFocus();
       return true;
     }
-    if (!menu_->Focused() || results_.empty()) return false;
-    std::string path = results_[selected_].value("path", "");
+    if (!menu_->Focused() || labels_.empty()) return false;
+    std::string path = current_path();
+    if (path.empty()) return false;
     if (key(e, "t") || key(e, "T")) {
-      tag_paths(ctx_, {path}, false, key(e, "t"), [this] { search(false); });
+      tag_paths(ctx_, {path}, on_dir(), key(e, "t"), [this] { search(false); });
       return true;
     }
     if (key(e, "c") || key(e, "m")) {
@@ -798,8 +860,9 @@ class SearchView : public View {
   bool searching_ = false;
   std::string query_, tag_, tags_line_;
   bool issues_ = false, under_ = false, searched_ = false, truncated_ = false;
-  int total_ = 0;
+  int total_ = 0, dirs_total_ = 0;
   json results_ = json::array();
+  json dirs_ = json::array();
   std::vector<std::string> labels_;
   int selected_ = 0;
   Element detail_ = text("");

@@ -313,6 +313,11 @@ class App {
     host_ = host.empty() ? profiles_.last_host : host;
     port_str_ = std::to_string(port > 0 ? port : profiles_.last_port);
     ctx_.dialogs = &dialogs_;
+    ctx_.show_in_tree = [this](const std::string& dir, const std::string& select) {
+      if (views_.size() < 2) return;
+      views_[1]->navigate(dir, select);   // the Tree is the second tab
+      switch_to(1);                       // ...which refreshes it
+    };
     ctx_.notify_fn = [this](const std::string& msg, bool err) {
       notice_ = {msg, err, std::chrono::steady_clock::now()};
     };
