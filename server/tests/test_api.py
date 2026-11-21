@@ -402,3 +402,15 @@ def test_tree_says_what_this_servers_node_holds(server):
     assert {e["name"]: e["here"] for e in out["entries"] if e["dir"]} == {"docs": 2, "only-ssd": 0}
     top = client.get("/api/tree?path=/docs")
     assert all(e["here"] for e in top["entries"] if not e["dir"])
+
+
+def test_a_null_body_means_no_body(server):
+    env, client, srv = server
+    login(client)
+    import urllib.request
+    req = urllib.request.Request(client.base + "/api/jobs/run", data=b"null", method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {client.token}")
+    with urllib.request.urlopen(req, context=client.ctx, timeout=10) as r:
+        assert r.status == 200
+    client.post("/api/jobs/run", [1], expect=400)           # a list is still refused
