@@ -47,8 +47,34 @@ def _other_present(conn, fid: int, node_id: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+# What the user sees: not the members of a group, and not an empty group.
+VISIBLE = ("d.parent_id IS NULL AND (d.kind != 'group' OR EXISTS ("
+           "SELECT 1 FROM decisions m WHERE m.parent_id = d.id AND m.status = 'open'))")
+
+GROUP_CHUNK = 200   # members resolved per transaction: the database is never held for long
+
+
+def member_kind(row: sqlite3.Row) -> str:
+    return json.loads(row["data"]).get("member_kind", "")
+
+
 def options_for(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, str]:
     kind = row["kind"]
+    if kind == "group":
+        mk = member_kind(row)
+        if mk == "missing":
+            return {
+                "restore": "Lost: copy the current versions back (where another copy exists)",
+                "forget": "Removed from this node only: stop tracking these copies",
+                "delete": "Deleted from the system: forget them and mark all other copies "
+                          "for deletion",
+            }
+        if mk == "rename":
+            return {
+                "apply": "Rename the copies on the other nodes too",
+                "ignore": "Leave the other copies at the old paths",
+            }
+        return {}
     if kind == "missing":
         if _other_present(conn, row["file_id"], row["node_id"]):
             return {
@@ -83,8 +109,37 @@ def _to_decision(conn, row) -> Decision:
     )
 
 
+def close_empty_groups(conn: sqlite3.Connection) -> None:
+    """A group whose decisions were all settled meanwhile (the files came back, ...) is done."""
+    conn.execute(
+        "UPDATE decisions SET status = 'obsolete', resolved = ? WHERE kind = 'group'"
+        " AND status = 'open' AND NOT EXISTS (SELECT 1 FROM decisions m"
+        " WHERE m.parent_id = decisions.id AND m.status = 'open')", (db.now(),))
+
+
 def count_decisions(conn: sqlite3.Connection, status: str = "open") -> int:
-    return conn.execute("SELECT COUNT(*) FROM decisions WHERE status = ?", (status,)).fetchone()[0]
+    """Decisions the user sees: a group counts once, its members not at all."""
+    return conn.execute(f"SELECT COUNT(*) FROM decisions d WHERE d.status = ? AND {VISIBLE}",
+                        (status,)).fetchone()[0]
+
+
+def group_info(conn: sqlite3.Connection, group_id: int) -> tuple[int, int]:
+    """(open members, their total size) of a group."""
+    return conn.execute(
+        "SELECT COUNT(*), IFNULL(SUM((SELECT MAX(c.size) FROM copies c WHERE c.file_id = d.file_id"
+        " AND c.node_id = d.node_id)), 0) FROM decisions d WHERE d.parent_id = ?"
+        " AND d.status = 'open'", (group_id,)).fetchone()
+
+
+def group_members(conn: sqlite3.Connection, group_id: int, limit: int = 50) -> list[str]:
+    """Paths of some of the open members, for showing what a group is made of."""
+    out = []
+    for r in conn.execute(
+            "SELECT f.vpath, d.data FROM decisions d LEFT JOIN files f ON f.id = d.file_id"
+            " WHERE d.parent_id = ? AND d.status = 'open' ORDER BY d.id LIMIT ?",
+            (group_id, limit)):
+        out.append(r["vpath"] or json.loads(r["data"]).get("vpath") or "?")
+    return out
 
 
 def list_decisions(conn: sqlite3.Connection, status: str = "open",
@@ -93,7 +148,7 @@ def list_decisions(conn: sqlite3.Connection, status: str = "open",
     rows = conn.execute(
         "SELECT d.*, f.vpath, n.name AS node_name FROM decisions d"
         " LEFT JOIN files f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
-        " WHERE d.status = ? ORDER BY d.id" + (" LIMIT ?" if limit else ""),
+        f" WHERE d.status = ? AND {VISIBLE} ORDER BY d.id" + (" LIMIT ?" if limit else ""),
         (status, limit) if limit else (status,),
     ).fetchall()
     return [_to_decision(conn, r) for r in rows]
@@ -103,8 +158,64 @@ def get_decision(conn: sqlite3.Connection, decision_id: int) -> Decision:
     return _to_decision(conn, _row(conn, decision_id))
 
 
+def _resolve_group(conn: sqlite3.Connection, row: sqlite3.Row, option: str) -> str:
+    """Apply one choice to every decision of a group, a few hundred per transaction.
+
+    A member for which the choice is impossible (restoring the last copy) is
+    taken out of the group and stays open on its own. Interrupted halfway, the
+    group simply still holds the rest.
+    """
+    opts = options_for(conn, row)
+    if option not in opts:
+        raise DecisionError(f"invalid option {option!r} for #{row['id']}; "
+                            f"choose from: {', '.join(opts)}")
+    done = left = 0
+    summaries: dict[str, int] = {}
+    while True:
+        with db.transaction(conn, "resolving a group"):
+            members = conn.execute(
+                "SELECT d.*, f.vpath, n.name AS node_name FROM decisions d"
+                " LEFT JOIN files f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
+                " WHERE d.parent_id = ? AND d.status = 'open' ORDER BY d.id LIMIT ?",
+                (row["id"], GROUP_CHUNK)).fetchall()
+            if not members:
+                break
+            for m in members:
+                chosen = _member_choice(conn, m, option)
+                if chosen is None:
+                    conn.execute("UPDATE decisions SET parent_id = NULL WHERE id = ?", (m["id"],))
+                    left += 1
+                    continue
+                text = _APPLY[m["kind"]](conn, m, json.loads(m["data"]), chosen)
+                conn.execute("UPDATE decisions SET status = 'resolved', resolution = ?,"
+                             " resolved = ? WHERE id = ?", (chosen, db.now(), m["id"]))
+                summaries[text] = summaries.get(text, 0) + 1
+                done += 1
+    with db.transaction(conn):
+        conn.execute("UPDATE decisions SET status = 'resolved', resolution = ?, resolved = ?"
+                     " WHERE id = ?", (option, db.now(), row["id"]))
+    extra = f"; {left} could not be done this way and stay open on their own" if left else ""
+    first = next(iter(summaries), "")
+    return f"{done} decision(s) resolved ({first}{', ...' if len(summaries) > 1 else ''}){extra}"
+
+
+def _member_choice(conn, member: sqlite3.Row, option: str) -> str | None:
+    """The option to apply to one member of a group for the group's choice."""
+    opts = options_for(conn, member)
+    if option in opts:
+        return option
+    if "acknowledge" in opts and option in ("forget", "delete"):
+        return "forget"   # the last copy: nothing else to restore or delete
+    return None
+
+
 def resolve(conn: sqlite3.Connection, decision_id: int, option: str) -> str:
     """Apply an option. Returns a short human-readable summary."""
+    head = _row(conn, decision_id)
+    if head["kind"] == "group":
+        if head["status"] != "open":
+            raise DecisionError(f"decision #{decision_id} is {head['status']}")
+        return _resolve_group(conn, head, option)
     with db.transaction(conn):
         row = _row(conn, decision_id)
         if row["status"] != "open":
@@ -119,6 +230,7 @@ def resolve(conn: sqlite3.Connection, decision_id: int, option: str) -> str:
             "UPDATE decisions SET status = ?, resolution = ?, resolved = ? WHERE id = ?",
             ("dismissed" if option == "keep" else "resolved", option, db.now(), decision_id),
         )
+        close_empty_groups(conn)
     return summary
 
 

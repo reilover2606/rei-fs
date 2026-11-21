@@ -298,7 +298,8 @@ def scan_node(
     stats.skipped_dirs = len(walker.skipped)
     vanished, to_forget = _find_vanished(root, existing, seen, walker, ignorer)
     with db.transaction(conn, "scan: reconciling changes"):
-        prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched)
+        prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched,
+                                    root, cfg.scan.group_decisions_min)
         for fid in touched:
             if conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone():
                 index.evaluate_divergence(conn, fid)
@@ -418,7 +419,8 @@ def _find_vanished(root, existing, seen, walker, ignorer) -> tuple[list[str], li
     return vanished, to_forget
 
 
-def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched) -> set[str]:
+def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched,
+                        root: Path | None = None, group_min: int = 0) -> set[str]:
     """Update the index for vanished copies (inside a transaction, database
     work only). Returns the virtual directories to prune afterwards."""
     node_id = node["id"]
@@ -437,6 +439,8 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
         pool.setdefault((r["hash"], r["size"]), []).append((r["vpath"], r["file_id"]))
 
     prune: set[str] = set()
+    new_missing: list[tuple[int, str]] = []
+    new_renames: list[int] = []
     for vpath in vanished:
         row = existing[vpath]
         fid = row["file_id"]
@@ -452,7 +456,9 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
             base = paths.basename(vpath)
             pick = next((c for c in candidates if paths.basename(c[0]) == base), candidates[0])
             candidates.remove(pick)
-            _handle_rename(conn, node_id, fid, vpath, pick[1], pick[0])
+            rid = _handle_rename(conn, node_id, fid, vpath, pick[1], pick[0])
+            if rid is not None:
+                new_renames.append(rid)
             stats.renamed += 1
             continue
         conn.execute(
@@ -464,16 +470,19 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
             "SELECT COUNT(*) FROM copies WHERE file_id = ? AND node_id != ? AND state = 'present'",
             (fid, node_id),
         ).fetchone()[0]
-        index.add_decision(conn, "missing", fid, node_id,
-                           {"vpath": vpath, "other_copies": others})
+        did = index.add_decision(conn, "missing", fid, node_id,
+                                 {"vpath": vpath, "other_copies": others})
+        new_missing.append((did, vpath))
         stats.missing += 1
         touched.add(fid)
 
+    _group_missing(conn, node_id, root, new_missing, group_min)
+    _group_renames(conn, node_id, new_renames, group_min)
     return prune
 
 
 def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
-                   new_fid: int, new_vpath: str) -> None:
+                   new_fid: int, new_vpath: str) -> int | None:
     index.copy_tags(conn, old_fid, new_fid)  # tags follow the rename
     conn.execute(
         "UPDATE files SET created = MIN(created, (SELECT created FROM files WHERE id = ?))"
@@ -487,8 +496,58 @@ def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
     ]
     index.forget_copy(conn, old_fid, node_id)
     if others:
-        index.add_decision(conn, "rename", old_fid, node_id,
-                           {"from": old_vpath, "to": new_vpath, "nodes": others})
+        return index.add_decision(conn, "rename", old_fid, node_id,
+                                  {"from": old_vpath, "to": new_vpath, "nodes": others})
+    return None
+
+
+def _group_missing(conn, node_id: str, root: Path | None, new_missing, group_min: int) -> None:
+    """Files that vanished together are one decision: a folder that is gone (the
+    topmost vanished folder), or many files gone from one folder."""
+    if not new_missing or root is None or group_min <= 0:
+        return
+    exists: dict[str, bool] = {}
+
+    def is_dir(vdir: str) -> bool:
+        if vdir not in exists:
+            exists[vdir] = os.path.isdir(paths.to_physical(root, vdir))
+        return exists[vdir]
+
+    entries = []
+    for did, vpath in new_missing:
+        parts = paths.split(vpath)
+        key, info = None, {}
+        for i in range(1, len(parts)):
+            top = "/" + "/".join(parts[:i])
+            if not is_dir(top):
+                key, info = "gone:" + top, {"dir": top, "mode": "gone"}
+                break
+        if key is None:
+            parent = paths.parent(vpath)
+            key, info = "in:" + parent, {"dir": parent, "mode": "in"}
+        entries.append((did, key, info))
+    index.group_decisions(conn, "missing", node_id, entries, group_min)
+
+
+def moved_prefixes(old: str, new: str) -> tuple[str, str]:
+    """The folder pair a rename implies: what is left of both paths once the
+    trailing parts they share are removed (/a/b/x.txt -> /n/b/x.txt is /a -> /n)."""
+    a, b = paths.split(old), paths.split(new)
+    while len(a) > 1 and len(b) > 1 and a[-1] == b[-1]:
+        a.pop()
+        b.pop()
+    return "/" + "/".join(a), "/" + "/".join(b)
+
+
+def _group_renames(conn, node_id: str, new_renames: list[int], group_min: int) -> None:
+    if not new_renames or group_min <= 0:
+        return
+    entries = []
+    for did in new_renames:
+        d = json.loads(conn.execute("SELECT data FROM decisions WHERE id = ?", (did,)).fetchone()[0])
+        src, dst = moved_prefixes(d["from"], d["to"])
+        entries.append((did, f"moved:{src}>{dst}", {"from": src, "to": dst, "mode": "moved"}))
+    index.group_decisions(conn, "rename", node_id, entries, group_min)
 
 
 def scan_all(

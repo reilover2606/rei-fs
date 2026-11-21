@@ -101,6 +101,7 @@ class DirEntry:
     is_dir: bool
     files: int                 # files at or below this entry
     file: FileInfo | None = None
+    here: int = 0              # of them, files with a copy on this server's own node
 
 
 def list_dir(conn: sqlite3.Connection, vdir: str,
@@ -108,27 +109,33 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     """Immediate children of a virtual directory. None if it does not exist."""
     vdir = paths.normalize(vdir)
     lo, hi = paths.prefix_range(vdir) if vdir != "/" else ("/", "0")
-    dirs: dict[str, int] = {}
+    dirs: dict[str, tuple[int, int]] = {}
     files: list[DirEntry] = []
+    me = index.self_id(conn)
     # The counting is done by SQLite: a directory with a million files below it
     # must not be pulled through Python for every refresh of the client.
+    # "here" = has a copy on this server's own node.
     start = len(lo) + 1   # 1-based position of the part after the directory
-    for head, n in conn.execute(
-        "SELECT substr(vpath, ?1, instr(substr(vpath, ?1), '/') - 1) AS head, COUNT(*)"
-        " FROM files WHERE vpath >= ?2 AND vpath < ?3 AND instr(substr(vpath, ?1), '/') > 0"
-        " GROUP BY head", (start, lo, hi)):
-        dirs[head] = n
+    join = (" LEFT JOIN copies c ON c.file_id = f.id AND c.node_id = ?4 AND c.state = 'present'")
+    for head, n, here in conn.execute(
+        "SELECT substr(f.vpath, ?1, instr(substr(f.vpath, ?1), '/') - 1) AS head, COUNT(*),"
+        " COUNT(c.file_id) FROM files f" + join +
+        " WHERE f.vpath >= ?2 AND f.vpath < ?3 AND instr(substr(f.vpath, ?1), '/') > 0"
+        " GROUP BY head", (start, lo, hi, me)):
+        dirs[head] = (n, here)
     for r in conn.execute(
-        "SELECT id, vpath FROM files WHERE vpath >= ?2 AND vpath < ?3"
-        " AND instr(substr(vpath, ?1), '/') = 0", (start, lo, hi)):
-        files.append(DirEntry(r["vpath"][len(lo):], False, 1, file_info(conn, r["id"], policy)))
+        "SELECT f.id, f.vpath, c.file_id IS NOT NULL AS here FROM files f" + join +
+        " WHERE f.vpath >= ?2 AND f.vpath < ?3 AND instr(substr(f.vpath, ?1), '/') = 0",
+        (start, lo, hi, me)):
+        files.append(DirEntry(r["vpath"][len(lo):], False, 1, file_info(conn, r["id"], policy),
+                              r["here"]))
     # Directories made by the user show even when empty.
     for d in vdirs.under(conn, vdir, include_self=False):
         head = d[len(lo):].partition("/")[0]
-        dirs.setdefault(head, 0)
+        dirs.setdefault(head, (0, 0))
     if not dirs and not files and vdir != "/" and not vdirs.under(conn, vdir):
         return None
-    out = [DirEntry(name, True, n) for name, n in sorted(dirs.items())]
+    out = [DirEntry(name, True, n, here=h) for name, (n, h) in sorted(dirs.items())]
     return out + sorted(files, key=lambda e: e.name)
 
 
@@ -324,6 +331,12 @@ def _compute_coverage(conn: sqlite3.Connection, policy: GoalPolicy, db_file: str
     return cov
 
 
+def decisions_visible() -> str:
+    from .decisions import VISIBLE   # decisions imports queries' siblings: import late
+
+    return VISIBLE
+
+
 def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Status:
     cov = coverage(conn, policy, max_age=STATUS_MAX_AGE)
     one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
@@ -337,6 +350,7 @@ def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Sta
         missing_copies=one("SELECT COUNT(*) FROM copies WHERE state = 'missing'"),
         marked_delete=one("SELECT COUNT(*) FROM copies WHERE marked_delete = 1"),
         non_portable=one("SELECT COUNT(*) FROM files WHERE issues != ''"),
-        open_decisions=one("SELECT COUNT(*) FROM decisions WHERE status = 'open'"),
+        open_decisions=one("SELECT COUNT(*) FROM decisions d WHERE d.status = 'open' AND "
+                           + decisions_visible()),
         open_wanted=one("SELECT COUNT(*) FROM wanted WHERE status = 'open'"),
     )

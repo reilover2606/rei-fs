@@ -569,6 +569,17 @@ class TreeView : public View {
  public:
   explicit TreeView(Context& ctx) : ctx_(ctx) {
     MenuOption opt = MenuOption::Vertical();
+    // Like the default look, but entries with a copy on this server's own node are blue.
+    opt.entries_option.transform = [this](const EntryState& st) {
+      Element e = text((st.active ? "> " : "  ") + st.label);
+      bool here = st.index >= 0 && st.index < static_cast<int>(entries_.size()) &&
+                  has_here(entries_[st.index]);
+      if (here) e = e | color(Color::BlueLight);
+      if (st.focused) e = e | inverted;
+      if (st.active) e = e | bold;
+      if (!st.focused && !st.active && !here) e = e | dim;
+      return e;
+    };
     opt.on_change = [this] { load_detail(); };
     opt.on_enter = [this] { enter(); };
     menu_ = Menu(&labels_, &selected_, opt);
@@ -622,6 +633,7 @@ class TreeView : public View {
           loading_ = false;
           entries_ = out["entries"];
           dir_priority_ = out.value("priority", 2);
+          this_node_ = out.value("this_node", "");
           rebuild_labels();
           selected_ = reselect(entries_, name,
                                [](const json& e) { return e.value("name", ""); }, selected_);
@@ -636,6 +648,13 @@ class TreeView : public View {
             refresh_selecting("");
           }
         });
+  }
+
+  // Does this entry (a file) or something below it (a folder) have a copy on this server's node?
+  static bool has_here(const json& e) {
+    auto h = e.find("here");
+    if (h == e.end()) return false;
+    return h->is_boolean() ? h->get<bool>() : h->get<int>() > 0;
   }
 
   // "»" marks the items picked up for a move.
@@ -667,6 +686,16 @@ class TreeView : public View {
     return &entries_[selected_];
   }
 
+  // Does the folder exist on this server's node? (blue = yes, at least one file)
+  Element here_line(const json& dir) const {
+    int here = dir.value("here", 0), total = dir.value("files", 0);
+    std::string node = this_node_.empty() ? "this server's node" : "this server's node (" + this_node_ + ")";
+    if (here > 0)
+      return text("on " + node + ": " + std::to_string(here) + " of " + std::to_string(total) +
+                  " file(s)") | color(Color::BlueLight);
+    return text("not on " + node + (total > 0 ? ": no file below it has a copy there" : "")) | dim;
+  }
+
   void load_detail() {
     const json* e = current();
     if (!e) {
@@ -679,9 +708,11 @@ class TreeView : public View {
                       text(std::to_string(e->value("files", 0)) + " file(s) below"),
                       text(std::string("update priority: ") + priority_name(e->value("priority", 2)) +
                            (e->value("set_here", false) ? "" : " (inherited)")),
+                      here_line(*e),
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
                       text("x: pick up to move it in the tree  n: rename") | dim,
-                      text("u: update priority (how often it is scanned)") | dim});
+                      text("u: update priority (how often it is scanned)") | dim,
+                      text("blue: a copy is on this server's own node") | dim});
       return;
     }
     // Only the detail of the item the user stops on is fetched (same key).
@@ -841,6 +872,7 @@ class TreeView : public View {
   Context& ctx_;
   std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
   int dir_priority_ = 2;           // update priority of the directory shown
+  std::string this_node_;          // name of this server's own node
   int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives
@@ -1106,6 +1138,7 @@ class DecisionsView : public View {
   explicit DecisionsView(Context& ctx) : ctx_(ctx) {
     MenuOption opt = MenuOption::Vertical();
     opt.on_enter = [this] { decide_current(); };
+    opt.on_change = [this] { load_members(); };
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
       return with_detail(list_panel(std::to_string(items_.size()) +
@@ -1133,14 +1166,35 @@ class DecisionsView : public View {
                  " on this server; decide some to see more";
       labels_.clear();
       for (const auto& d : items_)
-        labels_.push_back(fit("[" + d.value("kind", "") + "]", 12) + d.value("path", "") +
+        labels_.push_back(fit("[" + d.value("kind", "") + "]", 16) + d.value("path", "") +
                           (d["node"].is_string() ? "  (" + d.value("node", "") + ")" : "") +
                           where_suffix(ctx_, d));
       selected_ = reselect(items_, keep, key_of, selected_);
+      load_members();
     }, "decisions");
   }
 
  private:
+  // A group stands for many decisions: show a few of the paths it is made of.
+  void load_members() {
+    members_.clear();
+    members_of_.clear();
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return;
+    const json& d = items_[selected_];
+    if (!d.value("group", false)) return;
+    std::string key = key_of(d);
+    std::string path = "/api/decisions/" + std::to_string(d.value("id", 0)) + "/members?limit=12";
+    if (auto q = server_query(d); !q.empty()) path += "&" + q;
+    ctx_.get(path, [this, key](json out) {
+      if (selected_ < 0 || selected_ >= static_cast<int>(items_.size()) ||
+          key_of(items_[selected_]) != key)
+        return;   // the selection moved on
+      members_.clear();
+      for (const auto& p : out["paths"]) members_.push_back(p.get<std::string>());
+      members_of_ = key;
+    }, "decision-members");
+  }
+
   static std::string key_of(const json& d) { return d.value("server", "") + d["id"].dump(); }
   std::string current_key() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
@@ -1154,6 +1208,14 @@ class DecisionsView : public View {
                      label_value("kind", d.value("kind", "")),
                      label_value("server", d.value("server_name", ""))};
     rows.push_back(paragraph(d.value("summary", "")));
+    if (d.value("group", false) && members_of_ == key_of(d) && !members_.empty()) {
+      rows.push_back(separator());
+      rows.push_back(text("for example") | bold);
+      for (const auto& p : members_) rows.push_back(hard_wrap(p, kDetailWidth - 1) | dim);
+      if (d.value("members", 0) > static_cast<int>(members_.size()))
+        rows.push_back(text("... and " + std::to_string(d.value("members", 0) - static_cast<int>(members_.size())) +
+                            " more") | dim);
+    }
     rows.push_back(separator());
     rows.push_back(text("choices") | bold);
     for (const auto& o : d["options"])
@@ -1249,6 +1311,8 @@ class DecisionsView : public View {
     return false;
   }
 
+  std::vector<std::string> members_;   // sample paths of the selected group
+  std::string members_of_;             // key of the group they belong to
   Context& ctx_;
   std::set<std::string> marked_;   // nodes chosen with Space for the next scan
   json items_ = json::array();

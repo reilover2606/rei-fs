@@ -186,6 +186,29 @@ nothing is reported missing or renamed, so it is the cheapest scan. Nested setti
 `interval_minutes = 0` still turns all automatic scans off. The same classes will
 decide which directories live scanning watches.
 
+### 4.6 Decisions that belong together
+
+A deleted or moved folder with ten thousand files must not become ten thousand
+decisions. After each scan, the decisions it raised are gathered under one **group**
+decision per folder (`[scan] group_decisions_min`, default 5; 0 turns it off). How the
+files are told to belong together is not guessed from names, it comes from what the scan
+saw on the disk:
+
+* **missing**: for each vanished file the scan looks for the topmost folder above it that no
+  longer exists on that node. Everything under the same vanished folder is one group
+  (`/jar` gone, however deep the files). Files whose folder still exists are grouped by that
+  folder, so deleting most of one folder's files is also one decision.
+* **rename**: the files of one moved folder all show the same pair of prefixes once the
+  trailing path they share is removed (`/a/b/x` -> `/n/b/x` and `/a/c/y` -> `/n/c/y` both
+  say `/a` -> `/n`), so a moved folder, subfolders included, is one decision.
+
+The members stay in the database but are not listed or counted: the list shows the group, with
+a sample of its paths. One choice is applied to all members, a few hundred per transaction
+so the database is never held for long; one that cannot take that choice (restoring a file
+that had no other copy) leaves the group and stays open on its own. Later findings for the
+same folder join the open group, and a group whose members were all settled meanwhile
+closes by itself.
+
 ### 4.3 Diverging versions (decision: `divergent`)
 
 When copies of the same vpath have different hashes, the copy with the

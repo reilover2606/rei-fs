@@ -299,8 +299,12 @@ def cmd_decisions(args) -> None:
         return
     for d in items:
         where = f" on {d.node_name}" if d.node_name else ""
-        print(f"#{d.id} [{d.kind}] {d.vpath or d.data.get('vpath', '?')}{where}")
-        if d.kind == "rename":
+        print(f"#{d.id} [{d.kind}] {d.vpath or d.data.get('vpath') or d.data.get('dir', '?')}{where}")
+        if d.kind == "group":
+            n, size = decisions.group_info(conn, d.id)
+            print(f"    {n} {d.data.get('member_kind')} decision(s) in one: "
+                  + ", ".join(decisions.group_members(conn, d.id, 3)) + (" ..." if n > 3 else ""))
+        elif d.kind == "rename":
             print(f"    renamed to {d.data['to']}; {len(d.data['nodes'])} other node(s) keep the old path")
         elif d.kind == "divergent":
             print(f"    {len(d.data['stale_nodes'])} stale cop(ies)"

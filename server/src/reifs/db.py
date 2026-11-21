@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -368,6 +368,12 @@ ALTER TABLE changes_v7 RENAME TO changes;
 CREATE INDEX copies_marked ON copies(file_id) WHERE marked_delete = 1;
 CREATE INDEX copies_missing ON copies(file_id) WHERE state = 'missing';
 CREATE INDEX files_issues ON files(id) WHERE issues != '';
+""",
+    9: """
+-- A folder that vanished or moved holds thousands of files: their decisions are
+-- gathered under one 'group' decision (their parent) instead of flooding the stack.
+ALTER TABLE decisions ADD COLUMN parent_id INTEGER REFERENCES decisions(id) ON DELETE CASCADE;
+CREATE INDEX decisions_parent ON decisions(parent_id) WHERE parent_id IS NOT NULL;
 """,
 }
 
