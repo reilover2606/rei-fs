@@ -350,3 +350,21 @@ def test_virtual_move_through_the_api(server):
     assert (env.root / "other" / "a.txt").read_text() == "different"
     client.post("/api/vmove", {"paths": ["/docs"], "to": "/docs/x"}, expect=400)
     client.post("/api/vmove", {"paths": ["/docs"], "to": "/z", "on_conflict": "bogus"}, expect=400)
+
+
+def test_update_priority_through_the_api(server):
+    env, client, _ = server
+    login(client)
+    assert client.get("/api/priority?path=/docs")["priority"] == 2
+    out = client.post("/api/priority", {"path": "/docs", "priority": "archival"})
+    assert (out["priority"], out["inherited"]) == (3, False)
+    assert client.get("/api/priority?path=/docs/deep/er")["set_on"] == "/docs"
+    tree = client.get("/api/tree?path=/")
+    assert tree["priority"] == 2
+    assert [(e["name"], e["priority"], e["set_here"]) for e in tree["entries"] if e["dir"]] == \
+        [("docs", 3, True)]
+    client.post("/api/priority", {"path": "/docs/a.txt", "priority": 1}, expect=400)
+    client.post("/api/priority", {"path": "/docs", "priority": 9}, expect=400)
+    assert client.post("/api/priority", {"path": "/docs", "priority": None})["priority"] == 2
+    client.post("/api/scan", {"due": True})        # an automatic-style scan is accepted
+    wait_idle(client)

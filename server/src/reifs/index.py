@@ -142,6 +142,14 @@ def log_vdir(conn: sqlite3.Connection, vpath: str) -> None:
                                      "updated": r["updated"], "updated_by": r["updated_by"]})
 
 
+def log_dirpref(conn: sqlite3.Connection, vpath: str) -> None:
+    r = conn.execute("SELECT priority, updated, updated_by FROM dirprefs WHERE vpath = ?",
+                     (vpath,)).fetchone()
+    if r:
+        append_change(conn, "dirpref", {"vpath": vpath, "priority": r["priority"],
+                                        "updated": r["updated"], "updated_by": r["updated_by"]})
+
+
 def log_mark(conn: sqlite3.Connection, fid: int, node_id: str) -> None:
     r = conn.execute("SELECT marked_delete FROM copies WHERE file_id = ? AND node_id = ?",
                      (fid, node_id)).fetchone()

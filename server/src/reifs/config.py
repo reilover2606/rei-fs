@@ -63,9 +63,20 @@ class StorageSection:
 
 @dataclass
 class ScanSection:
+    # Minutes between automatic scans of a directory, by its update priority.
+    # interval_minutes is for priority 2 (the default) and 0 turns every
+    # automatic scan off; archival (3) is only scanned the first time and on request.
     interval_minutes: int = 60
+    synchronous_minutes: int = 1
+    frequent_minutes: int = 10
+    archival_minutes: int = 0
     ignore_hidden_dirs: bool = True
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
+
+
+    def minutes(self, priority: int) -> int:
+        return (self.synchronous_minutes, self.frequent_minutes, self.interval_minutes,
+                self.archival_minutes)[priority]
 
 
 @dataclass
@@ -210,7 +221,16 @@ advertise = {s(self.server.advertise)}
 root = {s(self.storage.root)}
 
 [scan]
+# Minutes between automatic scans of a directory, by update priority
+# (set per directory in the client; subdirectories inherit it):
+#   0 synchronous  1 frequent  2 infrequent (the default)  3 archival
+# interval_minutes is priority 2; 0 there turns ALL automatic scans off. 0 for
+# the others means "only the first time and when asked". A scan you start
+# yourself always covers everything.
 interval_minutes = {self.scan.interval_minutes}
+synchronous_minutes = {self.scan.synchronous_minutes}
+frequent_minutes = {self.scan.frequent_minutes}
+archival_minutes = {self.scan.archival_minutes}
 # Skip directories whose name starts with '.'.
 ignore_hidden_dirs = {b(self.scan.ignore_hidden_dirs)}
 # Glob patterns. Without '/', a pattern matches a file or directory name;

@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import db, peers, replication, runner, scanner, sync
+from . import db, index, peers, priority, replication, runner, scanner, sync
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
@@ -29,6 +29,7 @@ from .rsyncd import RsyncDaemon
 log = logging.getLogger("reifs.service")
 
 DISCOVERY_SECONDS = 30
+SCAN_CHECK_SECONDS = 30   # how often to look for directories due for a scan
 JOBS_SECONDS = 60
 SYNC_SECONDS = 30
 PLAN_SECONDS = 600     # replication planning, at least this often
@@ -76,8 +77,10 @@ class Worker:
                     "last_error": a.last_error, "last_result": a.last_result,
                     "queued": self.tasks.qsize()}
 
-    def request_scan(self, nodes: list[str] | None = None, verify: bool = False) -> None:
-        self._enqueue(("scan", tuple(sorted(nodes or [])), verify))
+    def request_scan(self, nodes: list[str] | None = None, verify: bool = False,
+                     full: bool = True) -> None:
+        """Scan (full: everything, as asked by the user; otherwise only what is due)."""
+        self._enqueue(("scan", tuple(sorted(nodes or [])), verify, full))
 
     def request_jobs(self) -> None:
         self._enqueue(("jobs",))
@@ -136,10 +139,12 @@ class Worker:
         try:
             while not self.shutdown.is_set():
                 now = time.monotonic()
-                if self.cfg.scan.interval_minutes > 0 and \
-                        now - last_scan >= self.cfg.scan.interval_minutes * 60:
+                # Which directories are due depends on their update priority;
+                # looking is cheap (nothing is read when nothing is due).
+                if self.cfg.scan.interval_minutes > 0 and now - last_scan >= SCAN_CHECK_SECONDS:
                     last_scan = now
-                    self.request_scan()
+                    if self._scan_due(conn, online):
+                        self.request_scan(full=False)
                 if now - last_discovery >= DISCOVERY_SECONDS:
                     last_discovery = now
                     online = self._watch_drives(conn, online)
@@ -167,6 +172,18 @@ class Worker:
         finally:
             conn.close()
 
+    def _scan_due(self, conn, online: set[str] | None) -> bool:
+        """Does any online node have a priority class whose scan is due?"""
+        try:
+            prefs = priority.Prefs(priority.load(conn))
+            owned = index.owned_node_ids(conn)
+            # Before the first discovery nothing is known: let the scan find out.
+            ids = owned if online is None else owned & online
+            return any(priority.due_classes(conn, self.cfg, nid, prefs) for nid in ids)
+        except Exception as e:  # noqa: BLE001 - keep the worker alive
+            log.warning("checking for due scans failed: %s", e)
+            return False
+
     def _watch_drives(self, conn, previous: set[str] | None) -> set[str]:
         try:
             current = {loc.node_id for loc in discover(conn, self.cfg).online}
@@ -176,7 +193,7 @@ class Worker:
         if previous is not None:
             for node_id in sorted(current - previous):
                 log.info("node %s came online; scanning it", node_id)
-                self.request_scan([node_id])
+                self.request_scan([node_id], full=False)
                 self.request_jobs()
         if self.syncer is not None and current != previous:
             self.syncer.request_daemon_update()
@@ -212,8 +229,7 @@ class Worker:
                 if kind == "scan":
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
-                        progress=self._scan_progress,
-                        stop=stop)
+                        progress=self._scan_progress, stop=stop, full=task[3])
                     summary = "; ".join(
                         f"{r.node_name}: +{r.stats.added} ~{r.stats.changed} "
                         f"-{r.stats.missing}" for r in results)

@@ -542,6 +542,12 @@ class OverviewView : public View {
 
 // --- Tree ---------------------------------------------------------------------------
 
+const char* priority_name(int p) {
+  static const char* names[] = {"synchronous", "frequent", "infrequent", "archival"};
+  return names[std::clamp(p, 0, 3)];
+}
+
+
 class TreeView : public View {
  public:
   explicit TreeView(Context& ctx) : ctx_(ctx) {
@@ -551,6 +557,7 @@ class TreeView : public View {
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
       std::string heading = path_;
+      if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
       return with_detail(list_panel(heading, menu_, labels_.size(),
@@ -563,7 +570,7 @@ class TreeView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  "
-           "v: move to...  n: rename  d: new dir  D: remove empty dir  r: refresh";
+           "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -597,6 +604,7 @@ class TreeView : public View {
           if (requested != path_) return;   // the user has gone elsewhere meanwhile
           loading_ = false;
           entries_ = out["entries"];
+          dir_priority_ = out.value("priority", 2);
           rebuild_labels();
           selected_ = reselect(entries_, name,
                                [](const json& e) { return e.value("name", ""); }, selected_);
@@ -620,8 +628,11 @@ class TreeView : public View {
       bool picked = picked_.count(child_path(e.value("name", ""))) > 0;
       std::string mark = picked ? "» " : "  ";
       if (e.value("dir", false))
-        labels_.push_back(mark + fit("▸ " + e.value("name", "") + "/", 42) + " " +
-                          std::to_string(e.value("files", 0)) + " files");
+        labels_.push_back(mark + fit("▸ " + e.value("name", "") + "/", 34) + " " +
+                          fit(std::to_string(e.value("files", 0)) + " files", 11) +
+                          (e.value("priority", 2) != 2
+                               ? std::string(" [") + priority_name(e.value("priority", 2)) + "]"
+                               : ""));
       else
         labels_.push_back(mark + file_label(e, 40));
     }
@@ -649,8 +660,11 @@ class TreeView : public View {
       detail_ = vbox({hard_wrap(child_path(e->value("name", "")) + "/", kDetailWidth - 1) | bold,
                       separator(),
                       text(std::to_string(e->value("files", 0)) + " file(s) below"),
+                      text(std::string("update priority: ") + priority_name(e->value("priority", 2)) +
+                           (e->value("set_here", false) ? "" : " (inherited)")),
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
-                      text("x: pick up to move it in the tree  n: rename") | dim});
+                      text("x: pick up to move it in the tree  n: rename") | dim,
+                      text("u: update priority (how often it is scanned)") | dim});
       return;
     }
     // Only the detail of the item the user stops on is fetched (same key).
@@ -727,6 +741,13 @@ class TreeView : public View {
       });
       return true;
     }
+    if (key(e, "u")) {   // update priority of the selected directory (or of this one)
+      const json* sel = current();
+      std::string dir_path = sel && sel->value("dir", false)
+                                 ? child_path(sel->value("name", "")) : path_;
+      set_priority(dir_path);
+      return true;
+    }
     const json* cur = current();
     if (!cur) return false;
     std::string target = child_path(cur->value("name", ""));
@@ -774,6 +795,23 @@ class TreeView : public View {
     return false;
   }
 
+  void set_priority(const std::string& dir_path) {
+    ctx_.dialogs->ask_choice(
+        "Update priority of " + dir_path + " (applies to everything below it):\n"
+        "how often it is scanned for changes; archival is only scanned when you ask.",
+        {"0  synchronous (live; for programs saving continuously)", "1  frequent",
+         "2  infrequent (default)", "3  archival (never changes)", "inherit from the parent"},
+        [this, dir_path](int i) {
+          json value = i == 4 ? json(nullptr) : json(i);
+          ctx_.send("/api/priority", {{"path", dir_path}, {"priority", value}},
+                    [this, dir_path](json out) {
+                      ctx_.notify(dir_path + ": " + out.value("name", "") +
+                                  (out.value("inherited", false) ? " (inherited)" : ""));
+                      refresh();
+                    });
+        });
+  }
+
   void move_items(std::vector<std::string> items, const std::string& dest,
                   const std::string& name) {
     virtual_move(ctx_, std::move(items), dest, name, [this] {
@@ -785,6 +823,7 @@ class TreeView : public View {
 
   Context& ctx_;
   std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
+  int dir_priority_ = 2;           // update priority of the directory shown
   int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives

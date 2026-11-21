@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import db, fsops, index, paths
+from . import db, fsops, index, paths, priority
 from .config import Config, ScanSection
 from .control import Stopped, StopFn, check
 from .hashing import hash_file
@@ -78,6 +78,7 @@ class ScanStats:
     deleted_marked: int = 0
     verify_mismatch: int = 0
     pruned_dirs: int = 0
+    skipped_dirs: int = 0    # directories left out: not due for an automatic scan
 
 
 @dataclass
@@ -98,9 +99,12 @@ def _is_junction(entry: os.DirEntry) -> bool:
 
 
 class _Walker:
-    def __init__(self, root: Path, ignorer: Ignorer):
+    def __init__(self, root: Path, ignorer: Ignorer, schedule: priority.Schedule | None = None,
+                 skipped: list[str] | None = None):
         self.root = root
         self.ignorer = ignorer
+        self.schedule = schedule or priority.Schedule(priority.Prefs({}), None)
+        self.skipped = skipped if skipped is not None else []
         self.errors: list[tuple[str, str]] = []
         self.error_paths: set[str] = set()
         self.unreadable: list[str] = []  # vdir prefixes
@@ -111,9 +115,11 @@ class _Walker:
 
     def walk(self) -> Iterator[tuple[str, str, int, int]]:
         """Yield ``(vpath, physical path, size, mtime_ns)`` for every indexed file."""
-        stack: list[tuple[str, str]] = [(str(self.root), "")]
+        prefs = self.schedule.prefs
+        stack: list[tuple[str, str, int]] = [(str(self.root), "", prefs.effective("/"))]
         while stack:
-            directory, vdir = stack.pop()
+            directory, vdir, prio = stack.pop()
+            wanted = self.schedule.wants(prio)
             try:
                 with os.scandir(directory) as it:
                     entries = sorted(it, key=lambda e: e.name)
@@ -140,9 +146,13 @@ class _Walker:
                         if marker_path(entry.path).exists():
                             self.errors.append((vpath, "nested node root; skipped"))
                             continue
-                        subdirs.append((entry.path, vpath))
+                        child_prio = prefs.prefs.get(vpath, prio)
+                        if self.schedule.enter(vpath, child_prio):
+                            subdirs.append((entry.path, vpath, child_prio))
+                        else:
+                            self.skipped.append(vpath)   # not due: not even read
                     elif entry.is_file(follow_symlinks=False):
-                        if self.ignorer.ignored(name, vpath, is_dir=False):
+                        if not wanted or self.ignorer.ignored(name, vpath, is_dir=False):
                             continue
                         st = entry.stat(follow_symlinks=False)
                         yield vpath, entry.path, st.st_size, st.st_mtime_ns
@@ -154,6 +164,8 @@ class _Walker:
         """True if we could not observe vpath, so it must not count as vanished."""
         if vpath in self.error_paths:
             return True
+        if not self.schedule.covers_file(vpath):
+            return True    # in a directory this scan did not visit
         return any(vpath.startswith(prefix + "/") for prefix in self.unreadable)
 
 
@@ -166,7 +178,10 @@ def scan_node(
     verify: bool = False,
     progress: ProgressFn | None = None,
     stop: StopFn | None = None,
+    classes: set[int] | None = None,
 ) -> ScanResult:
+    """Scan a node. ``classes``: only the directories of these update priorities
+    (an automatic scan); None scans everything (one the user asked for)."""
     node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if node is None:
         raise NodeError(f"unknown node {node_id}")
@@ -182,9 +197,12 @@ def scan_node(
             (node_id, db.now()),
         ).lastrowid
 
+    started_at = time.time()
     stats = ScanStats(node=node["name"])
     ignorer = Ignorer(cfg.scan)
-    walker = _Walker(root, ignorer)
+    prefs = priority.Prefs(priority.load(conn))
+    schedule = priority.Schedule(prefs, classes)
+    walker = _Walker(root, ignorer, schedule)
     existing: dict[str, sqlite3.Row] = {
         r["vpath"]: r
         for r in conn.execute(
@@ -192,6 +210,7 @@ def scan_node(
             " FROM copies c JOIN files f ON f.id = c.file_id WHERE c.node_id = ?",
             (node_id,),
         )
+        if classes is None or schedule.covers_file(r["vpath"])   # only what this scan visits
     }
     seen: set[str] = set()
     touched: set[int] = set()
@@ -258,6 +277,7 @@ def scan_node(
         raise
 
     # --- phase 2: vanished copies, renames, pruning ---------------------------
+    stats.skipped_dirs = len(walker.skipped)
     vanished, to_forget = _find_vanished(root, existing, seen, walker, ignorer)
     with db.transaction(conn, "scan: reconciling changes"):
         prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched)
@@ -269,6 +289,8 @@ def scan_node(
             " WHERE id = ?",
             (db.now(), scan_id, db.now(), node_id),
         )
+        priority.record_scan(conn, node_id, priority.CLASSES if classes is None else classes,
+                             started_at)
     for vdir in sorted(prune, key=lambda p: -p.count("/")):
         stats.pruned_dirs += fsops.prune(root, vdir)   # filesystem only, no lock held
     finish("complete")
@@ -454,8 +476,13 @@ def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
 def scan_all(
     conn: sqlite3.Connection, cfg: Config, names: list[str] | None = None, *,
     verify: bool = False, progress: ProgressFn | None = None, stop: StopFn | None = None,
+    full: bool = True,
 ):
-    """Discover owned nodes, then scan the online ones (optionally filtered)."""
+    """Discover owned nodes, then scan the online ones (optionally filtered).
+
+    ``full=False`` is an automatic scan: each node only gets the directories
+    whose update priority is due, and a node with none due is left alone.
+    """
     from .nodes import discover
 
     disc = discover(conn, cfg)
@@ -464,6 +491,12 @@ def scan_all(
     for loc in disc.online:
         if wanted and loc.name not in wanted and loc.node_id not in wanted:
             continue
+        classes = None
+        if not full:
+            classes = priority.due_classes(conn, cfg, loc.node_id,
+                                           priority.Prefs(priority.load(conn)))
+            if not classes:
+                continue
         results.append(scan_node(conn, cfg, loc.node_id, loc.root,
-                                 verify=verify, progress=progress, stop=stop))
+                                 verify=verify, progress=progress, stop=stop, classes=classes))
     return disc, results

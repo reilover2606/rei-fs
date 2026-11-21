@@ -158,6 +158,32 @@ cannot show. rsync receives names as bytes (`--files-from` with NUL separators,
 UTF-8); the path of a node on a remote server is backslash-escaped for the
 remote shell when the client's rsync does not do it itself (before 3.2.4).
 
+### 4.5 Update priority
+
+How often a directory changes differs: documents being edited all day, and
+archives that never change. The user sets an **update priority** per directory
+(`POST priority {path, priority}`; `reifs priority`; `u` in the Tree) and it
+applies to everything below, unless a subdirectory has its own value; the
+nearest setting at or above a path wins and the default is 2. It is replicated
+like a tag (last writer wins, `inherit` is a tombstone) and follows a directory
+when it is moved (5.5).
+
+| value | meaning | automatic scan every |
+|---|---|---|
+| 0 | synchronous: for programs saving continuously (the API for them comes later) | `scan.synchronous_minutes` (1) |
+| 1 | frequent | `scan.frequent_minutes` (10) |
+| 2 | infrequent (default) | `scan.interval_minutes` (60) |
+| 3 | archival: never changes | `scan.archival_minutes` (0 = only the first time and on request) |
+
+Automatic scans (the timer, a drive coming online, `reifs scan --due`) only visit
+the directories whose class is due, per node (`scan_state`); a directory not due
+is not even read, and a node with nothing due costs nothing. Files in directories
+a scan did not visit are never reported missing. A scan the user asks for, from the
+client or `reifs scan`, always covers everything, which is also how changes in an
+archive are noticed. Nested settings work: an archive can hold a frequent folder.
+`interval_minutes = 0` still turns all automatic scans off. The same classes will
+decide which directories live scanning watches.
+
 ### 4.3 Diverging versions (decision: `divergent`)
 
 When copies of the same vpath have different hashes, the copy with the
@@ -516,6 +542,7 @@ Endpoints (all JSON, under `/api`):
 | `GET decisions`, `POST decisions/<id> {option}` | Decision stack |
 | `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
+| `GET priority?path=`, `POST priority {path, priority}` | Update priority of a directory (4.5) |
 | `POST vmove {paths, to, name?, on_conflict: merge\|preserve, dry_run?}` | Move within the virtual tree (5.5) |
 | `POST mkdir {path}`, `POST rmdir {path}` | Create / remove an empty virtual directory (5.6) |
 | `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |

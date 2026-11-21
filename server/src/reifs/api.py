@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries, vdirs, vmove,
+from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, priority, queries, vdirs, vmove,
                replication, ssh, sync, tags, tls)
 from .config import Config
 from .paths import to_physical
@@ -162,6 +162,8 @@ class Api:
         r("GET", r"/api/jobs", self.list_jobs)
         r("POST", r"/api/jobs", self.create_job)
         r("POST", r"/api/vmove", self.vmove)
+        r("GET", r"/api/priority", self.get_priority)
+        r("POST", r"/api/priority", self.set_priority)
         r("POST", r"/api/mkdir", self.mkdir)
         r("POST", r"/api/rmdir", self.rmdir)
         r("POST", r"/api/jobs/run", self.run_jobs)
@@ -366,9 +368,11 @@ class Api:
                 remote.setdefault(row["owner_id"], []).append(row["id"])
         for owner, ids in remote.items():
             peers.forward(conn, owner, "POST", "/api/scan",
-                          {"nodes": ids, "verify": bool(body.get("verify"))})
+                          {"nodes": ids, "verify": bool(body.get("verify")),
+                           "due": bool(body.get("due"))})
         if local or not remote:
-            self._need_worker().request_scan(local or None, bool(body.get("verify")))
+            self._need_worker().request_scan(local or None, bool(body.get("verify")),
+                                             full=not body.get("due"))
         return {"ok": True, "queued": True}
 
     def _poke(self) -> None:
@@ -391,15 +395,20 @@ class Api:
         entries = queries.list_dir(conn, vdir, replication.policy(self.cfg))
         if entries is None:
             raise ApiError(404, f"not a directory in the virtual tree: {vdir}")
+        prefs = priority.Prefs(priority.load(conn))
+        here = prefs.effective(vdir)
         out = []
         for e in entries:
             if e.is_dir:
-                out.append({"name": e.name, "dir": True, "files": e.files})
+                child = paths.join(vdir, e.name)
+                out.append({"name": e.name, "dir": True, "files": e.files,
+                            "priority": prefs.prefs.get(child, here),
+                            "set_here": child in prefs.prefs})
             else:
                 f = file_json(e.file, full=False)
                 f["dir"] = False
                 out.append(f)
-        return {"path": vdir, "entries": out}
+        return {"path": vdir, "entries": out, "priority": here}
 
     def file(self, conn, q, body, **_):
         info = queries.lookup(conn, q.get("path", ""), replication.policy(self.cfg))
@@ -537,6 +546,16 @@ class Api:
             self.worker.request_jobs()
         return {"job_id": rep.job_id, "items": rep.items,
                 "excluded": {k: len(v) for k, v in rep.excluded.items()}}
+
+    def get_priority(self, conn, q, body, **_):
+        return priority.get(conn, q.get("path", "/"))
+
+    def set_priority(self, conn, q, body, **_):
+        try:
+            value = priority.parse(body.get("priority"))
+            return priority.set_priority(conn, str(body.get("path", "")), value)
+        except priority.PriorityError as e:
+            raise ApiError(400, str(e)) from None
 
     def mkdir(self, conn, q, body, **_):
         try:
