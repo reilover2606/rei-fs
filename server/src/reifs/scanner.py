@@ -32,7 +32,7 @@ from .hashing import hash_file
 from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
 
 BATCH_FILES = 500
-BATCH_SECONDS = 5.0
+BATCH_SECONDS = 1.0
 MAX_STORED_ERRORS = 1000
 
 
@@ -202,36 +202,58 @@ def scan_node(
             )
 
     # --- phase 1: walk, add and update copies --------------------------------
-    conn.execute("BEGIN IMMEDIATE")
-    pending, last_commit = 0, time.monotonic()
+    # Hashing (and directory reading) happens with NO database transaction
+    # open: reading a huge file or a stalled disk takes minutes and would block
+    # every other writer (the API, the sync thread) for that long. Results
+    # are collected and written in short batches.
+    batch: list[tuple] = []
+    last_flush = time.monotonic()
+
+    def flush(current: str = "") -> None:
+        nonlocal last_flush
+        if batch:
+            with db.transaction(conn):
+                for args in batch:
+                    _process_file(conn, node_id, scan_id, *args, stats, touched)
+            batch.clear()
+            if progress:
+                progress(stats, current)
+        last_flush = time.monotonic()
+
     try:
         for vpath, phys, size, mtime_ns in walker.walk():
             check(stop)
             stats.seen += 1
             seen.add(vpath)
-            if _process_file(conn, node_id, scan_id, vpath, phys, size, mtime_ns,
-                             existing.get(vpath), verify, stats, touched, walker):
-                pending += 1
-            if pending >= BATCH_FILES or time.monotonic() - last_commit > BATCH_SECONDS:
-                conn.execute("COMMIT")
-                if progress:
-                    progress(stats, vpath)
-                conn.execute("BEGIN IMMEDIATE")
-                pending, last_commit = 0, time.monotonic()
-        conn.execute("COMMIT")
+            row = existing.get(vpath)
+            if row is not None and not verify and row["size"] == size \
+                    and row["mtime_ns"] == mtime_ns:
+                if row["state"] == "missing":
+                    batch.append((vpath, size, mtime_ns, row, None))   # it came back
+                h = None
+            else:
+                try:
+                    h = hash_file(phys)
+                except OSError as e:
+                    walker._error(vpath, f"cannot hash: {e.strerror or e}")
+                    continue
+                stats.hashed += 1
+                batch.append((vpath, size, mtime_ns, row, h))
+            if len(batch) >= BATCH_FILES or (batch and time.monotonic() - last_flush > BATCH_SECONDS):
+                flush(vpath)
+        flush()
     except BaseException as exc:
-        if conn.in_transaction:
-            try:
-                conn.execute("COMMIT")  # keep the progress made so far
-            except sqlite3.Error:
-                conn.execute("ROLLBACK")
+        try:
+            flush()                      # keep the progress made so far
+        except sqlite3.Error:
+            pass
         finish("aborted" if isinstance(exc, (KeyboardInterrupt, Stopped)) else "failed")
         raise
 
     # --- phase 2: vanished copies, renames, pruning ---------------------------
+    vanished, to_forget = _find_vanished(root, existing, seen, walker, ignorer)
     with db.transaction(conn):
-        _reconcile_vanished(conn, node, root, scan_id, existing, seen, walker,
-                            ignorer, stats, touched)
+        prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched)
         for fid in touched:
             if conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone():
                 index.evaluate_divergence(conn, fid)
@@ -240,35 +262,30 @@ def scan_node(
             " WHERE id = ?",
             (db.now(), scan_id, db.now(), node_id),
         )
+    for vdir in sorted(prune, key=lambda p: -p.count("/")):
+        stats.pruned_dirs += fsops.prune(root, vdir)   # filesystem only, no lock held
     finish("complete")
     if progress:
         progress(stats, "")
     return ScanResult(node["name"], scan_id, "complete", stats, walker.errors)
 
 
-def _process_file(
-    conn, node_id, scan_id, vpath, phys, size, mtime_ns, row, verify, stats, touched, walker,
-) -> bool:
-    """Reconcile one observed file. Returns True if the database was written."""
-    if row is not None and not verify and row["size"] == size and row["mtime_ns"] == mtime_ns:
-        if row["state"] == "missing":
-            conn.execute(
-                "UPDATE copies SET state = 'present' WHERE file_id = ? AND node_id = ?",
-                (row["file_id"], node_id),
-            )
-            index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, row["hash"])
-            index.obsolete_decisions(conn, row["file_id"], ("missing",), node_id)
-            stats.reappeared += 1
-            touched.add(row["file_id"])
-            return True
-        return False
+def _process_file(conn, node_id, scan_id, vpath, size, mtime_ns, row, h, stats, touched) -> None:
+    """Write one observed file to the index (inside a transaction).
 
-    try:
-        h = hash_file(phys)
-    except OSError as e:
-        walker._error(vpath, f"cannot hash: {e.strerror or e}")
-        return False
-    stats.hashed += 1
+    ``h`` is its hash, computed beforehand without holding the lock; None
+    means the file is unchanged and only a copy marked missing came back.
+    """
+    if h is None:
+        conn.execute(
+            "UPDATE copies SET state = 'present' WHERE file_id = ? AND node_id = ?",
+            (row["file_id"], node_id),
+        )
+        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, row["hash"])
+        index.obsolete_decisions(conn, row["file_id"], ("missing",), node_id)
+        stats.reappeared += 1
+        touched.add(row["file_id"])
+        return
     ts = db.now()
 
     if row is None:
@@ -281,7 +298,7 @@ def _process_file(
         index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, h)
         stats.added += 1
         touched.add(fid)
-        return True
+        return
 
     fid = row["file_id"]
     content_changed = h != row["hash"]
@@ -303,12 +320,15 @@ def _process_file(
     if content_changed or row["state"] == "missing" or (row["size"], row["mtime_ns"]) != (size, mtime_ns):
         index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, h)
         touched.add(fid)
-    return True
 
 
-def _reconcile_vanished(conn, node, root, scan_id, existing, seen, walker, ignorer,
-                        stats, touched) -> None:
-    node_id = node["id"]
+def _find_vanished(root, existing, seen, walker, ignorer) -> tuple[list[str], list[str]]:
+    """Which tracked copies are gone, and which are still there but no longer
+    indexed (now ignored, a symlink, inside a nested node)?
+
+    Only reads the filesystem, so it runs before the write transaction is
+    opened: a slow or stalled disk must never hold the database lock.
+    """
     listings: dict[str, set[str] | None] = {}
 
     def exact_exists(vpath: str) -> bool | None:
@@ -337,6 +357,7 @@ def _reconcile_vanished(conn, node, root, scan_id, existing, seen, walker, ignor
         return False
 
     vanished: list[str] = []
+    to_forget: list[str] = []
     for vpath in existing:
         if vpath in seen or walker.protected(vpath):
             continue
@@ -344,12 +365,20 @@ def _reconcile_vanished(conn, node, root, scan_id, existing, seen, walker, ignor
         if exists is False:
             vanished.append(vpath)
         elif exists:
-            # Still on disk but not indexed: now ignored, a symlink, or inside
-            # a nested node. Stop tracking it without raising a decision.
             phys = paths.to_physical(root, vpath)
             if os.path.islink(phys) or ignorer.covers(vpath) or under_nested_node(vpath):
-                index.forget_copy(conn, existing[vpath]["file_id"], node_id)
-                stats.forgotten += 1
+                to_forget.append(vpath)
+    return vanished, to_forget
+
+
+def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched) -> set[str]:
+    """Update the index for vanished copies (inside a transaction, database
+    work only). Returns the virtual directories to prune afterwards."""
+    node_id = node["id"]
+    for vpath in to_forget:
+        # Still on disk but not indexed any more: stop tracking it quietly.
+        index.forget_copy(conn, existing[vpath]["file_id"], node_id)
+        stats.forgotten += 1
 
     # Rename candidates: copies that appeared since the last completed scan.
     pool: dict[tuple[str, int], list[tuple[str, int]]] = {}
@@ -393,8 +422,7 @@ def _reconcile_vanished(conn, node, root, scan_id, existing, seen, walker, ignor
         stats.missing += 1
         touched.add(fid)
 
-    for vdir in sorted(prune, key=lambda p: -p.count("/")):
-        stats.pruned_dirs += fsops.prune(root, vdir)
+    return prune
 
 
 def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,

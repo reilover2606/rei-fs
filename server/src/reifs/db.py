@@ -307,8 +307,8 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def connect(path: Path | str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+def connect(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, isolation_level=None, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -332,8 +332,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
 
 
-def open_existing(path: Path | str) -> sqlite3.Connection:
-    conn = connect(path)
+def open_existing(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+    conn = connect(path, timeout)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if 1 <= version < SCHEMA_VERSION:
         migrate(conn)

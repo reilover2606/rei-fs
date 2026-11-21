@@ -763,7 +763,8 @@ class Api:
                 raise ValueError("body must be a JSON object")
         except ValueError as e:
             return 400, {"error": f"bad JSON body: {e}"}
-        conn = db.open_existing(self.cfg.db_path)
+        # A client waits for the answer: report a busy database after 10 s, not 30.
+        conn = db.open_existing(self.cfg.db_path, timeout=10)
         try:
             # Who is calling: the client (bearer token) or a paired server.
             header = headers.get("Authorization")
@@ -800,7 +801,8 @@ class Api:
             return 400, {"error": str(e).strip("'\"")}
         except sqlite3.OperationalError as e:
             log.warning("database busy: %s", e)
-            return 503, {"error": f"database busy, try again ({e})"}
+            return 503, {"error": "the server is busy (its database is locked by another operation); "
+                                   f"try again in a moment ({e})"}
         finally:
             conn.close()
 

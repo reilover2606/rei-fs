@@ -309,3 +309,34 @@ def test_status_and_find(env):
     assert [f.vpath for f in queries.find(env.conn, under_replicated=True)] == ["/one.txt"]
     assert [f.vpath for f in queries.find(env.conn, node="ssd")] == ["/both.txt"]
     assert [f.vpath for f in queries.find(env.conn, "ONE*")] == ["/one.txt"]
+
+
+def test_scan_never_holds_the_write_lock_while_hashing(env, monkeypatch):
+    """Hashing a huge file (or reading a stalled disk) takes minutes: another
+    writer (the API, the sync thread) must not have to wait for it."""
+    import sqlite3
+
+    for i in range(30):
+        write(env.root / "d" / f"f{i}.txt", f"content {i}")
+    write(env.root / "d" / "huge.bin", "x")
+    other = sqlite3.connect(env.cfg.db_path, isolation_level=None, timeout=0.3)
+    waits = []
+    real = scanner.hash_file
+
+    def probing_hash(path):
+        t = __import__("time").time()
+        try:                      # a writer elsewhere, while we are "reading the file"
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("UPDATE meta SET value = value WHERE key = 'server_id'")
+            other.execute("COMMIT")
+            waits.append(("ok", __import__("time").time() - t))
+        except sqlite3.OperationalError:
+            waits.append(("LOCKED", __import__("time").time() - t))
+        return real(path)
+
+    monkeypatch.setattr(scanner, "hash_file", probing_hash)
+    env.scan()
+    assert len(waits) == 31
+    assert [w for w in waits if w[0] != "ok"] == []
+    monkeypatch.setattr(scanner, "hash_file", real)
+    other.close()
