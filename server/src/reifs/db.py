@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -376,6 +376,12 @@ CREATE INDEX files_issues ON files(id) WHERE issues != '';
 ALTER TABLE decisions ADD COLUMN parent_id INTEGER REFERENCES decisions(id) ON DELETE CASCADE;
 CREATE INDEX decisions_parent ON decisions(parent_id) WHERE parent_id IS NOT NULL;
 """,
+    10: """
+-- Big databases (millions of files): look proposals up by file, and a node's copies by node.
+CREATE INDEX wanted_file ON wanted(file_id);
+DROP INDEX copies_node;
+CREATE INDEX copies_node ON copies(node_id, size);
+""",
 }
 
 
@@ -383,7 +389,23 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
+def _use_a_roomy_temp_dir(path: Path | str) -> None:
+    """Big queries (sorting, grouping millions of rows) spill into temporary files. SQLite
+    puts them in /var/tmp or /tmp, which is often a small RAM disk: that ends in
+    "database or disk is full" with plenty of space on the real disk. Use a folder next to
+    the database instead, unless the user chose one (SQLITE_TMPDIR)."""
+    if os.environ.get("SQLITE_TMPDIR"):
+        return
+    tmp = Path(path).resolve().parent / "tmp"
+    try:
+        tmp.mkdir(exist_ok=True)
+        os.environ["SQLITE_TMPDIR"] = str(tmp)
+    except OSError:
+        pass
+
+
 def connect(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+    _use_a_roomy_temp_dir(path)
     conn = sqlite3.connect(path, isolation_level=None, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

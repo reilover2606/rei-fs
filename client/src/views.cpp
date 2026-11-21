@@ -542,7 +542,10 @@ class OverviewView : public View {
                                                                           lp.value("single_copy", 0))) +
                                                      " (" + std::to_string(lp.value("responsible", 0)) +
                                                      " planned by this server)"));
-      backup.push_back(line("  copies proposed", std::to_string(lp.value("proposed", 0))));
+      backup.push_back(line("  copies proposed", std::to_string(lp.value("proposed", 0)) +
+                                                     (lp.value("truncated", false)
+                                                          ? " (limit reached: more as these are decided)"
+                                                          : "")));
       if (lp.value("auto_approved", 0) > 0)
         backup.push_back(line("  approved automatically", std::to_string(lp.value("auto_approved", 0))));
       int nodest = lp.value("no_destination", 0);
@@ -593,6 +596,8 @@ class TreeView : public View {
     root_ = Renderer(menu_, [this] {
       std::string heading = path_;
       if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
+      if (more_files_ > 0)
+        heading += "   (" + std::to_string(more_files_) + " more files not listed; use Search)";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
       return with_detail(list_panel(heading, menu_, labels_.size(),
@@ -641,6 +646,7 @@ class TreeView : public View {
           entries_ = out["entries"];
           dir_priority_ = out.value("priority", 2);
           this_node_ = out.value("this_node", "");
+          more_files_ = out.value("more_files", 0);
           rebuild_labels();
           selected_ = reselect(entries_, name,
                                [](const json& e) { return e.value("name", ""); }, selected_);
@@ -880,6 +886,7 @@ class TreeView : public View {
   std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
   int dir_priority_ = 2;           // update priority of the directory shown
   std::string this_node_;          // name of this server's own node
+  int more_files_ = 0;             // files of this folder beyond the listing limit
   int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives

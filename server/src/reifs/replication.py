@@ -33,12 +33,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 
-from . import db, index, jobs, paths, peers
+from . import db, index, jobs, paths, peers, queries
 from .config import Config
 from .queries import GoalPolicy
+from .tags import tags_of
 
 REASON = "replicate"
 FORWARD_CHUNK = 5000
@@ -61,6 +63,9 @@ class PlanReport:
     reasons: dict[str, int] = field(default_factory=dict)
     examples: list[tuple[str, str]] = field(default_factory=list)
     auto_approved: int = 0
+    examined: int = 0          # files looked at in this run
+    open_proposals: int = 0    # replicate proposals waiting for a decision when planning began
+    truncated: bool = False    # stopped at the limits: the rest is planned in later runs
     finished: str = ""
 
     def to_dict(self) -> dict:
@@ -79,38 +84,35 @@ class UnderFile:
     goal: int
 
 
-def under_replicated(conn: sqlite3.Connection, pol: GoalPolicy) -> list[UnderFile]:
-    """Files with at least one good copy but fewer than their goal."""
-    cur = {r["file_id"]: r for r in conn.execute("""
-        SELECT file_id, hash, size FROM (
-            SELECT file_id, hash, size, ROW_NUMBER() OVER (
-                PARTITION BY file_id ORDER BY mtime_ns DESC, hash) AS rn
-            FROM copies WHERE state = 'present')
-        WHERE rn = 1""")}
-    good: dict[int, set[str]] = {}
-    for r in conn.execute("SELECT file_id, node_id, hash FROM copies"
-                          " WHERE state = 'present' AND marked_delete = 0"):
-        c = cur.get(r["file_id"])
-        if c is not None and c["hash"] == r["hash"]:
-            good.setdefault(r["file_id"], set()).add(r["node_id"])
-    tags: dict[int, list[str]] = {}
-    if pol.tag_copies:
-        for fid, tag in conn.execute("SELECT file_id, tag FROM tags WHERE present = 1"):
-            tags.setdefault(fid, []).append(tag)
-    files = {r["id"]: r for r in conn.execute("SELECT id, vpath, vkey, issues FROM files")}
-    out = []
-    for fid, nodes in good.items():
-        goal = pol.goal(tags.get(fid, ()))
-        if len(nodes) >= goal or fid not in files:
-            continue
-        f = files[fid]
-        out.append(UnderFile(fid, f["vpath"], f["vkey"], f["issues"], cur[fid]["hash"],
-                             cur[fid]["size"], sorted(nodes), goal))
-    out.sort(key=lambda f: f.vpath)
-    return out
+def good_nodes_of(conn: sqlite3.Connection, fid: int) -> tuple[list[str], str, int] | None:
+    """(nodes holding the current version, not marked for deletion; its hash; its size)."""
+    rows = conn.execute("SELECT node_id, hash, size, mtime_ns, marked_delete FROM copies"
+                        " WHERE file_id = ? AND state = 'present'", (fid,)).fetchall()
+    if not rows:
+        return None
+    top = min(rows, key=lambda r: (-r["mtime_ns"], r["hash"]))   # index.current_version
+    return (sorted(r["node_id"] for r in rows
+                   if r["hash"] == top["hash"] and not r["marked_delete"]),
+            top["hash"], top["size"])
+
+
+def under_file(conn: sqlite3.Connection, fid: int, pol: GoalPolicy) -> UnderFile | None:
+    """The file if it has a good copy but fewer than its goal (looked at on its own)."""
+    got = good_nodes_of(conn, fid)
+    f = conn.execute("SELECT vpath, vkey, issues FROM files WHERE id = ?", (fid,)).fetchone()
+    if got is None or f is None or not got[0]:
+        return None
+    goal = pol.goal(tags_of(conn, fid))
+    if len(got[0]) >= goal:
+        return None
+    return UnderFile(fid, f["vpath"], f["vkey"], f["issues"], got[1], got[2], got[0], goal)
 
 
 class _Planner:
+    """Chooses destinations. Everything about a file is looked up when the file comes
+    up (a few indexed queries), never preloaded: with millions of files that would
+    take minutes and gigabytes."""
+
     def __init__(self, conn: sqlite3.Connection, cfg: Config):
         self.conn = conn
         self.me = index.self_id(conn)
@@ -119,19 +121,6 @@ class _Planner:
         self.nodes = [n for n in conn.execute("SELECT * FROM nodes ORDER BY name")
                       if n["owner_id"] == self.me or n["owner_id"] in peers_]
         self.peer_online = {pid: bool(p["online"]) for pid, p in peers_.items()}
-        # Preloaded once instead of queried per file (hundreds of thousands of files).
-        self.holding: dict[int, set[str]] = {}
-        for fid, node_id in conn.execute("SELECT file_id, node_id FROM copies"):
-            self.holding.setdefault(fid, set()).add(node_id)
-        self.names_on: dict[str, dict[str, set[str]]] = {}  # case-insensitive nodes
-        for n in self.nodes:
-            if not n["case_sensitive"]:
-                by_key: dict[str, set[str]] = {}
-                for vkey, vpath in conn.execute(
-                        "SELECT f.vkey, f.vpath FROM copies c JOIN files f ON f.id = c.file_id"
-                        " WHERE c.node_id = ?", (n["id"],)):
-                    by_key.setdefault(vkey, set()).add(vpath)
-                self.names_on[n["id"]] = by_key
         # Space already promised to open/approved proposals.
         self.reserved: Counter = Counter()
         for r in conn.execute(
@@ -140,8 +129,18 @@ class _Planner:
                 " ('open', 'approved') GROUP BY w.id"):
             self.reserved[r["dst_node"]] += r["size"] or 0
 
+    def _holding(self, fid: int) -> set[str]:
+        return {r[0] for r in self.conn.execute(
+            "SELECT node_id FROM copies WHERE file_id = ?", (fid,))}
+
+    def _case_clash(self, node_id: str, f: UnderFile) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM files x JOIN copies c ON c.file_id = x.id WHERE x.vkey = ?"
+            " AND c.node_id = ? AND x.vpath != ? LIMIT 1", (f.vkey, node_id, f.vpath)
+        ).fetchone() is not None
+
     def choose(self, f: UnderFile, exclude: set[str]) -> tuple[str | None, str]:
-        holding = self.holding.get(f.file_id, set()) | exclude
+        holding = self._holding(f.file_id) | exclude
         issues = paths.decode_issues(f.issues)
         rejected: Counter = Counter()
         candidates = []
@@ -157,8 +156,7 @@ class _Planner:
             if n["restricted_names"] and issues & paths.RESTRICTED_NAME_ISSUES:
                 rejected["its name is not allowed on the other backup nodes"] += 1
                 continue
-            if not n["case_sensitive"] and \
-                    self.names_on[n["id"]].get(f.vkey, set()) - {f.vpath}:
+            if not n["case_sensitive"] and self._case_clash(n["id"], f):
                 rejected["a file differing only in case is on the other backup nodes"] += 1
                 continue
             free = n["free_bytes"]
@@ -177,29 +175,41 @@ class _Planner:
 
 
 def plan(conn: sqlite3.Connection, cfg: Config) -> PlanReport:
-    """Propose the missing copies of every under-replicated file we are responsible for."""
+    """Propose the missing copies of the under-replicated files we are responsible for.
+
+    Built to be bounded: the totals come from one SQL aggregation, the files are
+    walked in id order and looked at one by one, and at most
+    ``[replication] max_proposals`` proposals are open at a time (and at most
+    ``max_examined`` files looked at per run): with millions of files below their goal,
+    a plan is made in pieces, the next one when these have been approved or rejected.
+    """
     pol = policy(cfg)
     report = PlanReport(copies=pol.copies)
-    under = under_replicated(conn, pol)
-    by_id = {f.file_id: f for f in under}
+    stats, _stale = queries.coverage_stats(conn, pol)
+    report.under_replicated, report.single_copy = stats.under_replicated, stats.single_copy
     planner = _Planner(conn, cfg)
     me = planner.me
     owners = {r["id"]: r["owner_id"] for r in conn.execute("SELECT id, owner_id FROM nodes")}
-    with db.transaction(conn):
-        # A proposal is done once its file reached its goal, or its
-        # destination now holds a good copy.
-        active: dict[int, set[str]] = {}
-        for w in conn.execute("SELECT id, file_id, dst_node FROM wanted WHERE reason = ?"
-                              " AND status IN ('open', 'approved')", (REASON,)).fetchall():
-            f = by_id.get(w["file_id"])
-            if f is None or w["dst_node"] in f.good_nodes:
-                conn.execute("UPDATE wanted SET status = 'done' WHERE id = ?", (w["id"],))
-            else:
-                active.setdefault(w["file_id"], set()).add(w["dst_node"])
-    declined = {}
-    for r in conn.execute("SELECT file_id, data FROM wanted WHERE reason = ? AND"
-                          " status = 'rejected' ORDER BY id", (REASON,)):
-        declined[r["file_id"]] = json.loads(r["data"]).get("hash")
+
+    # Proposals that are no longer needed: the file reached its goal or the destination has it.
+    active: dict[int, set[str]] = {}
+    open_count, finished = 0, []
+    for w in conn.execute("SELECT id, file_id, dst_node, status FROM wanted WHERE reason = ?"
+                          " AND status IN ('open', 'approved')", (REASON,)).fetchall():
+        f = under_file(conn, w["file_id"], pol)
+        if f is None or w["dst_node"] in f.good_nodes:
+            finished.append(w["id"])
+        else:
+            active.setdefault(w["file_id"], set()).add(w["dst_node"])
+            open_count += w["status"] == "open"
+    for i in range(0, len(finished), 1000):
+        with db.transaction(conn):
+            conn.executemany("UPDATE wanted SET status = 'done' WHERE id = ?",
+                             [(x,) for x in finished[i:i + 1000]])
+    budget = max(0, cfg.replication.max_proposals - open_count)
+    report.open_proposals = open_count
+    if budget == 0 and report.under_replicated:
+        report.truncated = True   # at the limit: decide some of the open ones to get more
     reasons: Counter = Counter()
     pending_rows: list[tuple] = []
 
@@ -212,38 +222,58 @@ def plan(conn: sqlite3.Connection, cfg: Config) -> PlanReport:
                     index.add_wanted(conn, *args)
             pending_rows.clear()
 
-    for f in under:
-        report.under_replicated += 1
-        if len(f.good_nodes) == 1:
-            report.single_copy += 1
-        if owners.get(f.good_nodes[0]) != me:
-            continue  # the server holding the first good copy proposes
-        report.responsible += 1
-        pending = active.get(f.file_id, set())
-        need = f.goal - len(f.good_nodes) - len(pending)
-        if need <= 0:
-            report.already_proposed += 1
-            continue
-        if declined.get(f.file_id) == f.hash:
-            report.declined += 1
-            continue
-        chosen: set[str] = set()
-        source = next((n for n in f.good_nodes if owners.get(n) == me), f.good_nodes[0])
-        for _ in range(need):
-            dst, why = planner.choose(f, pending | chosen)
-            if dst is None:
-                report.no_destination += 1
-                reasons[why] += 1
-                if len(report.examples) < 20:
-                    report.examples.append((f.vpath, why))
+    queries.fill_under_ids(conn, pol)
+    last_id, examined, batch = 0, 0, []
+    while budget > 0 and examined < cfg.replication.max_examined and not report.truncated:
+        batch = [r[0] for r in conn.execute(
+            "SELECT file_id FROM temp.under_ids WHERE file_id > ? ORDER BY file_id LIMIT 500",
+            (last_id,))]
+        if not batch:
+            break
+        last_id = batch[-1]
+        for fid in batch:
+            f = under_file(conn, fid, pol)
+            examined += 1
+            if f is None:
+                continue
+            if owners.get(f.good_nodes[0]) != me:
+                continue  # the server holding the first good copy proposes
+            report.responsible += 1
+            pending = active.get(f.file_id, set())
+            need = f.goal - len(f.good_nodes) - len(pending)
+            if need <= 0:
+                report.already_proposed += 1
+                continue
+            declined = conn.execute(
+                "SELECT data FROM wanted WHERE file_id = ? AND reason = ? AND status = 'rejected'"
+                " ORDER BY id DESC LIMIT 1", (fid, REASON)).fetchone()
+            if declined is not None and json.loads(declined[0]).get("hash") == f.hash:
+                report.declined += 1
+                continue
+            chosen: set[str] = set()
+            source = next((n for n in f.good_nodes if owners.get(n) == me), f.good_nodes[0])
+            for _ in range(need):
+                dst, why = planner.choose(f, pending | chosen)
+                if dst is None:
+                    report.no_destination += 1
+                    reasons[why] += 1
+                    if len(report.examples) < 20:
+                        report.examples.append((f.vpath, why))
+                    break
+                chosen.add(dst)
+                pending_rows.append(("copy", f.file_id, source, dst, REASON,
+                                     {"hash": f.hash, "goal": f.goal}))
+                report.proposed += 1
+            if len(pending_rows) >= 2000:
+                flush()
+            if report.proposed >= budget:
+                report.truncated = True
                 break
-            chosen.add(dst)
-            pending_rows.append(("copy", f.file_id, source, dst, REASON,
-                                 {"hash": f.hash, "goal": f.goal}))
-            report.proposed += 1
-        if len(pending_rows) >= 2000:
-            flush()
+        time.sleep(0)   # let the API threads run: this loop is plain Python
     flush()
+    report.examined = examined
+    report.truncated = report.truncated or (
+        examined >= cfg.replication.max_examined and bool(batch))
     report.reasons = dict(reasons)
     report.finished = db.now()
     db.set_meta_tx(conn, "last_plan", json.dumps(report.to_dict()))

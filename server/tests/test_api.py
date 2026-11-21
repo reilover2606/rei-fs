@@ -431,3 +431,19 @@ def test_a_request_that_cannot_open_the_database_is_answered_and_not_leaked(serv
     assert srv.api._requests == {}                      # nothing is left "being served"
     monkeypatch.setattr(dbmod, "open_existing", real)
     assert client.get("/api/status")["connections"]["handshake_failed"] >= 0
+
+
+def test_routine_connection_endings_are_not_logged_or_counted(caplog):
+    import logging
+    from reifs import api as apimod
+    before = dict(apimod.CONNECTION_STATS)
+    with caplog.at_level(logging.INFO, logger="reifs.api"):
+        apimod._connection_problem("dropped", "127.0.0.1", BrokenPipeError("Broken pipe"))
+        apimod._connection_problem("handshake_failed", "127.0.0.1", ConnectionResetError())
+    assert apimod.CONNECTION_STATS == before and caplog.records == []
+    with caplog.at_level(logging.INFO, logger="reifs.api"):
+        apimod._last_summary[0] = 0.0
+        apimod._connection_problem("dropped", "10.0.0.5", OSError("something odd"))
+        apimod._connection_problem("dropped", "10.0.0.5", OSError("again"))
+    assert apimod.CONNECTION_STATS["dropped"] == before["dropped"] + 2
+    assert len(caplog.records) == 1      # at most one summary a minute
