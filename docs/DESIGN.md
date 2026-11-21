@@ -485,6 +485,14 @@ Endpoints (all JSON, under `/api`):
   `reifs fingerprint`, then pins it per `host:port`. A changed fingerprint
   is refused with a warning unless the user explicitly trusts the new one.
   The CA chain and host name are not used.
+* Server calls never run on the interface thread. A background executor
+  (one for reads, one for writes, plus the status poller, each with its own
+  connection sharing one session) runs them and hands results back to the
+  interface thread; loads triggered by the selection are coalesced so only
+  the latest runs. The status bar shows requests that are still waiting.
+  The Overview shows the server's activity and the database lock
+  (`GET status` has a `database` section: free, held by whom for how long,
+  locked by another program, waiting writers, requests being served).
 * Tabs: Overview, Tree, Search, Decisions, Wanted, Jobs, Nodes, Marked,
   Servers. A background thread polls `GET status` every 2 s for the status
   bar and the live Jobs view. Decisions, Wanted and Jobs show every paired

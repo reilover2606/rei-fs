@@ -13,6 +13,10 @@ uv run reifs scan
 uv run reifs serve           # HTTPS API for the client + background work
 ```
 
+While scanning, the server hashes files without holding the database's write
+lock, so other operations are never blocked by a long read; the client's
+Overview shows what it is doing and the lock state.
+
 Press `q` (or Ctrl+C, or send SIGTERM) to stop the server. In a terminal, `q`
 works without Enter; with no terminal (a service, a background job) only the
 signals work. Stopping: the current scan or transfer is

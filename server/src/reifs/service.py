@@ -110,6 +110,12 @@ class Worker:
             for k, v in kw.items():
                 setattr(self._activity, k, v)
 
+    def _scan_progress(self, s, current: str) -> None:
+        text = f"{s.node}: {s.seen:,} files seen, {s.hashed:,} hashed"
+        if current:
+            text += f", {current}"
+        self._progress(text)
+
     def _progress(self, detail: str) -> None:
         with self._lock:
             self._activity.detail = detail
@@ -180,6 +186,7 @@ class Worker:
     def _run(self, conn, task: tuple) -> None:
         kind = task[0]
         state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups"}[kind]
+        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups"}[kind])
         self._set(state=state, detail="", since=db.now())
         if kind == "plan":
             try:
@@ -205,7 +212,7 @@ class Worker:
                 if kind == "scan":
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
-                        progress=lambda s, cur: self._progress(f"{s.seen} files, {s.hashed} hashed"),
+                        progress=self._scan_progress,
                         stop=stop)
                     summary = "; ".join(
                         f"{r.node_name}: +{r.stats.added} ~{r.stats.changed} "
@@ -279,6 +286,7 @@ class Syncer:
                                   " ORDER BY id").fetchall())
 
     def _main(self) -> None:
+        db.set_label("syncing with paired servers")
         conn = db.open_existing(self.cfg.db_path)
         signature = None
         last_own = None

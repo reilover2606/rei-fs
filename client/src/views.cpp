@@ -2,6 +2,8 @@
 // Marked. Each view keeps its own data and talks to the server through the
 // shared Context.
 #include <algorithm>
+#include <cstdio>
+#include <ctime>
 #include <map>
 #include <set>
 
@@ -150,15 +152,14 @@ void tag_paths(Context& ctx, std::vector<std::string> paths, bool recursive, boo
                       (paths.size() == 1 ? paths[0] : std::to_string(paths.size()) + " items");
   ctx.dialogs->ask_text(title, "", [&ctx, paths, recursive, add, done](const std::string& tag) {
     if (tag.empty()) return;
-    ctx.attempt([&] {
-      auto out = ctx.api->post("/api/tags", {{"action", add ? "add" : "remove"},
-                                             {"tag", tag},
-                                             {"paths", paths},
-                                             {"recursive", recursive}});
-      ctx.notify(std::string(add ? "tagged " : "untagged ") +
-                 std::to_string(out.value("changed", 0)) + " file(s)");
-    });
-    done();
+    ctx.send("/api/tags",
+             {{"action", add ? "add" : "remove"}, {"tag", tag}, {"paths", paths},
+              {"recursive", recursive}},
+             [&ctx, add, done](json out) {
+               ctx.notify(std::string(add ? "tagged " : "untagged ") +
+                          std::to_string(out.value("changed", 0)) + " file(s)");
+               done();
+             });
   });
 }
 
@@ -166,39 +167,46 @@ void tag_paths(Context& ctx, std::vector<std::string> paths, bool recursive, boo
 void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::string& tag,
                     bool move) {
   if (paths.empty() && tag.empty()) return;
-  auto nodes = ctx.node_names();
-  if (nodes.empty()) return;
-  auto create = [&ctx, paths, tag, move](const std::string& from, const std::string& to) {
-    ctx.attempt([&] {
+  ctx.get("/api/nodes", [&ctx, paths, tag, move](json out) {
+    std::vector<std::string> nodes;
+    for (const auto& n : out["nodes"]) {
+      std::string label = n.value("name", "");
+      if (!n.value("online", false)) label += " (offline)";
+      nodes.push_back(label);
+    }
+    if (nodes.empty()) return;
+    auto create = [&ctx, paths, tag, move](const std::string& from, const std::string& to) {
       json body = {{"kind", move ? "move" : "copy"}, {"paths", paths}, {"to", to}};
       if (!tag.empty()) body["tag"] = tag;
       if (!from.empty()) body["from"] = from;
-      auto out = ctx.api->post("/api/jobs", body);
-      if (out["job_id"].is_null()) {
-        ctx.notify("nothing to do (already there, or not on the source)");
-      } else {
-        ctx.notify("job #" + std::to_string(out.value("job_id", 0)) + " created with " +
-                   std::to_string(out.value("items", 0)) + " item(s); it runs in the background");
-      }
-    });
-  };
-  std::string what = !tag.empty() ? "files tagged '" + tag + "'"
-                     : paths.size() == 1 ? paths[0]
-                                         : std::to_string(paths.size()) + " items";
-  if (!move) {
-    ctx.dialogs->ask_choice("Copy " + what + " to which node?", nodes,
-                            [create, nodes](int i) { create("", strip_offline(nodes[i])); });
-    return;
-  }
-  ctx.dialogs->ask_choice(
-      "Move " + what + " FROM which node? (its copies get marked for deletion)", nodes,
-      [&ctx, create, nodes, what](int i) {
-        std::string from = strip_offline(nodes[i]);
-        ctx.dialogs->ask_choice("Move " + what + " from " + from + " TO which node?", nodes,
-                                [create, nodes, from](int j) {
-                                  create(from, strip_offline(nodes[j]));
-                                });
+      ctx.send("/api/jobs", body, [&ctx](json out) {
+        if (out["job_id"].is_null()) {
+          ctx.notify("nothing to do (already there, or not on the source)");
+        } else {
+          ctx.notify("job #" + std::to_string(out.value("job_id", 0)) + " created with " +
+                     std::to_string(out.value("items", 0)) +
+                     " item(s); it runs in the background");
+        }
       });
+    };
+    std::string what = !tag.empty() ? "files tagged '" + tag + "'"
+                       : paths.size() == 1 ? paths[0]
+                                           : std::to_string(paths.size()) + " items";
+    if (!move) {
+      ctx.dialogs->ask_choice("Copy " + what + " to which node?", nodes,
+                              [create, nodes](int i) { create("", strip_offline(nodes[i])); });
+      return;
+    }
+    ctx.dialogs->ask_choice(
+        "Move " + what + " FROM which node? (its copies get marked for deletion)", nodes,
+        [&ctx, create, nodes, what](int i) {
+          std::string from = strip_offline(nodes[i]);
+          ctx.dialogs->ask_choice("Move " + what + " from " + from + " TO which node?", nodes,
+                                  [create, nodes, from](int j) {
+                                    create(from, strip_offline(nodes[j]));
+                                  });
+        });
+  });
 }
 
 // Keep the selection on the same item (by key) across refreshes.
@@ -211,6 +219,37 @@ int reselect(const json& items, const std::string& previous, KeyFn keyfn, int fa
 
 // --- Overview ---------------------------------------------------------------------
 
+// Seconds since the epoch of "2026-11-20T21:34:42.786160+00:00" (UTC); 0 if unreadable.
+std::int64_t parse_utc(const std::string& iso) {
+  int y, mo, d, h, mi, sec;
+  if (std::sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &sec) != 6) return 0;
+  std::tm tm{};
+  tm.tm_year = y - 1900;
+  tm.tm_mon = mo - 1;
+  tm.tm_mday = d;
+  tm.tm_hour = h;
+  tm.tm_min = mi;
+  tm.tm_sec = sec;
+#ifdef _WIN32
+  return static_cast<std::int64_t>(_mkgmtime(&tm));
+#else
+  return static_cast<std::int64_t>(timegm(&tm));
+#endif
+}
+
+std::string duration_text(double seconds) {
+  auto total = static_cast<long>(seconds < 0 ? 0 : seconds);
+  char buf[48];
+  if (total < 60)
+    std::snprintf(buf, sizeof buf, "%ld s", total);
+  else if (total < 3600)
+    std::snprintf(buf, sizeof buf, "%ld min %02ld s", total / 60, total % 60);
+  else
+    std::snprintf(buf, sizeof buf, "%ld h %02ld min", total / 3600, (total % 3600) / 60);
+  return buf;
+}
+
+
 class OverviewView : public View {
  public:
   explicit OverviewView(Context& ctx) : ctx_(ctx) {
@@ -220,7 +259,8 @@ class OverviewView : public View {
   std::string title() const override { return "Overview"; }
   Component component() override { return root_; }
   void refresh() override {
-    ctx_.attempt([&] { replication_ = ctx_.api->get("/api/replication"); });
+    ctx_.get("/api/replication", [this](json out) { replication_ = std::move(out); },
+             "overview-replication");
   }
   void on_poll() override {
     if (++polls_ % 15 == 0) refresh();  // the backup plan changes rarely (~30 s)
@@ -232,16 +272,16 @@ class OverviewView : public View {
  private:
   bool on_event(const Event& e) {
     if (key(e, "s")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/scan"); })) ctx_.notify("scan queued");
+      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan queued"); });
       return true;
     }
     if (key(e, "j")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/jobs/run"); })) ctx_.notify("job run queued");
+      ctx_.send("/api/jobs/run", {}, [this](json) { ctx_.notify("job run queued"); });
       return true;
     }
     if (key(e, "p")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/replication/plan"); }))
-        ctx_.notify("backup planning queued");
+      ctx_.send("/api/replication/plan", {},
+                [this](json) { ctx_.notify("backup planning queued"); });
       return true;
     }
     if (key(e, "g")) {
@@ -249,12 +289,17 @@ class OverviewView : public View {
       ctx_.dialogs->ask_text("Good copies every file should have (tag-specific goals: "
                              "[replication] tag_copies in config.toml)",
                              current, [this](const std::string& value) {
-                               ctx_.attempt([&] {
-                                 int n = std::stoi(value);
-                                 ctx_.api->post("/api/replication", {{"copies", n}});
+                               int n = 0;
+                               try {
+                                 n = std::stoi(value);
+                               } catch (...) {
+                                 ctx_.error("not a number: " + value);
+                                 return;
+                               }
+                               ctx_.send("/api/replication", {{"copies", n}}, [this, n](json) {
                                  ctx_.notify("copy goal set to " + std::to_string(n));
+                                 refresh();
                                });
-                               refresh();
                              });
       return true;
     }
@@ -265,17 +310,16 @@ class OverviewView : public View {
                            "will then be made without asking (restores, renames and overwrites "
                            "still wait for you).";
       ctx_.dialogs->confirm(q, [this, on] {
-        ctx_.attempt([&] {
-          ctx_.api->post("/api/replication", {{"auto_replicate", !on}});
+        ctx_.send("/api/replication", {{"auto_replicate", !on}}, [this, on](json) {
           ctx_.notify(std::string("automatic approval ") + (on ? "off" : "on"));
+          refresh();
         });
-        refresh();
       });
       return true;
     }
     if (key(e, "x")) {
       ctx_.dialogs->confirm("Stop the current scan or job run? (progress is kept)", [this] {
-        if (ctx_.attempt([&] { ctx_.api->post("/api/stop"); })) ctx_.notify("stop requested");
+        ctx_.send("/api/stop", {}, [this](json) { ctx_.notify("stop requested"); });
       });
       return true;
     }
@@ -329,15 +373,71 @@ class OverviewView : public View {
              s.value("open_decisions", 0) > 0),
         line("wanted jobs", num("open_wanted"), Color::Cyan, s.value("open_wanted", 0) > 0),
         line("active jobs", num("active_jobs"), Color::Cyan, s.value("active_jobs", 0) > 0),
-        separator(),
-        line("activity", act.value("state", "")),
     };
-    if (!act.value("detail", "").empty()) right.push_back(line("", act.value("detail", "")));
-    if (!act.value("last_result", "").empty())
-      right.push_back(hbox({text(fit("last result", 26)), paragraph(act.value("last_result", ""))}));
+
+    // What the server is busy with, and what the database is doing.
+    Elements work = {text("Activity and database") | bold, separator()};
+    std::string state = act.value("state", "idle");
+    if (state != "idle") {
+      double elapsed = static_cast<double>(std::time(nullptr) - parse_utc(act.value("since", "")));
+      work.push_back(hbox({text(fit("working on", 26)),
+                           text(state + " for " + duration_text(elapsed)) | color(Color::Yellow) |
+                               bold}));
+      if (!act.value("detail", "").empty())
+        work.push_back(hbox({text(fit("", 26)), paragraph(act.value("detail", ""))}));
+      if (act.value("queued", 0) > 0)
+        work.push_back(line("queued after that", std::to_string(act.value("queued", 0))));
+    } else {
+      work.push_back(line("working on", "nothing (idle)"));
+      if (!act.value("last_result", "").empty())
+        work.push_back(hbox({text(fit("last result", 26)), paragraph(act.value("last_result", ""))}));
+    }
     if (!act.value("last_error", "").empty())
-      right.push_back(hbox({text(fit("last error", 26)),
-                            paragraph(act.value("last_error", "")) | color(Color::Red)}));
+      work.push_back(hbox({text(fit("last error", 26)),
+                           paragraph(act.value("last_error", "")) | color(Color::Red)}));
+    json dbs = s.value("database", json::object());
+    if (!dbs.empty()) {
+      std::string lock = dbs.value("lock", "free");
+      if (lock == "free") {
+        work.push_back(hbox({text(fit("database write lock", 26)), text("free") | color(Color::Green)}));
+      } else if (lock == "held") {
+        std::string who;
+        for (const auto& h : dbs["holders"]) {
+          if (!who.empty()) who += ", ";
+          char buf[32];
+          std::snprintf(buf, sizeof buf, " (%.1f s)", h.value("seconds", 0.0));
+          who += h.value("who", "?") + buf;
+        }
+        work.push_back(hbox({text(fit("database write lock", 26)),
+                             paragraph("in use by " + who) | color(Color::Yellow)}));
+      } else {
+        work.push_back(hbox({text(fit("database write lock", 26)),
+                             paragraph("LOCKED by another program (for example a reifs command "
+                                       "running in a terminal)") |
+                                 color(Color::Red) | bold}));
+      }
+      if (!dbs["waiting"].empty()) {
+        double longest = 0;
+        for (const auto& w : dbs["waiting"]) longest = std::max(longest, w.value("seconds", 0.0));
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%zu waiting for it (longest %.1f s)", dbs["waiting"].size(),
+                      longest);
+        work.push_back(hbox({text(fit("writers", 26)),
+                             text(buf) | color(longest > 5 ? Color::Red : Color::Yellow)}));
+      }
+      int requests = dbs.value("requests", 0);
+      char rbuf[96];
+      if (requests > 0)
+        std::snprintf(rbuf, sizeof rbuf, "%d being served (slowest %.1f s)", requests,
+                      dbs.value("slowest_request", 0.0));
+      else
+        std::snprintf(rbuf, sizeof rbuf, "none");
+      work.push_back(line("client requests", rbuf));
+      if (dbs.value("busy_errors", 0) > 0)
+        work.push_back(line("failed: database busy", std::to_string(dbs.value("busy_errors", 0)),
+                            Color::Red, true));
+      work.push_back(text("Reading never waits for the write lock; only changes do.") | dim);
+    }
     std::string goal = std::to_string(replication_.value("copies", 2)) + " copies of every file";
     // Keep the json alive for the loop: .items() on a temporary dangles (C++20).
     json tag_copies = replication_.value("tag_copies", json::object());
@@ -368,7 +468,7 @@ class OverviewView : public View {
       backup.push_back(text("not planned yet (p: plan now)") | dim);
     }
     return vbox({hbox({vbox(left) | flex | border, vbox(right) | flex | border}),
-                 vbox(backup) | border});
+                 vbox(work) | border, vbox(backup) | border});
   }
 
   Context& ctx_;
@@ -387,7 +487,9 @@ class TreeView : public View {
     opt.on_enter = [this] { enter(); };
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
-      return with_detail(list_panel(path_, menu_, labels_.size(), "(empty)"), detail_);
+      return with_detail(list_panel(path_, menu_, labels_.size(),
+                                    loading_ ? "loading..." : "(empty)"),
+                         detail_);
     });
     root_ |= CatchEvent([this](Event e) { return on_event(e); });
   }
@@ -397,32 +499,41 @@ class TreeView : public View {
     return "Enter/→: open  ←/Backspace: up  t/T: tag/untag  c: copy  m: move  r: refresh";
   }
 
-  void refresh() override {
-    std::string keep = current_name();
-    bool ok = ctx_.attempt([&] {
-      try {
-        entries_ = ctx_.api->get("/api/tree?path=" + url_encode(path_))["entries"];
-      } catch (const ApiError& e) {
-        if (e.status != 404 || path_ == "/") throw;
-        path_ = "/";  // the directory disappeared
-        entries_ = ctx_.api->get("/api/tree?path=/")["entries"];
-      }
-    });
-    if (!ok) entries_ = json::array();
-    labels_.clear();
-    for (const auto& e : entries_) {
-      if (e.value("dir", false))
-        labels_.push_back(fit("▸ " + e.value("name", "") + "/", 42) + " " +
-                          std::to_string(e.value("files", 0)) + " files");
-      else
-        labels_.push_back("  " + file_label(e, 40));
-    }
-    selected_ = reselect(entries_, keep, [](const json& e) { return e.value("name", ""); },
-                         selected_);
-    load_detail();
-  }
+  void refresh() override { refresh_selecting(current_name()); }
 
  private:
+  // Load the listing of path_ and, when it arrives, select `name` in it.
+  void refresh_selecting(const std::string& name) {
+    std::string requested = path_;
+    ctx_.run(
+        false, [requested](Api& a) { return a.get("/api/tree?path=" + url_encode(requested)); },
+        [this, requested, name](json out) {
+          if (requested != path_) return;   // the user has gone elsewhere meanwhile
+          loading_ = false;
+          entries_ = out["entries"];
+          labels_.clear();
+          for (const auto& e : entries_) {
+            if (e.value("dir", false))
+              labels_.push_back(fit("▸ " + e.value("name", "") + "/", 42) + " " +
+                                std::to_string(e.value("files", 0)) + " files");
+            else
+              labels_.push_back("  " + file_label(e, 40));
+          }
+          selected_ = reselect(entries_, name,
+                               [](const json& e) { return e.value("name", ""); }, selected_);
+          load_detail();
+        },
+        "tree-list",
+        [this, requested] {
+          if (requested != path_) return;
+          loading_ = false;
+          if (path_ != "/") {   // the directory is gone: go back to the top
+            path_ = "/";
+            refresh_selecting("");
+          }
+        });
+  }
+
   std::string current_name() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(entries_.size())) return "";
     return entries_[selected_].value("name", "");
@@ -448,9 +559,18 @@ class TreeView : public View {
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim});
       return;
     }
-    json f;
-    if (ctx_.attempt([&] { f = ctx_.api->get("/api/file?path=" + url_encode(child_path(e->value("name", "")))); }))
-      detail_ = file_details(f);
+    // Only the detail of the item the user stops on is fetched (same key).
+    std::string path = child_path(e->value("name", ""));
+    ctx_.run(
+        false, [path](Api& a) { return a.get("/api/file?path=" + url_encode(path)); },
+        [this, path](json f) {
+          const json* cur = current();
+          if (!cur || cur->value("dir", false) ||
+              child_path(cur->value("name", "")) != path)
+            return;   // selection moved on
+          detail_ = file_details(f);
+        },
+        "tree-detail");
   }
 
   void enter() {
@@ -458,7 +578,11 @@ class TreeView : public View {
     if (!e || !e->value("dir", false)) return;
     path_ = child_path(e->value("name", ""));
     selected_ = 0;
-    refresh();
+    entries_ = json::array();
+    labels_.clear();
+    detail_ = text("");
+    loading_ = true;
+    refresh_selecting("");
   }
 
   void up() {
@@ -466,9 +590,11 @@ class TreeView : public View {
     auto pos = path_.rfind('/');
     std::string child = path_.substr(pos + 1);
     path_ = pos == 0 ? "/" : path_.substr(0, pos);
-    refresh();
-    selected_ = reselect(entries_, child, [](const json& e) { return e.value("name", ""); }, 0);
-    load_detail();
+    entries_ = json::array();
+    labels_.clear();
+    detail_ = text("");
+    loading_ = true;
+    refresh_selecting(child);
   }
 
   bool on_event(const Event& e) {
@@ -501,6 +627,7 @@ class TreeView : public View {
 
   Context& ctx_;
   std::string path_ = "/";
+  bool loading_ = false;
   json entries_ = json::array();
   std::vector<std::string> labels_;
   int selected_ = 0;
@@ -539,9 +666,10 @@ class SearchView : public View {
           vbox({issues->Render(), under->Render()}),
           button->Render() | vcenter,
       });
-      std::string heading = results_.empty() ? "results"
-                                              : std::to_string(total_) + " result(s)" +
-                                                    (truncated_ ? " (first 1000 shown)" : "");
+      std::string heading = searching_ ? "searching..."
+                            : results_.empty() ? "results"
+                                               : std::to_string(total_) + " result(s)" +
+                                                     (truncated_ ? " (first 1000 shown)" : "");
       return vbox({form_el, hint_->Render(),
                    with_detail(list_panel(heading, menu_, labels_.size(),
                                           "type a pattern and/or a tag, then Enter"),
@@ -559,44 +687,49 @@ class SearchView : public View {
   }
 
   void refresh() override {
-    ctx_.attempt([&] {
+    ctx_.get("/api/tags", [this](json out) {
       tags_line_.clear();
-      json out = ctx_.api->get("/api/tags");  // keep the temporary alive for the loop
       for (const auto& t : out["tags"])
         tags_line_ += t.value("tag", "") + "(" + std::to_string(t.value("files", 0)) + ") ";
       if (tags_line_.empty()) tags_line_ = "(none)";
-    });
-    if (searched_) search();
+    }, "search-tags");
+    if (searched_) search(false);
     leave_inputs();  // arriving on the tab: number keys still switch tabs
   }
 
  private:
+  // Only while this tab is the one on screen: taking the focus of a hidden
+  // tab would switch to it.
   void leave_inputs() {
+    if (!root_->Focused()) return;
     if (!results_.empty())
       menu_->TakeFocus();
     else
       hint_->TakeFocus();
   }
 
-  void search() {
+  // `from_user`: the user pressed Enter, so move on to the results when they come.
+  void search(bool from_user = true) {
     std::string q = "/api/find?q=" + url_encode(query_) + "&tag=" + url_encode(tag_);
     if (issues_) q += "&issues=1";
     if (under_) q += "&under=1";
-    json out;
-    if (!ctx_.attempt([&] { out = ctx_.api->get(q); })) return;
     searched_ = true;
-    results_ = out["files"];
-    total_ = out.value("total", 0);
-    truncated_ = out.value("truncated", false);
-    labels_.clear();
-    for (const auto& f : results_) {
-      json shown = f;
-      shown["name"] = f.value("path", "");
-      labels_.push_back(file_label(shown, 50));
-    }
-    selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
-    load_detail();
-    leave_inputs();
+    searching_ = true;
+    ctx_.get(q, [this, from_user](json out) {
+      searching_ = false;
+      results_ = out["files"];
+      total_ = out.value("total", 0);
+      truncated_ = out.value("truncated", false);
+      labels_.clear();
+      for (const auto& f : results_) {
+        json shown = f;
+        shown["name"] = f.value("path", "");
+        labels_.push_back(file_label(shown, 50));
+      }
+      selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
+      load_detail();
+      if (from_user && typing()) leave_inputs();
+    }, "search");
   }
 
   void load_detail() {
@@ -604,11 +737,16 @@ class SearchView : public View {
       detail_ = text("");
       return;
     }
-    json f;
-    if (ctx_.attempt([&] {
-          f = ctx_.api->get("/api/file?path=" + url_encode(results_[selected_].value("path", "")));
-        }))
-      detail_ = file_details(f);
+    std::string path = results_[selected_].value("path", "");
+    ctx_.run(
+        false, [path](Api& a) { return a.get("/api/file?path=" + url_encode(path)); },
+        [this, path](json f) {
+          if (selected_ < 0 || selected_ >= static_cast<int>(results_.size()) ||
+              results_[selected_].value("path", "") != path)
+            return;   // selection moved on
+          detail_ = file_details(f);
+        },
+        "search-detail");
   }
 
   std::vector<std::string> all_paths() const {
@@ -629,7 +767,7 @@ class SearchView : public View {
     if (!menu_->Focused() || results_.empty()) return false;
     std::string path = results_[selected_].value("path", "");
     if (key(e, "t") || key(e, "T")) {
-      tag_paths(ctx_, {path}, false, key(e, "t"), [this] { search(); });
+      tag_paths(ctx_, {path}, false, key(e, "t"), [this] { search(false); });
       return true;
     }
     if (key(e, "c") || key(e, "m")) {
@@ -649,13 +787,14 @@ class SearchView : public View {
       return true;
     }
     if (key(e, "r")) {
-      search();
+      search(false);
       return true;
     }
     return false;
   }
 
   Context& ctx_;
+  bool searching_ = false;
   std::string query_, tag_, tags_line_;
   bool issues_ = false, under_ = false, searched_ = false, truncated_ = false;
   int total_ = 0;
@@ -715,20 +854,17 @@ class DecisionsView : public View {
   }
 
   void refresh() override {
-    std::string keep = current_key();
-    json out;
-    if (ctx_.attempt([&] { out = ctx_.api->get("/api/decisions?everywhere=1"); })) {
+    ctx_.get("/api/decisions?everywhere=1", [this](json out) {
+      std::string keep = current_key();
       items_ = out["decisions"];
       note_ = unreachable_note(out);
-    } else {
-      items_ = json::array();
-    }
-    labels_.clear();
-    for (const auto& d : items_)
-      labels_.push_back(fit("[" + d.value("kind", "") + "]", 12) + d.value("path", "") +
-                        (d["node"].is_string() ? "  (" + d.value("node", "") + ")" : "") +
-                        where_suffix(ctx_, d));
-    selected_ = reselect(items_, keep, key_of, selected_);
+      labels_.clear();
+      for (const auto& d : items_)
+        labels_.push_back(fit("[" + d.value("kind", "") + "]", 12) + d.value("path", "") +
+                          (d["node"].is_string() ? "  (" + d.value("node", "") + ")" : "") +
+                          where_suffix(ctx_, d));
+      selected_ = reselect(items_, keep, key_of, selected_);
+    }, "decisions");
   }
 
  private:
@@ -752,12 +888,12 @@ class DecisionsView : public View {
     return vbox(rows);
   }
 
-  bool resolve(const json& d, const std::string& option) {
-    return ctx_.attempt([&] {
-      auto out = ctx_.api->post("/api/decisions/" + std::to_string(d.value("id", 0)),
-                                on_server({{"option", option}}, d));
-      ctx_.notify(out.value("summary", "done"));
-    });
+  void resolve(const json& d, const std::string& option) {
+    ctx_.send("/api/decisions/" + std::to_string(d.value("id", 0)),
+              on_server({{"option", option}}, d), [this](json out) {
+                ctx_.notify(out.value("summary", "done"));
+                refresh();
+              });
   }
 
   void decide_current() {
@@ -766,10 +902,7 @@ class DecisionsView : public View {
     std::vector<std::string> labels;
     for (const auto& o : d["options"]) labels.push_back(o.value("label", ""));
     ctx_.dialogs->ask_choice(d.value("summary", "") + "\n" + d.value("path", ""), labels,
-                             [this, d](int i) {
-                               resolve(d, d["options"][i].value("key", ""));
-                               refresh();
-                             });
+                             [this, d](int i) { resolve(d, d["options"][i].value("key", "")); });
   }
 
   void decide_all_of_kind() {
@@ -804,12 +937,35 @@ class DecisionsView : public View {
           ctx_.dialogs->confirm(
               "Really apply \"" + labels[i] + "\" to " + std::to_string(n) + " decision(s)?",
               [this, kind, key = keys[i]] {
-                int done = 0;
-                json all = items_;
-                for (const auto& x : all)
-                  if (x.value("kind", "") == kind) done += resolve(x, key);
-                ctx_.notify("applied to " + std::to_string(done) + " decision(s)");
-                refresh();
+                std::vector<json> targets;
+                for (const auto& x : items_)
+                  if (x.value("kind", "") == kind) targets.push_back(x);
+                // One background job: the decisions are resolved one after the other.
+                ctx_.run(
+                    true,
+                    [targets, key](Api& a) {
+                      int done = 0, failed = 0;
+                      std::string last;
+                      for (const auto& x : targets) {
+                        try {
+                          a.post("/api/decisions/" + std::to_string(x.value("id", 0)),
+                                 on_server({{"option", key}}, x));
+                          ++done;
+                        } catch (const std::exception& e) {
+                          ++failed;
+                          last = e.what();
+                        }
+                      }
+                      return json{{"done", done}, {"failed", failed}, {"last", last}};
+                    },
+                    [this](json out) {
+                      ctx_.notify("applied to " + std::to_string(out.value("done", 0)) +
+                                  " decision(s)");
+                      if (out.value("failed", 0) > 0)
+                        ctx_.error(std::to_string(out.value("failed", 0)) + " failed: " +
+                                   out.value("last", ""));
+                      refresh();
+                    });
               });
         });
   }
@@ -852,20 +1008,17 @@ class WantedView : public View {
   }
 
   void refresh() override {
-    json out;
-    if (ctx_.attempt([&] { out = ctx_.api->get("/api/wanted?everywhere=1"); })) {
+    ctx_.get("/api/wanted?everywhere=1", [this](json out) {
       items_ = out["wanted"];
       total_ = std::max(out.value("total", 0), static_cast<int>(items_.size()));
       note_ = unreachable_note(out);
-    } else {
-      items_ = json::array();
-    }
-    std::set<std::string> still;
-    for (const auto& w : items_)
-      if (checked_.count(key_of(w))) still.insert(key_of(w));
-    checked_ = still;
-    relabel();
-    selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
+      std::set<std::string> still;
+      for (const auto& w : items_)
+        if (checked_.count(key_of(w))) still.insert(key_of(w));
+      checked_ = still;
+      relabel();
+      selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
+    }, "wanted");
   }
 
  private:
@@ -902,31 +1055,45 @@ class WantedView : public View {
     } else {
       groups = targets();
     }
-    int jobs = 0, items = 0, rejected = 0;
-    for (auto& [server, ids] : groups) {
-      json body = {{"action", action}};
-      if (all)
-        body["all"] = true;
-      else
-        body["ids"] = ids;
-      if (!server.empty()) body["server"] = server;
-      ctx_.attempt([&] {
-        auto out = ctx_.api->post("/api/wanted", body);
-        if (out.contains("job_id") && !out["job_id"].is_null()) ++jobs;
-        jobs += out.value("remote_jobs", 0);
-        items += out.value("items", 0);
-        rejected += out.value("rejected", 0);
-        for (const auto& err : out.value("errors", json::array()))
-          ctx_.error(err.get<std::string>());
-      });
-    }
-    if (action == "approve")
-      ctx_.notify(std::to_string(jobs) + " job(s) created with " + std::to_string(items) +
-                  " item(s)");
-    else
-      ctx_.notify("rejected " + std::to_string(rejected) + " proposal(s)");
+    if (groups.empty()) return;
     checked_.clear();
-    refresh();
+    relabel();
+    // One background job: one request per server, one after the other.
+    ctx_.run(
+        true,
+        [action, all, groups](Api& a) {
+          int jobs = 0, items = 0, rejected = 0;
+          json errors = json::array();
+          for (const auto& [server, ids] : groups) {
+            json body = {{"action", action}};
+            if (all)
+              body["all"] = true;
+            else
+              body["ids"] = ids;
+            if (!server.empty()) body["server"] = server;
+            try {
+              json out = a.post("/api/wanted", body);
+              if (out.contains("job_id") && !out["job_id"].is_null()) ++jobs;
+              jobs += out.value("remote_jobs", 0);
+              items += out.value("items", 0);
+              rejected += out.value("rejected", 0);
+              for (const auto& err : out.value("errors", json::array())) errors.push_back(err);
+            } catch (const std::exception& e) {
+              errors.push_back(e.what());
+            }
+          }
+          return json{{"jobs", jobs}, {"items", items}, {"rejected", rejected},
+                      {"errors", errors}};
+        },
+        [this, action](json out) {
+          if (action == "approve")
+            ctx_.notify(std::to_string(out.value("jobs", 0)) + " job(s) created with " +
+                        std::to_string(out.value("items", 0)) + " item(s)");
+          else
+            ctx_.notify("rejected " + std::to_string(out.value("rejected", 0)) + " proposal(s)");
+          for (const auto& err : out["errors"]) ctx_.error(err.get<std::string>());
+          refresh();
+        });
   }
 
   bool on_event(const Event& e) {
@@ -991,25 +1158,20 @@ class JobsView : public View {
   }
 
   void refresh() override {
-    std::string keep = current_key();
-    json out;
-    if (ctx_.attempt([&] {
-          out = ctx_.api->get(all_ ? "/api/jobs?all=1&everywhere=1" : "/api/jobs?everywhere=1");
-        })) {
+    ctx_.get(all_ ? "/api/jobs?all=1&everywhere=1" : "/api/jobs?everywhere=1", [this](json out) {
+      std::string keep = current_key();
       items_ = out["jobs"];
       note_ = unreachable_note(out);
-    } else {
-      items_ = json::array();
-    }
-    labels_.clear();
-    for (const auto& j : items_)
-      labels_.push_back(fit("#" + std::to_string(j.value("id", 0)), 6) +
-                        fit(j.value("status", ""), 10) +
-                        fit(std::to_string(j.value("done", 0)) + "/" +
-                                std::to_string(j.value("total", 0)), 12) +
-                        j.value("description", "") + where_suffix(ctx_, j));
-    selected_ = reselect(items_, keep, key_of, selected_);
-    load_detail();
+      labels_.clear();
+      for (const auto& j : items_)
+        labels_.push_back(fit("#" + std::to_string(j.value("id", 0)), 6) +
+                          fit(j.value("status", ""), 10) +
+                          fit(std::to_string(j.value("done", 0)) + "/" +
+                                  std::to_string(j.value("total", 0)), 12) +
+                          j.value("description", "") + where_suffix(ctx_, j));
+      selected_ = reselect(items_, keep, key_of, selected_);
+      load_detail();
+    }, "jobs");
   }
 
  private:
@@ -1026,16 +1188,19 @@ class JobsView : public View {
       detail_ = text("");
       return;
     }
-    json j;
-    std::string q = server_query(*cur);
-    if (!ctx_.attempt([&] {
-          j = ctx_.api->get("/api/jobs/" + std::to_string(cur->value("id", 0)) +
-                            (q.empty() ? "" : "?" + q));
-        }))
-      return;
+    std::string wanted = key_of(*cur), q = server_query(*cur), server_name = cur->value("server_name", "");
+    std::string path = "/api/jobs/" + std::to_string(cur->value("id", 0)) + (q.empty() ? "" : "?" + q);
+    ctx_.get(path, [this, wanted, server_name](json j) {
+      const json* now = current();
+      if (!now || key_of(*now) != wanted) return;   // selection moved on
+      show_detail(j, server_name);
+    }, "jobs-detail");
+  }
+
+  void show_detail(const json& j, const std::string& server_name) {
     Elements rows = {paragraph(j.value("description", "")) | bold, separator(),
                      label_value("status", j.value("status", "")),
-                     label_value("server", cur->value("server_name", "")),
+                     label_value("server", server_name),
                      label_value("created", j.value("created", "").substr(0, 19))};
     std::string counts;
     for (auto& [k, v] : j["counts"].items()) counts += k + " " + v.dump() + "  ";
@@ -1074,13 +1239,22 @@ class JobsView : public View {
       // Every server runs its own jobs: ask each one shown.
       std::set<std::string> servers = {""};
       for (const auto& j : items_) servers.insert(j.value("server", ""));
-      for (const auto& sid : servers) {
-        if (sid == ctx_.api->server_id()) continue;
-        json body = json::object();
-        if (!sid.empty()) body["server"] = sid;
-        ctx_.attempt([&] { ctx_.api->post("/api/jobs/run", body); });
-      }
-      ctx_.notify("job run queued");
+      std::string me = ctx_.api->server_id();
+      ctx_.run(
+          true,
+          [servers, me](Api& a) {
+            for (const auto& sid : servers) {
+              json body = json::object();
+              if (!sid.empty() && sid != me) body["server"] = sid;
+              else if (!sid.empty()) continue;
+              try {
+                a.post("/api/jobs/run", body);
+              } catch (const std::exception&) {   // an unreachable server is not fatal
+              }
+            }
+            return json::object();
+          },
+          [this](json) { ctx_.notify("job run queued"); });
       return true;
     }
     const json* cur = current();
@@ -1090,21 +1264,19 @@ class JobsView : public View {
     if (key(e, "c")) {
       ctx_.dialogs->confirm("Cancel job #" + id + "? Items already done stay done.",
                             [this, id, item] {
-                              if (ctx_.attempt([&] {
-                                    ctx_.api->post("/api/jobs/" + id + "/cancel",
-                                                   on_server(json::object(), item));
-                                  }))
-                                ctx_.notify("job #" + id + " cancelled");
-                              refresh();
+                              ctx_.send("/api/jobs/" + id + "/cancel",
+                                        on_server(json::object(), item), [this, id](json) {
+                                          ctx_.notify("job #" + id + " cancelled");
+                                          refresh();
+                                        });
                             });
       return true;
     }
     if (key(e, "y")) {
-      ctx_.attempt([&] {
-        auto out = ctx_.api->post("/api/jobs/" + id + "/retry", on_server(json::object(), item));
+      ctx_.send("/api/jobs/" + id + "/retry", on_server(json::object(), item), [this](json out) {
         ctx_.notify("re-queued " + std::to_string(out.value("items", 0)) + " failed item(s)");
+        refresh();
       });
-      refresh();
       return true;
     }
     return false;
@@ -1140,30 +1312,26 @@ class NodesView : public View {
   }
 
   void refresh() override {
-    std::string keep = current_name();
-    json out;
-    if (ctx_.attempt([&] { out = ctx_.api->get("/api/nodes"); })) {
+    ctx_.get("/api/nodes", [this](json out) {
+      std::string keep = current_name();
       items_ = out["nodes"];
       foreign_ = out.value("foreign", json::array());
-    } else {
-      items_ = json::array();
-      foreign_ = json::array();
-    }
-    labels_.clear();
-    for (const auto& n : items_) {
-      std::string state = n.value("online", false) ? (n.value("reachable", true) ? "online"
-                                                                                  : "unreachable")
-                                                   : "offline";
-      labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
-                        fit(state, 12) + fit(n.value("owner", ""), 12) +
-                        fit(std::to_string(n.value("files", 0)) + " files", 14) +
-                        human_size(n.value("bytes", 0)));
-    }
-    for (const auto& f : foreign_)
-      labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
-                        fit(f.value("owner", ""), 12) + "press o to adopt");
-    selected_ = reselect(items_, keep, [](const json& n) { return n.value("name", ""); },
-                         selected_);
+      labels_.clear();
+      for (const auto& n : items_) {
+        std::string state = n.value("online", false)
+                                ? (n.value("reachable", true) ? "online" : "unreachable")
+                                : "offline";
+        labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
+                          fit(state, 12) + fit(n.value("owner", ""), 12) +
+                          fit(std::to_string(n.value("files", 0)) + " files", 14) +
+                          human_size(n.value("bytes", 0)));
+      }
+      for (const auto& f : foreign_)
+        labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
+                          fit(f.value("owner", ""), 12) + "press o to adopt");
+      selected_ = reselect(items_, keep, [](const json& n) { return n.value("name", ""); },
+                           selected_);
+    }, "nodes");
   }
 
  private:
@@ -1206,7 +1374,7 @@ class NodesView : public View {
   bool on_event(const Event& e) {
     if (key(e, "r")) return refresh(), true;
     if (key(e, "S")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/scan"); })) ctx_.notify("scan of all nodes queued");
+      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan of all nodes queued"); });
       return true;
     }
     if (key(e, "n")) {
@@ -1224,13 +1392,13 @@ class NodesView : public View {
             ctx_.dialogs->ask_text("Name of the new node", suggestion,
                                    [this, path](const std::string& name) {
                                      if (name.empty()) return;
-                                     ctx_.attempt([&] {
-                                       auto out = ctx_.api->post("/api/nodes",
-                                                                 {{"path", path}, {"name", name}});
-                                       ctx_.notify("added node " + out.value("name", name) +
-                                                   "; scanning it");
-                                     });
-                                     refresh();
+                                     ctx_.send("/api/nodes", {{"path", path}, {"name", name}},
+                                               [this, name](json out) {
+                                                 ctx_.notify("added node " +
+                                                             out.value("name", name) +
+                                                             "; scanning it");
+                                                 refresh();
+                                               });
                                    });
           });
       return true;
@@ -1244,12 +1412,13 @@ class NodesView : public View {
       ctx_.dialogs->confirm("Make this server the owner of '" + f.value("name", "") +
                                 "' (owned by " + f.value("owner", "") + ")?",
                             [this, f] {
-                              ctx_.attempt([&] {
-                                ctx_.api->post("/api/nodes/" + url_encode(f.value("node_id", "")) +
-                                               "/adopt");
-                                ctx_.notify("adopted " + f.value("name", "") + "; scanning it");
-                              });
-                              refresh();
+                              ctx_.send("/api/nodes/" + url_encode(f.value("node_id", "")) +
+                                            "/adopt",
+                                        {}, [this, f](json) {
+                                          ctx_.notify("adopted " + f.value("name", "") +
+                                                      "; scanning it");
+                                          refresh();
+                                        });
                             });
       return true;
     }
@@ -1259,27 +1428,26 @@ class NodesView : public View {
       ctx_.dialogs->ask_text("New name for node " + name, name,
                              [this, name](const std::string& value) {
                                if (value.empty() || value == name) return;
-                               if (ctx_.attempt([&] {
-                                     ctx_.api->post("/api/nodes/" + url_encode(name),
-                                                    {{"name", value}});
-                                   }))
-                                 ctx_.notify("renamed " + name + " to " + value);
-                               refresh();
+                               ctx_.send("/api/nodes/" + url_encode(name), {{"name", value}},
+                                         [this, name, value](json) {
+                                           ctx_.notify("renamed " + name + " to " + value);
+                                           refresh();
+                                         });
                              });
       return true;
     }
     if (key(e, "s")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/scan", {{"nodes", {name}}}); }))
-        ctx_.notify("scan of " + name + " queued");
+      ctx_.send("/api/scan", {{"nodes", {name}}},
+                [this, name](json) { ctx_.notify("scan of " + name + " queued"); });
       return true;
     }
     if (key(e, "v")) {
       ctx_.dialogs->confirm("Re-hash every file on " + name + "? This reads all its data.",
                             [this, name] {
-                              if (ctx_.attempt([&] {
-                                    ctx_.api->post("/api/scan", {{"nodes", {name}}, {"verify", true}});
-                                  }))
-                                ctx_.notify("verify scan of " + name + " queued");
+                              ctx_.send("/api/scan", {{"nodes", {name}}, {"verify", true}},
+                                        [this, name](json) {
+                                          ctx_.notify("verify scan of " + name + " queued");
+                                        });
                             });
       return true;
     }
@@ -1287,20 +1455,22 @@ class NodesView : public View {
       std::string current = std::to_string(items_[selected_].value("priority", 0));
       ctx_.dialogs->ask_text("Priority of " + name + " (higher = preferred backup target)",
                              current, [this, name](const std::string& value) {
-                               ctx_.attempt([&] {
-                                 ctx_.api->post("/api/nodes/" + url_encode(name),
-                                                {{"priority", std::stoi(value)}});
-                               });
-                               refresh();
+                               int n = 0;
+                               try {
+                                 n = std::stoi(value);
+                               } catch (...) {
+                                 ctx_.error("not a number: " + value);
+                                 return;
+                               }
+                               ctx_.send("/api/nodes/" + url_encode(name), {{"priority", n}},
+                                         [this](json) { refresh(); });
                              });
       return true;
     }
     if (key(e, "t")) {
       bool target = items_[selected_].value("replication_target", true);
-      ctx_.attempt([&] {
-        ctx_.api->post("/api/nodes/" + url_encode(name), {{"replication_target", !target}});
-      });
-      refresh();
+      ctx_.send("/api/nodes/" + url_encode(name), {{"replication_target", !target}},
+                [this](json) { refresh(); });
       return true;
     }
     return false;
@@ -1343,8 +1513,11 @@ class ServersView : public View {
   }
 
   void refresh() override {
-    json out;
-    if (!ctx_.attempt([&] { out = ctx_.api->get("/api/peers"); })) return;
+    ctx_.get("/api/peers", [this](json out) { apply(out); }, "servers");
+  }
+
+ private:
+  void apply(const json& out) {
     self_ = out["self"];
     rows_ = json::array();
     for (auto r : out["requests"]) {
@@ -1373,7 +1546,7 @@ class ServersView : public View {
     selected_ = std::min(selected_, std::max(0, static_cast<int>(rows_.size()) - 1));
   }
 
- private:
+
   const json* current() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(rows_.size())) return nullptr;
     return &rows_[selected_];
@@ -1415,22 +1588,21 @@ class ServersView : public View {
     ctx_.dialogs->ask_text("Address of the server to pair with (HOST[:PORT])", "",
                            [this](const std::string& address) {
       if (address.empty()) return;
-      json info;
-      if (!ctx_.attempt([&] { info = ctx_.api->post("/api/peers/probe", {{"address", address}}); }))
-        return;
-      std::string fp = info.value("fingerprint", "");
-      ctx_.dialogs->ask_choice(
-          "Server '" + info.value("name", "") + "' at " + address +
-              ".\nIts certificate fingerprint is\n" + fp +
-              "\nCompare it with 'reifs fingerprint' on that server.",
-          {"Send a pairing request", "Cancel"}, [this, address, fp](int i) {
-            if (i != 0) return;
-            if (ctx_.attempt([&] {
-                  ctx_.api->post("/api/peers/pair", {{"address", address}, {"fingerprint", fp}});
-                }))
-              ctx_.notify("pairing requested; accept it on the other server");
-            refresh();
-          });
+      ctx_.send("/api/peers/probe", {{"address", address}}, [this, address](json info) {
+        std::string fp = info.value("fingerprint", "");
+        ctx_.dialogs->ask_choice(
+            "Server '" + info.value("name", "") + "' at " + address +
+                ".\nIts certificate fingerprint is\n" + fp +
+                "\nCompare it with 'reifs fingerprint' on that server.",
+            {"Send a pairing request", "Cancel"}, [this, address, fp](int i) {
+              if (i != 0) return;
+              ctx_.send("/api/peers/pair", {{"address", address}, {"fingerprint", fp}},
+                        [this](json) {
+                          ctx_.notify("pairing requested; accept it on the other server");
+                          refresh();
+                        });
+            });
+      });
     });
   }
 
@@ -1445,8 +1617,7 @@ class ServersView : public View {
             "(read-only rsync with rrsync)?",
         {"Close", "Install the peers' keys"}, [this](int i) {
           if (i != 1) return;
-          ctx_.attempt([&] {
-            auto out = ctx_.api->post("/api/peers/authorize", {{"apply", true}});
+          ctx_.send("/api/peers/authorize", {{"apply", true}}, [this](json out) {
             std::string msg = "added " + std::to_string(out.value("added", 0)) + " key(s) to " +
                               out.value("file", "");
             if (!out.value("restricted", false)) msg += " (rrsync not found: NOT restricted)";
@@ -1461,7 +1632,7 @@ class ServersView : public View {
     if (key(e, "p")) return start_pairing(), true;
     if (key(e, "k")) return ssh_key_dialog(), true;
     if (key(e, "s")) {
-      if (ctx_.attempt([&] { ctx_.api->post("/api/peers/sync"); })) ctx_.notify("syncing");
+      ctx_.send("/api/peers/sync", {}, [this](json) { ctx_.notify("syncing"); });
       return true;
     }
     const json* r = current();
@@ -1477,36 +1648,36 @@ class ServersView : public View {
                                    "Fingerprint " + row.value("fingerprint", "")
                              : "Reject this pairing request?";
       ctx_.dialogs->confirm(q, [this, row, accept] {
-        if (ctx_.attempt([&] {
-              ctx_.api->post("/api/peers/requests/" + std::to_string(row.value("id", 0)) +
-                             (accept ? "/accept" : "/reject"));
-            }))
-          ctx_.notify(accept ? "paired with " + row.value("name", "") : "request rejected");
-        refresh();
+        ctx_.send("/api/peers/requests/" + std::to_string(row.value("id", 0)) +
+                      (accept ? "/accept" : "/reject"),
+                  {}, [this, row, accept](json) {
+                    ctx_.notify(accept ? "paired with " + row.value("name", "")
+                                       : "request rejected");
+                    refresh();
+                  });
       });
       return true;
     }
     if (key(e, "t") && row["row"] == "peer") {
       std::string next = row.value("transport", "daemon") == "ssh" ? "daemon" : "ssh";
-      if (ctx_.attempt([&] {
-            ctx_.api->post("/api/peers/" + url_encode(row.value("id", "")) + "/transport",
-                           {{"transport", next}});
-          }))
-        ctx_.notify("files from " + row.value("name", "") + " now come over " +
-                    (next == "ssh" ? "SSH" : "its rsync daemon"));
-      refresh();
+      ctx_.send("/api/peers/" + url_encode(row.value("id", "")) + "/transport",
+                {{"transport", next}}, [this, row, next](json) {
+                  ctx_.notify("files from " + row.value("name", "") + " now come over " +
+                              (next == "ssh" ? "SSH" : "its rsync daemon"));
+                  refresh();
+                });
       return true;
     }
     if (key(e, "d") && row["row"] == "peer") {
       ctx_.dialogs->confirm("Unpair from '" + row.value("name", "") +
                                 "'? Its nodes stay listed but stop updating.",
                             [this, row] {
-                              if (ctx_.attempt([&] {
-                                    ctx_.api->post("/api/peers/" + url_encode(row.value("id", "")) +
-                                                   "/unpair");
-                                  }))
-                                ctx_.notify("unpaired");
-                              refresh();
+                              ctx_.send("/api/peers/" + url_encode(row.value("id", "")) +
+                                            "/unpair",
+                                        {}, [this](json) {
+                                          ctx_.notify("unpaired");
+                                          refresh();
+                                        });
                             });
       return true;
     }
@@ -1554,13 +1725,14 @@ class MarkedView : public View {
   std::string help() const override { return "u: keep (unmark) this copy  U: unmark all  r: refresh"; }
 
   void refresh() override {
-    if (!ctx_.attempt([&] { items_ = ctx_.api->get("/api/marked")["marked"]; }))
-      items_ = json::array();
-    labels_.clear();
-    for (const auto& m : items_)
-      labels_.push_back(fit(m.value("node", ""), 12) + fit(m.value("path", ""), 50) + " " +
-                        human_size(m.value("size", 0)));
-    selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
+    ctx_.get("/api/marked", [this](json out) {
+      items_ = out["marked"];
+      labels_.clear();
+      for (const auto& m : items_)
+        labels_.push_back(fit(m.value("node", ""), 12) + fit(m.value("path", ""), 50) + " " +
+                          human_size(m.value("size", 0)));
+      selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
+    }, "marked");
   }
 
  private:
@@ -1568,21 +1740,19 @@ class MarkedView : public View {
     if (key(e, "r")) return refresh(), true;
     if (key(e, "U")) {
       ctx_.dialogs->confirm("Remove every deletion mark?", [this] {
-        ctx_.attempt([&] {
-          auto out = ctx_.api->post("/api/unmark", {{"all", true}});
+        ctx_.send("/api/unmark", {{"all", true}}, [this](json out) {
           ctx_.notify("unmarked " + std::to_string(out.value("unmarked", 0)) + " cop(ies)");
+          refresh();
         });
-        refresh();
       });
       return true;
     }
     if (key(e, "u") && selected_ >= 0 && selected_ < static_cast<int>(items_.size())) {
-      const json& m = items_[selected_];
-      ctx_.attempt([&] {
-        ctx_.api->post("/api/unmark", {{"paths", {m.value("path", "")}}, {"node", m.value("node", "")}});
-        ctx_.notify("kept " + m.value("path", "") + " on " + m.value("node", ""));
+      std::string path = items_[selected_].value("path", ""), node = items_[selected_].value("node", "");
+      ctx_.send("/api/unmark", {{"paths", {path}}, {"node", node}}, [this, path, node](json) {
+        ctx_.notify("kept " + path + " on " + node);
+        refresh();
       });
-      refresh();
       return true;
     }
     return false;

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 
@@ -129,31 +130,141 @@ void Dialogs::info(const std::string& title, const std::string& body) {
   open(escape_closes(view, [this] { finish(nullptr); }));
 }
 
-// --- context -----------------------------------------------------------------------
+// --- background executor ---------------------------------------------------------
 
-bool Context::attempt(const std::function<void()>& fn) {
-  try {
-    fn();
-    return true;
-  } catch (const UntrustedCertificate&) {
-    error("the server certificate changed; reconnect to review it");
-  } catch (const std::exception& e) {
-    error(e.what());
+Executor::Executor() : thread_([this] { loop(); }) {}
+
+Executor::~Executor() { stop(); }
+
+void Executor::submit(const std::string& key, std::function<void()> job,
+                      std::function<void()> on_dropped) {
+  std::vector<std::function<void()>> dropped;
+  {
+    std::lock_guard lock(mutex_);
+    if (stopping_) return;
+    if (!key.empty()) {
+      for (auto it = queue_.begin(); it != queue_.end();) {
+        if (it->key == key) {
+          if (it->on_dropped) dropped.push_back(std::move(it->on_dropped));
+          it = queue_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    queue_.push_back({key, std::move(job), std::move(on_dropped)});
   }
-  return false;
+  wake_.notify_one();
+  for (auto& d : dropped) d();
 }
 
-std::vector<std::string> Context::node_names() {
-  std::vector<std::string> names;
-  attempt([&] {
-    json out = api->get("/api/nodes");  // keep the temporary alive for the loop
-    for (const auto& n : out["nodes"]) {
-      std::string label = n.value("name", "");
-      if (!n.value("online", false)) label += " (offline)";
-      names.push_back(label);
+void Executor::stop() {
+  std::vector<Item> left;
+  {
+    std::lock_guard lock(mutex_);
+    stopping_ = true;
+    left.swap(queue_);
+  }
+  wake_.notify_all();
+  if (thread_.joinable()) thread_.join();
+  for (auto& item : left)
+    if (item.on_dropped) item.on_dropped();
+}
+
+void Executor::loop() {
+  for (;;) {
+    Item item;
+    {
+      std::unique_lock lock(mutex_);
+      wake_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (stopping_) return;
+      item = std::move(queue_.front());
+      queue_.erase(queue_.begin());
     }
-  });
-  return names;
+    item.job();
+  }
+}
+
+// --- context -----------------------------------------------------------------------
+
+void Context::start_workers(Api& main, std::function<void(std::function<void()>)> post) {
+  post_ = std::move(post);
+  read_api_ = main.spawn();
+  write_api_ = main.spawn();
+  closing_ = false;
+}
+
+void Context::stop_workers() {
+  closing_ = true;
+  read_exec_.stop();
+  write_exec_.stop();
+}
+
+void Context::finish(std::uint64_t id) {
+  std::lock_guard lock(pending_mutex_);
+  pending_.erase(id);
+}
+
+int Context::pending() const {
+  std::lock_guard lock(pending_mutex_);
+  return static_cast<int>(pending_.size());
+}
+
+double Context::oldest_pending_seconds() const {
+  std::lock_guard lock(pending_mutex_);
+  if (pending_.empty()) return 0;
+  auto oldest = std::min_element(pending_.begin(), pending_.end(),
+                                 [](auto& a, auto& b) { return a.second < b.second; });
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - oldest->second).count();
+}
+
+void Context::run(bool write, std::function<json(Api&)> work, std::function<void(json)> done,
+                  const std::string& key, std::function<void()> on_error) {
+  if (closing_ || !read_api_) return;
+  std::uint64_t id;
+  {
+    std::lock_guard lock(pending_mutex_);
+    id = ++next_id_;
+    pending_[id] = std::chrono::steady_clock::now();
+  }
+  Api* api = (write ? write_api_ : read_api_).get();
+  auto job = [this, api, id, work = std::move(work), done = std::move(done),
+              on_error]() mutable {
+    json result;
+    std::string failure;
+    try {
+      result = work(*api);
+    } catch (const ApiError& e) {
+      failure = e.status == 401 ? "the session expired; reconnecting, try again in a moment"
+                                : e.what();
+    } catch (const UntrustedCertificate&) {
+      failure = "the server certificate changed; reconnect to review it";
+    } catch (const std::exception& e) {
+      failure = e.what();
+    }
+    if (closing_) return;
+    post_([this, id, result = std::move(result), failure, done = std::move(done), on_error] {
+      finish(id);
+      if (!failure.empty()) {
+        error(failure);
+        if (on_error) on_error();
+      } else if (done) {
+        done(result);
+      }
+    });
+  };
+  // A job dropped in favour of a newer one with the same key is simply forgotten.
+  (write ? write_exec_ : read_exec_).submit(key, std::move(job), [this, id] { finish(id); });
+}
+
+void Context::get(const std::string& path, std::function<void(json)> done,
+                  const std::string& key) {
+  run(false, [path](Api& a) { return a.get(path); }, std::move(done), key);
+}
+
+void Context::send(const std::string& path, json body, std::function<void(json)> done) {
+  run(true, [path, body = std::move(body)](Api& a) { return a.post(path, body); },
+      std::move(done));
 }
 
 json Context::status() const {
@@ -217,6 +328,8 @@ class App {
     auto pages = Container::Tab({login, main_holder_}, &page_);
     auto root = dialogs_.wrap(pages);
     screen_.Loop(root);
+    stop_poller();
+    ctx_.stop_workers();
     if (api_) api_->logout();
     return 0;
   }
@@ -327,6 +440,7 @@ class App {
     }
     ctx_.api = api_.get();
     ctx_.connected_at = std::chrono::steady_clock::now();
+    ctx_.start_workers(*api_, [this](std::function<void()> task) { screen_.Post(std::move(task)); });
     build_main();
     page_ = 1;
     start_poller();
@@ -363,6 +477,7 @@ class App {
         return true;
       }
     }
+    if (e == Event::Special("tick")) return true;   // just a redraw
     if (e == Event::Custom) {
       views_[tab_]->on_poll();
       return true;
@@ -402,6 +517,12 @@ class App {
     std::string state = act.value("state", "?");
     std::string detail = act.value("detail", "");
     Elements bar = {text(" " + api_->server_name() + " ") | inverted};
+    // The Overview tab has the full detail; the bar only gets a short version.
+    if (!detail.empty()) {
+      std::string shortened = fit(detail, 28);
+      while (!shortened.empty() && shortened.back() == ' ') shortened.pop_back();
+      detail = shortened;
+    }
     auto activity = text(" " + state + (detail.empty() ? "" : ": " + detail) + " ");
     bar.push_back(state == "idle" ? activity : activity | color(Color::Yellow));
     auto count = [&](const char* key, const char* label, Color c) {
@@ -422,6 +543,15 @@ class App {
       bar.push_back(text(" pairing request! ") | color(Color::Yellow) | bold);
     if (!act.value("last_error", "").empty())
       bar.push_back(text(" " + act.value("last_error", "") + " ") | color(Color::Red));
+    if (int n = ctx_.pending(); n > 0) {
+      double waited = ctx_.oldest_pending_seconds();
+      if (waited >= 0.5) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " waiting for the server (%d, %.0f s) ", n, waited);
+        auto t = text(buf);
+        bar.push_back(waited > 5 ? t | color(Color::Red) | bold : t | color(Color::Yellow));
+      }
+    }
     if (auto err = poll_error(); !err.empty())
       bar.push_back(text(" " + err + " ") | color(Color::Red));
 
@@ -446,31 +576,39 @@ class App {
 
   void start_poller() {
     poller_running_ = true;
+    poll_api_ = api_->spawn();
     poller_ = std::thread([this] {
-      while (poller_running_) {
-        try {
-          ctx_.set_status(api_->get("/api/status"));
-          set_poll_error("");
-        } catch (const ApiError& e) {
-          if (e.status == 401) {
-            // The server restarted and forgot our session: log in again.
-            try {
-              api_->login(password_);
-              set_poll_error("");
-            } catch (const std::exception& e2) {
-              set_poll_error(std::string("session lost: ") + e2.what());
-            }
-          } else {
-            set_poll_error(e.what());
-          }
-        } catch (const std::exception& e) {
-          set_poll_error(e.what());
-        }
-        screen_.PostEvent(Event::Custom);
+      for (int tick = 0; poller_running_; ++tick) {
+        if (tick % 2 == 0) poll_status();
+        // A redraw every second (the "waiting for the server" counter), and
+        // every other second the views get their periodic refresh.
+        screen_.PostEvent(tick % 2 == 0 ? Event::Custom : Event::Special("tick"));
         std::unique_lock lock(poller_mutex_);
-        poller_cv_.wait_for(lock, std::chrono::seconds(2), [this] { return !poller_running_; });
+        poller_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return !poller_running_; });
       }
     });
+  }
+
+  void poll_status() {
+    try {
+      ctx_.set_status(poll_api_->get("/api/status"));
+      set_poll_error("");
+    } catch (const ApiError& e) {
+      if (e.status == 401) {
+        // The server restarted and forgot our session: log in again (the
+        // new token is shared by every connection).
+        try {
+          poll_api_->login(password_);
+          set_poll_error("");
+        } catch (const std::exception& e2) {
+          set_poll_error(std::string("session lost: ") + e2.what());
+        }
+      } else {
+        set_poll_error(e.what());
+      }
+    } catch (const std::exception& e) {
+      set_poll_error(e.what());
+    }
   }
 
   void set_poll_error(const std::string& e) { ctx_.set_poll_error(e); }
@@ -497,6 +635,7 @@ class App {
   int tab_ = 0;
   std::string host_, port_str_, password_, login_message_;
   Notice notice_;
+  std::unique_ptr<Api> poll_api_;
   std::thread poller_;
   std::atomic<bool> poller_running_{false};
   std::mutex poller_mutex_;

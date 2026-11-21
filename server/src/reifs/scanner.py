@@ -33,6 +33,8 @@ from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
 
 BATCH_FILES = 500
 BATCH_SECONDS = 1.0
+REPORT_SECONDS = 0.3        # progress callback at least this often
+BIG_FILE = 16 << 20         # announce files from this size on before hashing them
 MAX_STORED_ERRORS = 1000
 
 
@@ -64,6 +66,7 @@ class Ignorer:
 
 @dataclass
 class ScanStats:
+    node: str = ""
     seen: int = 0
     hashed: int = 0
     added: int = 0
@@ -179,7 +182,7 @@ def scan_node(
             (node_id, db.now()),
         ).lastrowid
 
-    stats = ScanStats()
+    stats = ScanStats(node=node["name"])
     ignorer = Ignorer(cfg.scan)
     walker = _Walker(root, ignorer)
     existing: dict[str, sqlite3.Row] = {
@@ -207,18 +210,18 @@ def scan_node(
     # every other writer (the API, the sync thread) for that long. Results
     # are collected and written in short batches.
     batch: list[tuple] = []
-    last_flush = time.monotonic()
+    last_flush = last_report = time.monotonic()
 
     def flush(current: str = "") -> None:
         nonlocal last_flush
         if batch:
-            with db.transaction(conn):
+            with db.transaction(conn, "scan: saving results"):
                 for args in batch:
                     _process_file(conn, node_id, scan_id, *args, stats, touched)
             batch.clear()
             if progress:
                 progress(stats, current)
-        last_flush = time.monotonic()
+        last_flush = last_report = time.monotonic()
 
     try:
         for vpath, phys, size, mtime_ns in walker.walk():
@@ -232,6 +235,8 @@ def scan_node(
                     batch.append((vpath, size, mtime_ns, row, None))   # it came back
                 h = None
             else:
+                if progress and size >= BIG_FILE:   # a long silent read: say so
+                    progress(stats, f"hashing {vpath} ({size / 2**20:,.0f} MiB)")
                 try:
                     h = hash_file(phys)
                 except OSError as e:
@@ -241,6 +246,8 @@ def scan_node(
                 batch.append((vpath, size, mtime_ns, row, h))
             if len(batch) >= BATCH_FILES or (batch and time.monotonic() - last_flush > BATCH_SECONDS):
                 flush(vpath)
+            elif progress and time.monotonic() - last_report > REPORT_SECONDS:
+                progress(stats, vpath)
         flush()
     except BaseException as exc:
         try:
@@ -252,7 +259,7 @@ def scan_node(
 
     # --- phase 2: vanished copies, renames, pruning ---------------------------
     vanished, to_forget = _find_vanished(root, existing, seen, walker, ignorer)
-    with db.transaction(conn):
+    with db.transaction(conn, "scan: reconciling changes"):
         prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched)
         for fid in touched:
             if conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone():

@@ -7,6 +7,7 @@ errors are ``{"error": "..."}`` with a 4xx/5xx status.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -131,6 +132,10 @@ class Api:
         self.worker = worker
         self.syncer = syncer
         self.pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="reifs-peer")
+        self.busy_timeout = 10.0   # seconds a request waits for the write lock
+        self._request_ids = itertools.count(1)
+        self._requests: dict[int, float] = {}      # requests being served now -> start
+        self._requests_lock = threading.Lock()
         self.tokens: dict[str, float] = {}
         self.tokens_lock = threading.Lock()
         self.server_id = ""
@@ -228,6 +233,24 @@ class Api:
 
     # --- status and nodes -----------------------------------------------------------
 
+    def database_status(self) -> dict:
+        """What the database is doing: write lock, waiting writers, requests."""
+        act = db.lock_activity()
+        free = db.probe_lock(self.cfg.db_path)
+        if act["holders"]:
+            lock = "held"            # by something in this server
+        elif not free:
+            lock = "locked"          # by another process (e.g. a reifs command)
+        else:
+            lock = "free"
+        now = time.monotonic()
+        with self._requests_lock:
+            others = sorted((now - t for t in self._requests.values()), reverse=True)[:-1] \
+                if self._requests else []
+        return {"lock": lock, "holders": act["holders"], "waiting": act["waiting"],
+                "busy_errors": act["busy_errors"],
+                "requests": len(others), "slowest_request": round(others[0], 2) if others else 0}
+
     def status(self, conn, q, body, **_):
         s = queries.status(conn, replication.policy(self.cfg))
         online, total = conn.execute(
@@ -249,6 +272,7 @@ class Api:
             "peers_online": conn.execute("SELECT COUNT(*) FROM servers WHERE paired = 1"
                                          " AND online = 1").fetchone()[0],
             "auto_replicate": self.cfg.server.auto_replicate,
+            "database": self.database_status(),
             "pair_requests": conn.execute(
                 "SELECT COUNT(*) FROM pair_requests WHERE direction = 'in' AND status = 'pending'"
             ).fetchone()[0],
@@ -764,7 +788,11 @@ class Api:
         except ValueError as e:
             return 400, {"error": f"bad JSON body: {e}"}
         # A client waits for the answer: report a busy database after 10 s, not 30.
-        conn = db.open_existing(self.cfg.db_path, timeout=10)
+        db.set_label(f"{method} {parts.path}")
+        token_id = next(self._request_ids)
+        with self._requests_lock:
+            self._requests[token_id] = time.monotonic()
+        conn = db.open_existing(self.cfg.db_path, timeout=self.busy_timeout)
         try:
             # Who is calling: the client (bearer token) or a paired server.
             header = headers.get("Authorization")
@@ -800,11 +828,15 @@ class Api:
         except USER_ERRORS as e:
             return 400, {"error": str(e).strip("'\"")}
         except sqlite3.OperationalError as e:
+            db.note_busy_error()
             log.warning("database busy: %s", e)
             return 503, {"error": "the server is busy (its database is locked by another operation); "
                                    f"try again in a moment ({e})"}
         finally:
             conn.close()
+            db.set_label(None)
+            with self._requests_lock:
+                self._requests.pop(token_id, None)
 
 
 # --- HTTP plumbing -------------------------------------------------------------------

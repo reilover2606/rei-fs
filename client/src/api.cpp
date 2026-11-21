@@ -49,7 +49,25 @@ std::string fingerprint_of(const unsigned char* der, std::size_t size) {
 }
 
 Api::Api(std::string host, int port, std::string pinned)
-    : host_(std::move(host)), port_(port), pinned_(std::move(pinned)) {}
+    : host_(std::move(host)), port_(port), session_(std::make_shared<Session>()) {
+  session_->pinned = std::move(pinned);
+}
+
+std::unique_ptr<Api> Api::spawn() const {
+  auto other = std::make_unique<Api>(host_, port_);
+  other->session_ = session_;
+  return other;
+}
+
+std::string Api::pinned() const {
+  std::lock_guard lock(session_->mutex);
+  return session_->pinned;
+}
+
+std::string Api::token() const {
+  std::lock_guard lock(session_->mutex);
+  return session_->token;
+}
 
 Api::~Api() = default;
 
@@ -71,7 +89,8 @@ void Api::ensure_client() {
     httplib::tls::free_cert(cert);
     if (!ok) return httplib::SSLVerifierResponse::CertificateRejected;
     seen_ = fingerprint_of(der.data(), der.size());
-    return (!pinned_.empty() && seen_ == pinned_)
+    std::string pin = pinned();
+    return (!pin.empty() && seen_ == pin)
                ? httplib::SSLVerifierResponse::CertificateAccepted
                : httplib::SSLVerifierResponse::CertificateRejected;
   });
@@ -92,17 +111,20 @@ std::string Api::probe() {
 }
 
 void Api::set_pinned(const std::string& fingerprint) {
+  {
+    std::lock_guard lock(session_->mutex);
+    session_->pinned = fingerprint;
+  }
   std::lock_guard lock(mutex_);
-  pinned_ = fingerprint;
   client_.reset();  // reconnect with the new pin
 }
 
 void Api::login(const std::string& password) {
   auto out = post("/api/login", json{{"password", password}});
-  std::lock_guard lock(mutex_);
-  token_ = out.value("token", "");
-  server_name_ = out.contains("server") ? out["server"].value("name", "") : "";
-  server_id_ = out.contains("server") ? out["server"].value("id", "") : "";
+  std::lock_guard lock(session_->mutex);
+  session_->token = out.value("token", "");
+  session_->server_name = out.contains("server") ? out["server"].value("name", "") : "";
+  session_->server_id = out.contains("server") ? out["server"].value("id", "") : "";
 }
 
 void Api::logout() {
@@ -110,18 +132,18 @@ void Api::logout() {
     post("/api/logout");
   } catch (const std::exception&) {
   }
-  std::lock_guard lock(mutex_);
-  token_.clear();
+  std::lock_guard lock(session_->mutex);
+  session_->token.clear();
 }
 
 std::string Api::server_id() const {
-  std::lock_guard lock(mutex_);
-  return server_id_;
+  std::lock_guard lock(session_->mutex);
+  return session_->server_id;
 }
 
 std::string Api::server_name() const {
-  std::lock_guard lock(mutex_);
-  return server_name_;
+  std::lock_guard lock(session_->mutex);
+  return session_->server_name;
 }
 
 json Api::get(const std::string& path) { return request("GET", path, nullptr); }
@@ -137,7 +159,7 @@ json Api::request(const std::string& method, const std::string& path, const json
   double waited_for_lock = elapsed();
   ensure_client();
   httplib::Headers headers;
-  if (!token_.empty()) headers.emplace("Authorization", "Bearer " + token_);
+  if (auto t = token(); !t.empty()) headers.emplace("Authorization", "Bearer " + t);
   httplib::Result res = method == "GET"
                             ? client_->Get(path, headers)
                             : client_->Post(path, headers, body->dump(), "application/json");
