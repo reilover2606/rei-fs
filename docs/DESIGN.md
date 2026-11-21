@@ -343,6 +343,14 @@ a name that merge combines with and preserve avoids.
   link, name not valid UTF-8, another node's folder, not scanned yet, ...), and what
   the index lists that is no longer on disk.
 
+### 5.8 Keeping the client responsive
+
+Lists that grow with use (decisions, deletion marks, proposals) are never sent whole: the
+client asks for a page (`limit`) and gets `total` too, and says "showing N of M". The counting for a
+directory listing is done by SQLite, and a paired server already known to be unreachable is not
+asked again by every refresh. Everything a refresh costs should depend on what is on screen,
+not on how long the server has been in use.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

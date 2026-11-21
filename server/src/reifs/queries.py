@@ -109,14 +109,18 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     lo, hi = paths.prefix_range(vdir) if vdir != "/" else ("/", "0")
     dirs: dict[str, int] = {}
     files: list[DirEntry] = []
-    for r in conn.execute("SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ?",
-                          (lo, hi)):
-        rest = r["vpath"][len(lo):]
-        head, sep, _ = rest.partition("/")
-        if sep:
-            dirs[head] = dirs.get(head, 0) + 1
-        else:
-            files.append(DirEntry(head, False, 1, file_info(conn, r["id"], policy)))
+    # The counting is done by SQLite: a directory with a million files below it
+    # must not be pulled through Python for every refresh of the client.
+    start = len(lo) + 1   # 1-based position of the part after the directory
+    for head, n in conn.execute(
+        "SELECT substr(vpath, ?1, instr(substr(vpath, ?1), '/') - 1) AS head, COUNT(*)"
+        " FROM files WHERE vpath >= ?2 AND vpath < ?3 AND instr(substr(vpath, ?1), '/') > 0"
+        " GROUP BY head", (start, lo, hi)):
+        dirs[head] = n
+    for r in conn.execute(
+        "SELECT id, vpath FROM files WHERE vpath >= ?2 AND vpath < ?3"
+        " AND instr(substr(vpath, ?1), '/') = 0", (start, lo, hi)):
+        files.append(DirEntry(r["vpath"][len(lo):], False, 1, file_info(conn, r["id"], policy)))
     # Directories made by the user show even when empty.
     for d in vdirs.under(conn, vdir, include_self=False):
         head = d[len(lo):].partition("/")[0]

@@ -489,8 +489,13 @@ class Api:
 
     def list_decisions(self, conn, q, body, caller=None, **_):
         names = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM nodes")}
-        items = [decision_json(d, names) for d in decisions.list_decisions(conn)]
-        return self._everywhere(conn, q, caller, "/api/decisions", "decisions", items)
+        limit = min(int(q.get("limit", 0) or 0), 5000) or None   # None: all (the CLI, scripts)
+        items = [decision_json(d, names) for d in decisions.list_decisions(conn, limit=limit)]
+        total = decisions.count_decisions(conn)
+        path = "/api/decisions" + (f"?limit={limit}" if limit else "")
+        result = self._everywhere(conn, q, caller, path, "decisions", items)
+        result["total"] = total
+        return result
 
     def resolve_decision(self, conn, q, body, id, **_):
         summary = decisions.resolve(conn, int(id), str(body.get("option", "")))
@@ -691,8 +696,10 @@ class Api:
     # --- deletion marks ------------------------------------------------------------
 
     def list_marked(self, conn, q, body, **_):
-        rows = jobs.marked_copies(conn, q.get("node") or None)
-        return {"marked": [{
+        limit = min(int(q.get("limit", 0) or 0), 20000) or None
+        rows = jobs.marked_copies(conn, q.get("node") or None, limit)
+        total, size = jobs.marked_totals(conn, q.get("node") or None)
+        return {"total": total, "total_size": size, "marked": [{
             "path": r["vpath"], "node": r["node_name"], "online": bool(r["online"]),
             "size": r["size"],
             "physical": str(to_physical(r["root_path"], r["vpath"])) if r["root_path"] else "",
@@ -714,8 +721,14 @@ class Api:
         out = {key: items, "unreachable": []}
         if q.get("everywhere") != "1" or caller != "client":
             return out
-        targets = [(p["id"], p["name"], peers.client_for(conn, p["id"], timeout=6))
-                   for p in peers.paired_peers(conn)]
+        # A server the sync thread already found unreachable is not asked again
+        # (every refresh would wait for the connection to time out).
+        targets = []
+        for p in peers.paired_peers(conn):
+            if p["online"]:
+                targets.append((p["id"], p["name"], peers.client_for(conn, p["id"], timeout=4)))
+            else:
+                out["unreachable"].append(p["name"])
 
         def fetch(target):
             sid, name, client = target

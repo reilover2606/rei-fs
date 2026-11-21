@@ -313,7 +313,19 @@ def retry_job(conn: sqlite3.Connection, job_id: int) -> int:
 # --- deletion marks -----------------------------------------------------------
 
 
-def marked_copies(conn: sqlite3.Connection, node: str | None = None) -> list[sqlite3.Row]:
+def marked_totals(conn: sqlite3.Connection, node: str | None = None) -> tuple[int, int]:
+    q = ("SELECT COUNT(*), IFNULL(SUM(c.size), 0) FROM copies c JOIN nodes n ON n.id = c.node_id"
+         " WHERE c.marked_delete = 1")
+    args: list = []
+    if node:
+        q += " AND (n.name = ? OR n.id = ?)"
+        args += [node, node]
+    r = conn.execute(q, args).fetchone()
+    return r[0], r[1]
+
+
+def marked_copies(conn: sqlite3.Connection, node: str | None = None,
+                  limit: int | None = None) -> list[sqlite3.Row]:
     q = ("SELECT f.vpath, n.name AS node_name, n.root_path, n.online, c.size, c.file_id,"
          " c.node_id FROM copies c JOIN files f ON f.id = c.file_id"
          " JOIN nodes n ON n.id = c.node_id WHERE c.marked_delete = 1")
@@ -321,7 +333,11 @@ def marked_copies(conn: sqlite3.Connection, node: str | None = None) -> list[sql
     if node:
         q += " AND (n.name = ? OR n.id = ?)"
         args += [node, node]
-    return conn.execute(q + " ORDER BY n.name, f.vpath", args).fetchall()
+    q += " ORDER BY n.name, f.vpath"
+    if limit:
+        q += " LIMIT ?"
+        args.append(limit)
+    return conn.execute(q, args).fetchall()
 
 
 def unmark(conn: sqlite3.Connection, vpaths: list[str], node: str | None) -> int:

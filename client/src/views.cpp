@@ -1122,10 +1122,15 @@ class DecisionsView : public View {
   }
 
   void refresh() override {
-    ctx_.get("/api/decisions?everywhere=1", [this](json out) {
+    ctx_.get("/api/decisions?everywhere=1&limit=500", [this](json out) {
       std::string keep = current_key();
       items_ = out["decisions"];
       note_ = unreachable_note(out);
+      int total = out.value("total", 0);
+      if (total > static_cast<int>(items_.size()))
+        note_ += (note_.empty() ? "" : "  ") + std::string("showing the oldest ") +
+                 std::to_string(items_.size()) + " of " + std::to_string(total) +
+                 " on this server; decide some to see more";
       labels_.clear();
       for (const auto& d : items_)
         labels_.push_back(fit("[" + d.value("kind", "") + "]", 12) + d.value("path", "") +
@@ -2081,10 +2086,11 @@ class MarkedView : public View {
   explicit MarkedView(Context& ctx) : ctx_(ctx) {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
-      std::int64_t total = 0;
-      for (const auto& m : items_) total += m.value("size", std::int64_t{0});
-      auto list = list_panel(std::to_string(items_.size()) + " cop(ies) marked for deletion, " +
-                                 human_size(total),
+      auto list = list_panel(std::to_string(total_) + " cop(ies) marked for deletion, " +
+                                 human_size(total_size_) +
+                                 (total_ > static_cast<int>(items_.size())
+                                      ? " (first " + std::to_string(items_.size()) + " shown)"
+                                      : ""),
                              menu_, labels_.size(), "nothing is marked for deletion");
       Element detail = text("");
       if (selected_ >= 0 && selected_ < static_cast<int>(items_.size())) {
@@ -2106,8 +2112,10 @@ class MarkedView : public View {
   std::string help() const override { return "u: keep (unmark) this copy  U: unmark all  r: refresh"; }
 
   void refresh() override {
-    ctx_.get("/api/marked", [this](json out) {
+    ctx_.get("/api/marked?limit=1000", [this](json out) {
       items_ = out["marked"];
+      total_ = out.value("total", static_cast<int>(items_.size()));
+      total_size_ = out.value("total_size", std::int64_t{0});
       labels_.clear();
       for (const auto& m : items_)
         labels_.push_back(fit(m.value("node", ""), 12) + fit(m.value("path", ""), 50) + " " +
@@ -2139,6 +2147,8 @@ class MarkedView : public View {
     return false;
   }
 
+  int total_ = 0;
+  std::int64_t total_size_ = 0;
   Context& ctx_;
   json items_ = json::array();
   std::vector<std::string> labels_;
