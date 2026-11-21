@@ -8,6 +8,7 @@
 #include <string>
 
 #include <ftxui/screen/string.hpp>
+#include <nlohmann/json.hpp>
 
 #include "../src/api.hpp"
 #include "../src/format.hpp"
@@ -28,6 +29,11 @@ static void test_format() {
   CHECK(reifs::human_size(1023) == "1023 B");
   CHECK(reifs::human_size(1536) == "1.5 KiB");
   CHECK(reifs::human_size(5LL * 1024 * 1024 * 1024) == "5.0 GiB");
+  {  // sizes beyond 2 GiB must not wrap (value() with a plain 0 default is an int)
+    auto j = nlohmann::json::parse(R"({"size": 6442450944, "bytes": 3000000000})");
+    CHECK(reifs::human_size(j.value("size", std::int64_t{0})) == "6.0 GiB");
+    CHECK(reifs::human_size(j.value("bytes", std::int64_t{0})) == "2.8 GiB");
+  }
   CHECK(reifs::url_encode("/a b/c?d&e") == "/a%20b/c%3Fd%26e");
   CHECK(reifs::fit("abc", 5) == "abc  ");
   CHECK(reifs::fit("abcdefgh", 5) == "abcd~");

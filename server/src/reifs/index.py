@@ -134,6 +134,14 @@ def log_tag(conn: sqlite3.Connection, fid: int, tag: str) -> None:
                                     "updated": r["updated"], "updated_by": r["updated_by"]})
 
 
+def log_vdir(conn: sqlite3.Connection, vpath: str) -> None:
+    r = conn.execute("SELECT present, updated, updated_by FROM vdirs WHERE vpath = ?",
+                     (vpath,)).fetchone()
+    if r:
+        append_change(conn, "vdir", {"vpath": vpath, "present": r["present"],
+                                     "updated": r["updated"], "updated_by": r["updated_by"]})
+
+
 def log_mark(conn: sqlite3.Connection, fid: int, node_id: str) -> None:
     r = conn.execute("SELECT marked_delete FROM copies WHERE file_id = ? AND node_id = ?",
                      (fid, node_id)).fetchone()

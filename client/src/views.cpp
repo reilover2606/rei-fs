@@ -87,7 +87,7 @@ std::string file_label(const json& f, int name_width) {
   for (const auto& fl : f.value("flags", json::array())) flags += " " + fl.get<std::string>();
   if (!f.value("issues", json::array()).empty()) flags += " !";
   return fit(f.value("name", f.value("path", "")), name_width) + " " +
-         fit(human_size(f.value("size", 0)), 10) + " " +
+         fit(human_size(f.value("size", std::int64_t{0})), 10) + " " +
          fit(std::to_string(f.value("good_copies", 0)) + "/" + std::to_string(f.value("goal", 2)) +
                  flags, 16);
 }
@@ -98,7 +98,7 @@ Element file_details(const json& f) {
   Elements rows = {
       hard_wrap(f.value("path", ""), kDetailWidth - 1) | bold,
       separator(),
-      label_value("size", human_size(f.value("size", 0))),
+      label_value("size", human_size(f.value("size", std::int64_t{0}))),
       label_value("modified", format_time(f.value("mtime", 0))),
       label_value("good copies", copies_badge(f.value("good_copies", 0), f.value("goal", 2))),
   };
@@ -126,7 +126,7 @@ Element file_details(const json& f) {
         text(fit(state, 16)) | color(col),
     }));
     rows.push_back(hbox({text("  "), text(format_time(c.value("mtime", 0)) + "  " +
-                                         human_size(c.value("size", 0)) + "  " +
+                                         human_size(c.value("size", std::int64_t{0})) + "  " +
                                          c.value("hash", "")) | dim}));
   }
   return vbox(rows);
@@ -205,6 +205,69 @@ void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::str
                                   [create, nodes, from](int j) {
                                     create(from, strip_offline(nodes[j]));
                                   });
+        });
+  });
+}
+
+// Move items inside the virtual tree: the files are renamed on every node that
+// holds them. When the destination already has something of the same name the
+// user chooses between merging (the default) and keeping both.
+void virtual_move(Context& ctx, std::vector<std::string> paths, const std::string& dest,
+                  const std::string& name, std::function<void()> done) {
+  if (paths.empty()) return;
+  json probe = {{"paths", paths}, {"to", dest}, {"dry_run", true}};
+  if (!name.empty()) probe["name"] = name;
+  ctx.send("/api/vmove", probe, [&ctx, paths, dest, name, done](json plan) {
+    if (plan.value("files", 0) == 0 && plan.value("dirs", 0) == 0) {
+      ctx.notify("nothing to move (it is already there)");
+      return;
+    }
+    auto go = [&ctx, paths, dest, name, done](const std::string& mode) {
+      json body = {{"paths", paths}, {"to", dest}, {"on_conflict", mode}};
+      if (!name.empty()) body["name"] = name;
+      ctx.send("/api/vmove", body, [&ctx, done](json out) {
+        std::string msg = out.value("files", 0) == 0
+                              ? "moved"
+                              : std::to_string(out.value("files", 0)) + " file(s) moved";
+        if (!out["job_id"].is_null() || out.value("remote_jobs", 0) > 0)
+          msg += "; renaming on the nodes (job #" + std::to_string(out.value("job_id", 0)) + ")";
+        if (out.value("merged", 0) > 0)
+          msg += ", " + std::to_string(out.value("merged", 0)) + " merged";
+        if (out.value("marked", 0) > 0)
+          msg += ", " + std::to_string(out.value("marked", 0)) +
+                 " duplicate cop(ies) marked for deletion";
+        if (!out["skipped"].empty())
+          msg += ", " + std::to_string(out["skipped"].size()) + " skipped";
+        if (!out["errors"].empty()) {
+          msg += "; could not reach: " + out["errors"][0].get<std::string>();
+          ctx.error(msg);
+        } else {
+          ctx.notify(msg);
+        }
+        if (done) done();
+      });
+    };
+    if (plan["conflicts"].empty()) {
+      go("merge");
+      return;
+    }
+    std::string names;
+    int shown = 0;
+    for (const auto& c : plan["conflicts"]) {
+      if (shown++ == 3) {
+        names += ", ...";
+        break;
+      }
+      std::string full = c.get<std::string>();
+      names += (names.empty() ? "" : ", ") + full.substr(full.rfind('/') + 1);
+    }
+    ctx.dialogs->ask_choice(
+        names + " already exists in " + dest + ".\nMerge: folders are combined; identical files "
+                "become one (the duplicate is marked for deletion); different content becomes "
+                "two versions of one file.\nKeep both: the moved item gets a free name.",
+        {"Merge (default)", "Keep both", "Cancel"}, [go](int i) {
+          if (i == 0) go("merge");
+          if (i == 1) go("preserve");
         });
   });
 }
@@ -352,7 +415,7 @@ class OverviewView : public View {
     Elements left = {
         text("Index") | bold,
         separator(),
-        line("files", num("files") + "  (" + human_size(s.value("bytes", 0)) + ")"),
+        line("files", num("files") + "  (" + human_size(s.value("bytes", std::int64_t{0})) + ")"),
         line("with at least 2 copies", num("satisfied"), Color::Green, true),
         line("under-replicated", num("under_replicated"), Color::Red, under > 0),
         line("  with a single copy", num("single_copy"), Color::Red, s.value("single_copy", 0) > 0),
@@ -487,7 +550,10 @@ class TreeView : public View {
     opt.on_enter = [this] { enter(); };
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
-      return with_detail(list_panel(path_, menu_, labels_.size(),
+      std::string heading = path_;
+      if (!picked_.empty())
+        heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
+      return with_detail(list_panel(heading, menu_, labels_.size(),
                                     loading_ ? "loading..." : "(empty)"),
                          detail_);
     });
@@ -496,7 +562,15 @@ class TreeView : public View {
   std::string title() const override { return "Tree"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Enter/→: open  ←/Backspace: up  t/T: tag/untag  c: copy  m: move  r: refresh";
+    return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  "
+           "v: move to...  n: rename  d: new dir  D: remove empty dir  r: refresh";
+  }
+  void on_poll() override {
+    // After a virtual move the renames run in the background: follow them.
+    if (follow_ > 0) {
+      --follow_;
+      refresh();
+    }
   }
 
   void refresh() override {
@@ -523,14 +597,7 @@ class TreeView : public View {
           if (requested != path_) return;   // the user has gone elsewhere meanwhile
           loading_ = false;
           entries_ = out["entries"];
-          labels_.clear();
-          for (const auto& e : entries_) {
-            if (e.value("dir", false))
-              labels_.push_back(fit("▸ " + e.value("name", "") + "/", 42) + " " +
-                                std::to_string(e.value("files", 0)) + " files");
-            else
-              labels_.push_back("  " + file_label(e, 40));
-          }
+          rebuild_labels();
           selected_ = reselect(entries_, name,
                                [](const json& e) { return e.value("name", ""); }, selected_);
           load_detail();
@@ -544,6 +611,20 @@ class TreeView : public View {
             refresh_selecting("");
           }
         });
+  }
+
+  // "»" marks the items picked up for a move.
+  void rebuild_labels() {
+    labels_.clear();
+    for (const auto& e : entries_) {
+      bool picked = picked_.count(child_path(e.value("name", ""))) > 0;
+      std::string mark = picked ? "» " : "  ";
+      if (e.value("dir", false))
+        labels_.push_back(mark + fit("▸ " + e.value("name", "") + "/", 42) + " " +
+                          std::to_string(e.value("files", 0)) + " files");
+      else
+        labels_.push_back(mark + file_label(e, 40));
+    }
   }
 
   std::string current_name() const {
@@ -568,7 +649,8 @@ class TreeView : public View {
       detail_ = vbox({hard_wrap(child_path(e->value("name", "")) + "/", kDetailWidth - 1) | bold,
                       separator(),
                       text(std::to_string(e->value("files", 0)) + " file(s) below"),
-                      text(""), text("t: tag every file below  c/m: copy/move it all") | dim});
+                      text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
+                      text("x: pick up to move it in the tree  n: rename") | dim});
       return;
     }
     // Only the detail of the item the user stops on is fetched (same key).
@@ -622,6 +704,29 @@ class TreeView : public View {
       refresh();
       return true;
     }
+    if (key(e, "p") && !picked_.empty()) {   // put the picked-up items here
+      move_items({picked_.begin(), picked_.end()}, path_, "");
+      return true;
+    }
+    if (e == Event::Escape && !picked_.empty()) {
+      picked_.clear();
+      rebuild_labels();
+      return true;
+    }
+    if (key(e, "d")) {   // new (empty) directory here
+      ctx_.dialogs->ask_text("New directory in " + path_ + " (a/b/c makes several):", "",
+                             [this](const std::string& name) {
+        if (name.empty()) return;
+        std::string full = path_ == "/" ? "/" + name : path_ + "/" + name;
+        ctx_.send("/api/mkdir", {{"path", full}}, [this, full](json) {
+          ctx_.notify("created " + full);
+          want_ = full.substr(path_ == "/" ? 1 : path_.size() + 1);
+          want_ = want_.substr(0, want_.find('/'));
+          refresh();
+        });
+      });
+      return true;
+    }
     const json* cur = current();
     if (!cur) return false;
     std::string target = child_path(cur->value("name", ""));
@@ -634,10 +739,53 @@ class TreeView : public View {
       transfer_paths(ctx_, {target}, "", key(e, "m"));
       return true;
     }
+    if (key(e, "x")) {   // pick up / put down this item
+      if (!picked_.erase(target)) picked_.insert(target);
+      rebuild_labels();
+      return true;
+    }
+    if (key(e, "D") && dir) {   // remove an empty directory
+      ctx_.dialogs->confirm("Remove the empty directory " + target + "?", [this, target] {
+        ctx_.send("/api/rmdir", {{"path", target}}, [this, target](json) {
+          ctx_.notify("removed " + target);
+          refresh();
+        });
+      });
+      return true;
+    }
+    if (key(e, "n")) {   // rename in place
+      ctx_.dialogs->ask_text("New name for " + target, cur->value("name", ""),
+                             [this, target](const std::string& name) {
+        if (name.empty()) return;
+        move_items({target}, path_, name);
+      });
+      return true;
+    }
+    if (key(e, "v")) {   // move to a directory typed by the user
+      std::vector<std::string> items(picked_.begin(), picked_.end());
+      if (items.empty()) items = {target};
+      std::string what = items.size() == 1 ? items[0] : std::to_string(items.size()) + " items";
+      ctx_.dialogs->ask_text("Move " + what + " to the virtual directory:", path_,
+                             [this, items](const std::string& dest) {
+        if (!dest.empty()) move_items(items, dest, "");
+      });
+      return true;
+    }
     return false;
   }
 
+  void move_items(std::vector<std::string> items, const std::string& dest,
+                  const std::string& name) {
+    virtual_move(ctx_, std::move(items), dest, name, [this] {
+      picked_.clear();
+      follow_ = 5;
+      refresh();
+    });
+  }
+
   Context& ctx_;
+  std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
+  int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives
   bool loading_ = false;
@@ -1388,7 +1536,7 @@ class NodesView : public View {
         labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
                           fit(state, 12) + fit(n.value("owner", ""), 12) +
                           fit(std::to_string(n.value("files", 0)) + " files", 14) +
-                          human_size(n.value("bytes", 0)));
+                          human_size(n.value("bytes", std::int64_t{0})));
       }
       for (const auto& f : foreign_)
         labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
@@ -1426,7 +1574,7 @@ class NodesView : public View {
         label_value("owner", n.value("owner", "")),
         label_path("root", n.value("root", "")),
         label_value("files", std::to_string(n.value("files", 0)) + " (" +
-                                 human_size(n.value("bytes", 0)) + ")"),
+                                 human_size(n.value("bytes", std::int64_t{0})) + ")"),
         label_value("case-sensitive", yes(n.value("case_sensitive", false))),
         label_value("Windows names", yes(n.value("restricted_names", false))),
         label_value("priority", std::to_string(n.value("priority", 0))),
@@ -1765,7 +1913,7 @@ class MarkedView : public View {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
       std::int64_t total = 0;
-      for (const auto& m : items_) total += m.value("size", 0);
+      for (const auto& m : items_) total += m.value("size", std::int64_t{0});
       auto list = list_panel(std::to_string(items_.size()) + " cop(ies) marked for deletion, " +
                                  human_size(total),
                              menu_, labels_.size(), "nothing is marked for deletion");
@@ -1774,7 +1922,7 @@ class MarkedView : public View {
         const json& m = items_[selected_];
         detail = vbox({hard_wrap(m.value("path", ""), kDetailWidth - 1) | bold, separator(),
                        label_value("node", m.value("node", "")),
-                       label_value("size", human_size(m.value("size", 0))),
+                       label_value("size", human_size(m.value("size", std::int64_t{0}))),
                        label_path("physical", m.value("physical", ""))});
       }
       return vbox({paragraph(" The server never deletes files. Delete these yourself; the next "
@@ -1794,7 +1942,7 @@ class MarkedView : public View {
       labels_.clear();
       for (const auto& m : items_)
         labels_.push_back(fit(m.value("node", ""), 12) + fit(m.value("path", ""), 50) + " " +
-                          human_size(m.value("size", 0)));
+                          human_size(m.value("size", std::int64_t{0})));
       selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
     }, "marked");
   }

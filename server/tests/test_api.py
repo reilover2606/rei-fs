@@ -331,3 +331,22 @@ def test_status_shows_database_lock_and_scan_progress(server, monkeypatch):
     assert "srv:" in seen[0] and "hashing /huge.bin (17 MiB)" in seen[0]
     assert seen[1] == "free"
     wait_idle(client)
+
+
+def test_virtual_move_through_the_api(server):
+    env, client, _ = server
+    login(client)
+    write(env.root / "other" / "a.txt", "different", mtime=1_000_000)
+    client.post("/api/scan")
+    wait_idle(client)
+    probe = client.post("/api/vmove", {"paths": ["/docs/a.txt"], "to": "/other", "dry_run": True})
+    assert probe["dry_run"] and probe["conflicts"] == ["/other/a.txt"] and probe["files"] == 1
+    assert (env.root / "docs" / "a.txt").exists()  # a dry run changes nothing
+    out = client.post("/api/vmove", {"paths": ["/docs/a.txt"], "to": "/other",
+                                     "on_conflict": "preserve"})
+    assert out["renamed"] == [{"wanted": "a.txt", "given": "a (2).txt"}] and out["job_id"]
+    wait_idle(client)
+    assert (env.root / "other" / "a (2).txt").read_text() == "alpha"
+    assert (env.root / "other" / "a.txt").read_text() == "different"
+    client.post("/api/vmove", {"paths": ["/docs"], "to": "/docs/x"}, expect=400)
+    client.post("/api/vmove", {"paths": ["/docs"], "to": "/z", "on_conflict": "bogus"}, expect=400)
