@@ -83,12 +83,18 @@ def _to_decision(conn, row) -> Decision:
     )
 
 
-def list_decisions(conn: sqlite3.Connection, status: str = "open") -> list[Decision]:
+def count_decisions(conn: sqlite3.Connection, status: str = "open") -> int:
+    return conn.execute("SELECT COUNT(*) FROM decisions WHERE status = ?", (status,)).fetchone()[0]
+
+
+def list_decisions(conn: sqlite3.Connection, status: str = "open",
+                   limit: int | None = None) -> list[Decision]:
+    """The oldest decisions first; ``limit`` keeps a huge pile from being sent at once."""
     rows = conn.execute(
         "SELECT d.*, f.vpath, n.name AS node_name FROM decisions d"
         " LEFT JOIN files f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
-        " WHERE d.status = ? ORDER BY d.id",
-        (status,),
+        " WHERE d.status = ? ORDER BY d.id" + (" LIMIT ?" if limit else ""),
+        (status, limit) if limit else (status,),
     ).fetchall()
     return [_to_decision(conn, r) for r in rows]
 

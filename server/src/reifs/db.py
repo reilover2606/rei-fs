@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -361,6 +361,13 @@ INSERT INTO changes_v7(seq, origin_id, origin_seq, kind, data, ts)
     SELECT seq, origin_id, origin_seq, kind, data, ts FROM changes;
 DROP TABLE changes;
 ALTER TABLE changes_v7 RENAME TO changes;
+""",
+    8: """
+-- The status line counts these on every poll: let SQLite count the few rows
+-- instead of reading every copy and file.
+CREATE INDEX copies_marked ON copies(file_id) WHERE marked_delete = 1;
+CREATE INDEX copies_missing ON copies(file_id) WHERE state = 'missing';
+CREATE INDEX files_issues ON files(id) WHERE issues != '';
 """,
 }
 

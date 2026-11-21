@@ -194,6 +194,12 @@ void Context::start_workers(Api& main, std::function<void(std::function<void()>)
   closing_ = false;
 }
 
+void Context::abort_requests() {
+  closing_ = true;
+  if (read_api_) read_api_->abort();    // a request waiting for a server that does not answer
+  if (write_api_) write_api_->abort();  // must not keep the program from quitting
+}
+
 void Context::stop_workers() {
   closing_ = true;
   read_exec_.stop();
@@ -333,9 +339,20 @@ class App {
     auto pages = Container::Tab({login, main_holder_}, &page_);
     auto root = dialogs_.wrap(pages);
     screen_.Loop(root);
+    // Quitting never waits for the server: interrupt whatever is in flight.
+    poller_running_ = false;
+    ctx_.abort_requests();
+    if (poll_api_) poll_api_->abort();
     stop_poller();
     ctx_.stop_workers();
-    if (api_) api_->logout();
+    if (api_) {   // a short, separate attempt to log out politely
+      try {
+        auto last = api_->spawn();
+        last->set_read_timeout(2);
+        last->logout();
+      } catch (...) {
+      }
+    }
     return 0;
   }
 
@@ -582,14 +599,22 @@ class App {
   void start_poller() {
     poller_running_ = true;
     poll_api_ = api_->spawn();
-    poller_ = std::thread([this] {
+    poll_api_->set_read_timeout(10);   // the status line should say "not answering", not freeze
+    // Two threads: the clock must keep ticking (the "waiting for the server" and
+    // "working for ..." counters) even while a status request is stuck.
+    ticker_ = std::thread([this] {
       for (int tick = 0; poller_running_; ++tick) {
-        if (tick % 2 == 0) poll_status();
-        // A redraw every second (the "waiting for the server" counter), and
-        // every other second the views get their periodic refresh.
         screen_.PostEvent(tick % 2 == 0 ? Event::Custom : Event::Special("tick"));
         std::unique_lock lock(poller_mutex_);
         poller_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return !poller_running_; });
+      }
+    });
+    poller_ = std::thread([this] {
+      while (poller_running_) {
+        poll_status();
+        screen_.PostEvent(Event::Custom);
+        std::unique_lock lock(poller_mutex_);
+        poller_cv_.wait_for(lock, std::chrono::seconds(2), [this] { return !poller_running_; });
       }
     });
   }
@@ -626,6 +651,7 @@ class App {
     }
     poller_cv_.notify_all();
     if (poller_.joinable()) poller_.join();
+    if (ticker_.joinable()) ticker_.join();
   }
 
   ScreenInteractive screen_;
@@ -641,7 +667,7 @@ class App {
   std::string host_, port_str_, password_, login_message_;
   Notice notice_;
   std::unique_ptr<Api> poll_api_;
-  std::thread poller_;
+  std::thread poller_, ticker_;
   std::atomic<bool> poller_running_{false};
   std::mutex poller_mutex_;
   std::condition_variable poller_cv_;

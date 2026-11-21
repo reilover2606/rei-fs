@@ -183,9 +183,21 @@ void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::str
         if (out["job_id"].is_null()) {
           ctx.notify("nothing to do (already there, or not on the source)");
         } else {
-          ctx.notify("job #" + std::to_string(out.value("job_id", 0)) + " created with " +
-                     std::to_string(out.value("items", 0)) +
-                     " item(s); it runs in the background");
+          std::string msg = "job #" + std::to_string(out.value("job_id", 0)) + " created with " +
+                            std::to_string(out.value("items", 0)) +
+                            " item(s); it runs in the background";
+          // What was left out and why (files already on the destination are fine).
+          std::string left;
+          json excluded = out.value("excluded", json::object());
+          for (auto& [reason, n] : excluded.items()) {
+            if (reason.rfind("already on", 0) == 0) continue;
+            left += (left.empty() ? "" : "; ") + n.dump() + " " + reason;
+          }
+          if (left.empty()) {
+            ctx.notify(msg);
+          } else {
+            ctx.error(msg + ". NOT included: " + left + " (see the job)");
+          }
         }
       });
     };
@@ -1110,10 +1122,15 @@ class DecisionsView : public View {
   }
 
   void refresh() override {
-    ctx_.get("/api/decisions?everywhere=1", [this](json out) {
+    ctx_.get("/api/decisions?everywhere=1&limit=500", [this](json out) {
       std::string keep = current_key();
       items_ = out["decisions"];
       note_ = unreachable_note(out);
+      int total = out.value("total", 0);
+      if (total > static_cast<int>(items_.size()))
+        note_ += (note_.empty() ? "" : "  ") + std::string("showing the oldest ") +
+                 std::to_string(items_.size()) + " of " + std::to_string(total) +
+                 " on this server; decide some to see more";
       labels_.clear();
       for (const auto& d : items_)
         labels_.push_back(fit("[" + d.value("kind", "") + "]", 12) + d.value("path", "") +
@@ -1408,7 +1425,7 @@ class JobsView : public View {
   std::string title() const override { return "Jobs"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "j: run now  c: cancel  y: retry failed  h: show/hide finished  r: refresh";
+    return "j: run now  c: cancel  y: retry failed/skipped  h: show/hide finished  r: refresh";
   }
   void on_poll() override {
     if (++polls_ % 2 == 0) refresh();  // every ~4 s: lists come from every server
@@ -1425,6 +1442,9 @@ class JobsView : public View {
                           fit(j.value("status", ""), 10) +
                           fit(std::to_string(j.value("done", 0)) + "/" +
                                   std::to_string(j.value("total", 0)), 12) +
+                          (j.value("issues", 0) > 0
+                               ? "[" + std::to_string(j.value("issues", 0)) + " NOT done] "
+                               : std::string()) +
                           j.value("description", "") + where_suffix(ctx_, j));
       selected_ = reselect(items_, keep, key_of, selected_);
       load_detail();
@@ -1462,6 +1482,11 @@ class JobsView : public View {
     std::string counts;
     for (auto& [k, v] : j["counts"].items()) counts += k + " " + v.dump() + "  ";
     rows.push_back(label_value("items", counts));
+    if (j.value("issues", 0) > 0)
+      rows.push_back(paragraph(std::to_string(j.value("issues", 0)) +
+                               " item(s) were NOT done (listed below), so this job is not "
+                               "complete.") |
+                     color(Color::Red) | bold);
     if (!j["items"].empty()) {
       rows.push_back(separator());
       rows.push_back(text("items not done") | bold);
@@ -1474,7 +1499,7 @@ class JobsView : public View {
       }
       std::string state = it.value("state", "");
       Color c = Color::Default;
-      if (state == "failed" || state == "conflict")
+      if (state == "failed" || state == "conflict" || state == "skipped")
         c = Color::Red;
       else if (state == "pending")
         c = Color::Yellow;
@@ -1564,7 +1589,7 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  m: move root  n: add drive  "
+    return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  c: check completeness  m: move root  n: add drive  "
            "R: rename  p: priority  t: backup target  o: adopt";
   }
 
@@ -1725,6 +1750,43 @@ class NodesView : public View {
         ctx_.notify("scan of " + joined(targets) + " queued");
         marked_.clear();
         rebuild_labels();
+      });
+      return true;
+    }
+    if (key(e, "c")) {   // does the index account for everything on the disk?
+      ctx_.notify("checking " + name + " (reads the whole folder; may take a while)...");
+      ctx_.get("/api/nodes/" + url_encode(name) + "/audit", [this, name](json out) {
+        std::string body = std::to_string(out.value("files_on_disk", 0)) + " files on disk, " +
+                           std::to_string(out.value("files_indexed", 0)) + " in the index.\n";
+        auto list = [&body](const json& items, const char* lead) {
+          for (const auto& it : items) {
+            body += "\n" + std::to_string(it.value("count", 0)) + " " + lead +
+                    it.value("reason", "") + "\n";
+            int shown = 0;
+            for (const auto& ex : it["examples"]) {
+              if (++shown > 5) break;
+              body += "    " + ex.get<std::string>() + "\n";
+            }
+          }
+        };
+        list(out["not_in_index"], "not in the index: ");
+        list(out["other"], "");
+        const json gone = out.value("listed_but_not_on_disk", json::object());
+        if (gone.value("count", 0) > 0) {
+          body += "\n" + std::to_string(gone.value("count", 0)) +
+                  " listed in the index but NOT on disk:\n";
+          int shown = 0;
+          for (const auto& ex : gone["examples"]) {
+            if (++shown > 5) break;
+            body += "    " + ex.get<std::string>() + "\n";
+          }
+        }
+        if (out["not_in_index"].empty() && out["other"].empty() && gone.value("count", 0) == 0)
+          body += "\nEverything on disk is in the index, and the other way round.";
+        else
+          body += "\nA scan (s) indexes new files; the rest is left out on purpose "
+                  "(see [scan] in the config).";
+        ctx_.dialogs->info("Check of " + name, body);
       });
       return true;
     }
@@ -2024,10 +2086,11 @@ class MarkedView : public View {
   explicit MarkedView(Context& ctx) : ctx_(ctx) {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
-      std::int64_t total = 0;
-      for (const auto& m : items_) total += m.value("size", std::int64_t{0});
-      auto list = list_panel(std::to_string(items_.size()) + " cop(ies) marked for deletion, " +
-                                 human_size(total),
+      auto list = list_panel(std::to_string(total_) + " cop(ies) marked for deletion, " +
+                                 human_size(total_size_) +
+                                 (total_ > static_cast<int>(items_.size())
+                                      ? " (first " + std::to_string(items_.size()) + " shown)"
+                                      : ""),
                              menu_, labels_.size(), "nothing is marked for deletion");
       Element detail = text("");
       if (selected_ >= 0 && selected_ < static_cast<int>(items_.size())) {
@@ -2049,8 +2112,10 @@ class MarkedView : public View {
   std::string help() const override { return "u: keep (unmark) this copy  U: unmark all  r: refresh"; }
 
   void refresh() override {
-    ctx_.get("/api/marked", [this](json out) {
+    ctx_.get("/api/marked?limit=1000", [this](json out) {
       items_ = out["marked"];
+      total_ = out.value("total", static_cast<int>(items_.size()));
+      total_size_ = out.value("total_size", std::int64_t{0});
       labels_.clear();
       for (const auto& m : items_)
         labels_.push_back(fit(m.value("node", ""), 12) + fit(m.value("path", ""), 50) + " " +
@@ -2082,6 +2147,8 @@ class MarkedView : public View {
     return false;
   }
 
+  int total_ = 0;
+  std::int64_t total_size_ = 0;
   Context& ctx_;
   json items_ = json::array();
   std::vector<std::string> labels_;

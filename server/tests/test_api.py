@@ -368,3 +368,21 @@ def test_update_priority_through_the_api(server):
     assert client.post("/api/priority", {"path": "/docs", "priority": None})["priority"] == 2
     client.post("/api/scan", {"due": True})        # an automatic-style scan is accepted
     wait_idle(client)
+
+
+def test_long_lists_are_bounded(server):
+    env, client, _ = server
+    login(client)
+    me = env.conn.execute("SELECT id FROM nodes WHERE name = 'srv'").fetchone()[0]
+    fids = [r[0] for r in env.conn.execute("SELECT id FROM files")]
+    with env.conn:
+        for fid in fids:
+            env.conn.execute("INSERT INTO decisions(kind, file_id, node_id, data, created)"
+                             " VALUES ('missing', ?, ?, '{}', '2026-01-01T00:00:00+00:00')",
+                             (fid, me))
+        env.conn.execute("UPDATE copies SET marked_delete = 1")
+    out = client.get("/api/decisions?limit=2")
+    assert len(out["decisions"]) == 2 and out["total"] == len(fids)
+    assert len(client.get("/api/decisions")["decisions"]) == len(fids)       # no limit: all
+    marked = client.get("/api/marked?limit=1")
+    assert len(marked["marked"]) == 1 and marked["total"] == len(fids) and marked["total_size"] > 0

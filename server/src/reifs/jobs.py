@@ -130,7 +130,11 @@ def create_transfer_job(conn: sqlite3.Connection, vpaths: list[str], tag: str | 
         size = next(r["size"] for r in copies.values() if r["hash"] == version.hash)
         items.append((vpath, size))
 
-    if not items:
+    # What was left out for a reason that means "not copied" is kept in the job
+    # as a skipped item, so it is visible there and the job does not read "done".
+    left_out = [(vpath, reason) for reason, vpaths in report.excluded.items()
+                if not reason.startswith("already on") for vpath in vpaths]
+    if not items and not left_out:
         return report
     kind = "move" if move else "copy"
     desc = f"{kind} {describe(vpaths, tag)}" + (f" from {src_node['name']}" if src_node else "") \
@@ -144,6 +148,14 @@ def create_transfer_job(conn: sqlite3.Connection, vpaths: list[str], tag: str | 
             [(job_id, vpath, src_node["id"] if src_node else None, dst_node["id"], size,
               int(move), ts) for vpath, size in items],
         )
+        conn.executemany(
+            "INSERT INTO job_items(job_id, op, vpath, src_node, dst_node, size, mark_source,"
+            " state, message, updated) VALUES (?, 'copy', ?, ?, ?, 0, ?, 'skipped', ?, ?)",
+            [(job_id, vpath, src_node["id"] if src_node else None, dst_node["id"], int(move),
+              f"not copied: {reason}", ts) for vpath, reason in left_out],
+        )
+        if not items:
+            refresh_status(conn, job_id)
     report.job_id, report.items = job_id, len(items)
     return report
 
@@ -237,6 +249,13 @@ def get_job(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row:
     return row
 
 
+def unresolved_skips(conn: sqlite3.Connection, job_id: int) -> int:
+    """Skipped items that nobody decided to skip (the user's own "skip" is an answer)."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND state = 'skipped'"
+        " AND IFNULL(message, '') != 'skipped by user'", (job_id,)).fetchone()[0]
+
+
 def item_counts(conn: sqlite3.Connection, job_id: int) -> dict[str, int]:
     return {r[0]: r[1] for r in conn.execute(
         "SELECT state, COUNT(*) FROM job_items WHERE job_id = ? GROUP BY state", (job_id,))}
@@ -251,7 +270,8 @@ def refresh_status(conn: sqlite3.Connection, job_id: int, after_run: bool = Fals
         status = "waiting" if after_run else "pending"
     elif c.get("conflict"):
         status = "waiting"
-    elif c.get("failed"):
+    elif c.get("failed") or unresolved_skips(conn, job_id):
+        # Finished, but not everything was done: never call that "done".
         status = "failed"
     else:
         status = "done"
@@ -278,12 +298,12 @@ def cancel_job(conn: sqlite3.Connection, job_id: int) -> int:
 
 
 def retry_job(conn: sqlite3.Connection, job_id: int) -> int:
-    """Put failed items back in the queue."""
+    """Put failed and skipped items back in the queue."""
     with db.transaction(conn):
         get_job(conn, job_id)
         n = conn.execute(
             "UPDATE job_items SET state = 'pending', attempts = 0, updated = ?"
-            " WHERE job_id = ? AND state = 'failed'", (db.now(), job_id)).rowcount
+            " WHERE job_id = ? AND state IN ('failed', 'skipped')", (db.now(), job_id)).rowcount
         if n:
             conn.execute("UPDATE jobs SET status = 'pending', finished = NULL WHERE id = ?",
                          (job_id,))
@@ -293,7 +313,19 @@ def retry_job(conn: sqlite3.Connection, job_id: int) -> int:
 # --- deletion marks -----------------------------------------------------------
 
 
-def marked_copies(conn: sqlite3.Connection, node: str | None = None) -> list[sqlite3.Row]:
+def marked_totals(conn: sqlite3.Connection, node: str | None = None) -> tuple[int, int]:
+    q = ("SELECT COUNT(*), IFNULL(SUM(c.size), 0) FROM copies c JOIN nodes n ON n.id = c.node_id"
+         " WHERE c.marked_delete = 1")
+    args: list = []
+    if node:
+        q += " AND (n.name = ? OR n.id = ?)"
+        args += [node, node]
+    r = conn.execute(q, args).fetchone()
+    return r[0], r[1]
+
+
+def marked_copies(conn: sqlite3.Connection, node: str | None = None,
+                  limit: int | None = None) -> list[sqlite3.Row]:
     q = ("SELECT f.vpath, n.name AS node_name, n.root_path, n.online, c.size, c.file_id,"
          " c.node_id FROM copies c JOIN files f ON f.id = c.file_id"
          " JOIN nodes n ON n.id = c.node_id WHERE c.marked_delete = 1")
@@ -301,7 +333,11 @@ def marked_copies(conn: sqlite3.Connection, node: str | None = None) -> list[sql
     if node:
         q += " AND (n.name = ? OR n.id = ?)"
         args += [node, node]
-    return conn.execute(q + " ORDER BY n.name, f.vpath", args).fetchall()
+    q += " ORDER BY n.name, f.vpath"
+    if limit:
+        q += " LIMIT ?"
+        args.append(limit)
+    return conn.execute(q, args).fetchall()
 
 
 def unmark(conn: sqlite3.Connection, vpaths: list[str], node: str | None) -> int:

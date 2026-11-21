@@ -75,9 +75,13 @@ void Api::ensure_client() {
   if (client_) return;
   client_ = std::make_unique<httplib::SSLClient>(host_, port_);
   client_->set_connection_timeout(5);
-  client_->set_read_timeout(60);
+  client_->set_read_timeout(read_timeout_);
   client_->set_write_timeout(30);
   client_->set_keep_alive(true);
+  {
+    std::lock_guard lock(abort_mutex_);
+    live_ = client_.get();
+  }
   // Identity is established by the pinned fingerprint only: no CA, no host
   // name. The verifier always decides, so the built-in checks never run.
   client_->enable_server_hostname_verification(false);
@@ -94,6 +98,19 @@ void Api::ensure_client() {
                ? httplib::SSLVerifierResponse::CertificateAccepted
                : httplib::SSLVerifierResponse::CertificateRejected;
   });
+}
+
+void Api::drop_client() {
+  {
+    std::lock_guard lock(abort_mutex_);
+    live_ = nullptr;
+  }
+  client_.reset();
+}
+
+void Api::abort() {
+  std::lock_guard lock(abort_mutex_);
+  if (live_) live_->stop();   // shuts the socket down; the waiting request fails
 }
 
 std::string Api::probe() {
@@ -116,7 +133,7 @@ void Api::set_pinned(const std::string& fingerprint) {
     session_->pinned = fingerprint;
   }
   std::lock_guard lock(mutex_);
-  client_.reset();  // reconnect with the new pin
+  drop_client();  // reconnect with the new pin
 }
 
 void Api::login(const std::string& password) {
@@ -166,7 +183,7 @@ json Api::request(const std::string& method, const std::string& path, const json
   if (!res) {
     auto err = res.error();
     log_request(method, path, 0, elapsed(), httplib::to_string(err));
-    client_.reset();  // start over with a fresh connection next time
+    drop_client();    // start over with a fresh connection next time
     if (err == httplib::Error::SSLServerVerification)
       throw UntrustedCertificate(seen_);
     throw ApiError(0, "connection error: " + httplib::to_string(err));

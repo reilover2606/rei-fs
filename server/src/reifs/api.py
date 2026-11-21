@@ -26,8 +26,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, priority, queries, vdirs, vmove,
-               replication, ssh, sync, tags, tls)
+from . import (__version__, audit, auth, db, decisions, index, jobs, nodes, paths, peers,
+               priority, queries, replication, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
 from .paths import to_physical
@@ -115,7 +115,10 @@ def job_json(conn: sqlite3.Connection, j: sqlite3.Row) -> dict:
     return {"id": j["id"], "kind": j["kind"], "status": j["status"],
             "description": j["description"], "created": j["created"],
             "started": j["started"], "finished": j["finished"], "counts": counts,
-            "total": sum(counts.values()), "done": counts.get("done", 0)}
+            "total": sum(counts.values()), "done": counts.get("done", 0),
+            # Items not done and not going to be without the user: never hide them.
+            "issues": sum(counts.get(k, 0) for k in ("failed", "conflict"))
+            + jobs.unresolved_skips(conn, j["id"])}
 
 
 # --- the API ------------------------------------------------------------------------
@@ -149,6 +152,7 @@ class Api:
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
+        r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/stop", self.stop)
@@ -350,6 +354,20 @@ class Api:
             self.syncer.request_poke()
         return {"ok": True, "id": node_id, "name": name}
 
+    def audit_node(self, conn, q, body, node, **_):
+        """Compare a node's folder with the index (reads only; can take a while)."""
+        row = nodes.get_node(conn, unquote(node))
+        if row["owner_id"] != nodes.self_id(conn):
+            return peers.forward(conn, row["owner_id"], "GET", f"/api/nodes/{row['id']}/audit",
+                                 timeout=600)
+        root = next((loc.root for loc in nodes.discover(conn, self.cfg).online
+                     if loc.node_id == row["id"]), None)
+        if root is None:
+            raise ApiError(409, f"node {row['name']!r} is not attached")
+        out = audit.audit_node(conn, self.cfg, row["id"], root)
+        out["node"] = row["name"]
+        return out
+
     def move_node_root(self, conn, q, body, node, **_):
         row = nodes.get_node(conn, unquote(node))
         if row["owner_id"] != nodes.self_id(conn):
@@ -471,8 +489,13 @@ class Api:
 
     def list_decisions(self, conn, q, body, caller=None, **_):
         names = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM nodes")}
-        items = [decision_json(d, names) for d in decisions.list_decisions(conn)]
-        return self._everywhere(conn, q, caller, "/api/decisions", "decisions", items)
+        limit = min(int(q.get("limit", 0) or 0), 5000) or None   # None: all (the CLI, scripts)
+        items = [decision_json(d, names) for d in decisions.list_decisions(conn, limit=limit)]
+        total = decisions.count_decisions(conn)
+        path = "/api/decisions" + (f"?limit={limit}" if limit else "")
+        result = self._everywhere(conn, q, caller, path, "decisions", items)
+        result["total"] = total
+        return result
 
     def resolve_decision(self, conn, q, body, id, **_):
         summary = decisions.resolve(conn, int(id), str(body.get("option", "")))
@@ -673,8 +696,10 @@ class Api:
     # --- deletion marks ------------------------------------------------------------
 
     def list_marked(self, conn, q, body, **_):
-        rows = jobs.marked_copies(conn, q.get("node") or None)
-        return {"marked": [{
+        limit = min(int(q.get("limit", 0) or 0), 20000) or None
+        rows = jobs.marked_copies(conn, q.get("node") or None, limit)
+        total, size = jobs.marked_totals(conn, q.get("node") or None)
+        return {"total": total, "total_size": size, "marked": [{
             "path": r["vpath"], "node": r["node_name"], "online": bool(r["online"]),
             "size": r["size"],
             "physical": str(to_physical(r["root_path"], r["vpath"])) if r["root_path"] else "",
@@ -696,8 +721,14 @@ class Api:
         out = {key: items, "unreachable": []}
         if q.get("everywhere") != "1" or caller != "client":
             return out
-        targets = [(p["id"], p["name"], peers.client_for(conn, p["id"], timeout=6))
-                   for p in peers.paired_peers(conn)]
+        # A server the sync thread already found unreachable is not asked again
+        # (every refresh would wait for the connection to time out).
+        targets = []
+        for p in peers.paired_peers(conn):
+            if p["online"]:
+                targets.append((p["id"], p["name"], peers.client_for(conn, p["id"], timeout=4)))
+            else:
+                out["unreachable"].append(p["name"])
 
         def fetch(target):
             sid, name, client = target

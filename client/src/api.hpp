@@ -57,6 +57,13 @@ class Api {
   void login(const std::string& password);
   void logout();
 
+  // Interrupts a request in progress on this connection (callable from another
+  // thread): it fails at once. Used when the program quits, so that it never waits
+  // for a server that is not answering.
+  void abort();
+  // How long to wait for the server's answer (default 60 s). Before the first request.
+  void set_read_timeout(int seconds) { read_timeout_ = seconds; }
+
   json get(const std::string& path);
   json post(const std::string& path, const json& body = json::object());
 
@@ -68,6 +75,7 @@ class Api {
  private:
   json request(const std::string& method, const std::string& path, const json* body);
   void ensure_client();
+  void drop_client();
 
   struct Session {
     std::mutex mutex;
@@ -81,6 +89,9 @@ class Api {
   std::string seen_;
   std::shared_ptr<Session> session_;
   std::unique_ptr<httplib::SSLClient> client_;
+  int read_timeout_ = 60;
+  std::mutex abort_mutex_;           // guards live_ against abort() racing a reset
+  httplib::SSLClient* live_ = nullptr;
   mutable std::mutex mutex_;   // this connection: one request at a time
 };
 

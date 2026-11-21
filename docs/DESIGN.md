@@ -325,6 +325,40 @@ nothing is ever deleted through it. Renaming or moving a directory (5.5) carries
 the directories made inside it along at once, and an existing empty directory is
 a name that merge combines with and preserve avoids.
 
+### 5.7 Never "done" when it is not
+
+* A job is `done` only when **every** item is done (or the user skipped it on
+  purpose). Items that could not be done (`failed`, `skipped`, `conflict`) keep it
+  `failed`/`waiting`, it stays in the job list, and the client shows "N NOT done"
+  with each item and its reason. `retry` re-queues failed *and* skipped items.
+* Files a copy left out when the job was created (no present copy anywhere, not on the
+  source node, not the current version, ...) are kept as skipped items, not just
+  counted in a reply. Files already on the destination are not an issue.
+* When a job ends, every file it says it copied is looked at again on the
+  destination (it exists, with the recorded size). One that is gone goes back to
+  pending and the job says so.
+* A job only knows indexed files. `reifs node audit NODE` (`c` in the Nodes tab)
+  walks a node's folder without reading file contents and says what is on disk but not
+  in the index, with the reason (hidden directory, `[scan] ignore` pattern, symbolic
+  link, name not valid UTF-8, another node's folder, not scanned yet, ...), and what
+  the index lists that is no longer on disk.
+
+### 5.8 Keeping the client responsive
+
+Lists that grow with use (decisions, deletion marks, proposals) are never sent whole: the
+client asks for a page (`limit`) and gets `total` too, and says "showing N of M". The counting for a
+directory listing is done by SQLite, and a paired server already known to be unreachable is not
+asked again by every refresh. Everything a refresh costs should depend on what is on screen,
+not on how long the server has been in use.
+
+While a job runs the change log grows with every file, which used to invalidate the
+backup-coverage figures on every status poll and recompute them over every copy
+(hundreds of milliseconds, with the GIL held, so the whole API crawled). The status line now
+accepts figures a few seconds old, one computation runs at a time, and the counters it
+reads have indexes. The client keeps its clock ticking in its own thread, so a slow
+status request cannot freeze the display, gives up on a status request after 10 s, and on
+quitting interrupts whatever request is in flight instead of waiting for the server.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies
@@ -545,6 +579,7 @@ Endpoints (all JSON, under `/api`):
 | `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
 | `GET priority?path=`, `POST priority {path, priority}` | Update priority of a directory (4.5) |
+| `GET nodes/<name>/audit` | What is on a node's disk but not in the index, and the reverse (5.7) |
 | `POST nodes/<name>/root {path, move?}` | Change where a node's root folder is on its server (the server's own node too: `[storage] root` follows; editing that by hand after moving the folder is also found) |
 | `POST vmove {paths, to, name?, on_conflict: merge\|preserve, dry_run?}` | Move within the virtual tree (5.5) |
 | `POST mkdir {path}`, `POST rmdir {path}` | Create / remove an empty virtual directory (5.6) |
