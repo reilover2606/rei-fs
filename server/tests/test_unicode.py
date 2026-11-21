@@ -131,7 +131,7 @@ def test_local_rsync_copy_keeps_names_byte_for_byte(tree):
         return out
 
     assert listing(ssd) == listing(tree.root)                   # the same bytes, not just similar
-    assert (ssd / "日本語" / "ファイル.txt").read_text() == "content of 日本語/ファイル.txt"
+    assert (ssd / "日本語" / "ファイル.txt").read_text(encoding="utf-8") == "content of 日本語/ファイル.txt"
     # Both spellings of "café" arrived as two separate files.
     assert (ssd / "accents" / "café.txt").exists() and (ssd / "accents" / "café.txt").exists()
     # And the index agrees with the disk: a scan of the new node finds nothing odd.
@@ -152,7 +152,7 @@ def test_pull_through_the_rsync_daemon_with_cjk_names_and_paths(cluster):  # noq
     rep = jobs.create_transfer_job(b.conn, ["/"], None, "ベータ")
     r = b.run_jobs()[rep.job_id]
     assert (r.status, r.done, r.failed) == ("done", len(NAMES) + 1, 0), r.messages
-    assert (b.root / "한국어" / "파일 이름.docx").read_text() == "content of 한국어/파일 이름.docx"
+    assert (b.root / "한국어" / "파일 이름.docx").read_text(encoding="utf-8") == "content of 한국어/파일 이름.docx"
     assert (b.root / "rare" / "𠮷野家 𩸽.txt").exists()
     assert (b.root / "accents" / "café.txt").exists()
     a.sync(b)
@@ -289,6 +289,6 @@ def test_pull_over_ssh_from_an_awkward_folder(cluster, sshd, server_name, old_rs
     rep = jobs.create_transfer_job(b.conn, ["/"], None, "ベータ")
     r = b.run_jobs()[rep.job_id]
     assert (r.status, r.done, r.failed) == ("done", len(NAMES) + 1, 0), r.messages
-    assert (b.root / "日本語" / "ファイル.txt").read_text() == "content of 日本語/ファイル.txt"
+    assert (b.root / "日本語" / "ファイル.txt").read_text(encoding="utf-8") == "content of 日本語/ファイル.txt"
     assert (b.root / "名前 with spaces" / "a%b&c=d+e.txt").exists()
     assert (b.root / "rare" / "𠮷野家 𩸽.txt").exists()
