@@ -1228,6 +1228,7 @@ class DecisionsView : public View {
   }
 
   Context& ctx_;
+  std::set<std::string> marked_;   // nodes chosen with Space for the next scan
   json items_ = json::array();
   std::string note_;
   std::vector<std::string> labels_;
@@ -1558,8 +1559,8 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "n: add drive  R: rename  s/S: scan  v: verify  p: priority  t: backup target  "
-           "o: adopt";
+    return "Space: choose  s: scan the chosen (or this) node  S: scan all  v: verify  n: add drive  "
+           "R: rename  p: priority  t: backup target  o: adopt";
   }
 
   void refresh() override {
@@ -1567,25 +1568,46 @@ class NodesView : public View {
       std::string keep = current_name();
       items_ = out["nodes"];
       foreign_ = out.value("foreign", json::array());
-      labels_.clear();
-      for (const auto& n : items_) {
-        std::string state = n.value("online", false)
-                                ? (n.value("reachable", true) ? "online" : "unreachable")
-                                : "offline";
-        labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
-                          fit(state, 12) + fit(n.value("owner", ""), 12) +
-                          fit(std::to_string(n.value("files", 0)) + " files", 14) +
-                          human_size(n.value("bytes", std::int64_t{0})));
-      }
-      for (const auto& f : foreign_)
-        labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
-                          fit(f.value("owner", ""), 12) + "press o to adopt");
+      rebuild_labels();
       selected_ = reselect(items_, keep, [](const json& n) { return n.value("name", ""); },
                            selected_);
     }, "nodes");
   }
 
  private:
+  // "»" marks the nodes chosen for a scan (Space).
+  void rebuild_labels() {
+    labels_.clear();
+    for (const auto& n : items_) {
+      std::string state = n.value("online", false)
+                              ? (n.value("reachable", true) ? "online" : "unreachable")
+                              : "offline";
+      labels_.push_back(std::string(marked_.count(n.value("name", "")) ? "» " : "  ") +
+                        fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
+                        fit(state, 12) + fit(n.value("owner", ""), 12) +
+                        fit(std::to_string(n.value("files", 0)) + " files", 14) +
+                        human_size(n.value("bytes", std::int64_t{0})));
+    }
+    for (const auto& f : foreign_)
+      labels_.push_back("  " + fit(f.value("name", ""), 16) + fit("foreign", 9) +
+                        fit("attached", 12) + fit(f.value("owner", ""), 12) +
+                        "press o to adopt");
+  }
+
+  // The nodes to scan: the ones marked with Space, else the selected one.
+  std::vector<std::string> scan_targets(const std::string& selected) {
+    std::vector<std::string> out;
+    for (const auto& n : items_)
+      if (marked_.count(n.value("name", ""))) out.push_back(n.value("name", ""));
+    if (out.empty()) out.push_back(selected);
+    return out;
+  }
+  static std::string joined(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& n : names) out += (out.empty() ? "" : ", ") + n;
+    return out;
+  }
+
   bool on_foreign() const { return selected_ >= static_cast<int>(items_.size()); }
   std::string current_name() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
@@ -1687,17 +1709,31 @@ class NodesView : public View {
                              });
       return true;
     }
+    if (key(e, " ")) {   // choose nodes to scan together
+      if (!marked_.erase(name)) marked_.insert(name);
+      rebuild_labels();
+      return true;
+    }
     if (key(e, "s")) {
-      ctx_.send("/api/scan", {{"nodes", {name}}},
-                [this, name](json) { ctx_.notify("scan of " + name + " queued"); });
+      auto targets = scan_targets(name);
+      ctx_.send("/api/scan", {{"nodes", targets}}, [this, targets](json) {
+        ctx_.notify("scan of " + joined(targets) + " queued");
+        marked_.clear();
+        rebuild_labels();
+      });
       return true;
     }
     if (key(e, "v")) {
-      ctx_.dialogs->confirm("Re-hash every file on " + name + "? This reads all its data.",
-                            [this, name] {
-                              ctx_.send("/api/scan", {{"nodes", {name}}, {"verify", true}},
-                                        [this, name](json) {
-                                          ctx_.notify("verify scan of " + name + " queued");
+      auto targets = scan_targets(name);
+      ctx_.dialogs->confirm("Re-hash every file on " + joined(targets) +
+                                "? This reads all their data.",
+                            [this, targets] {
+                              ctx_.send("/api/scan", {{"nodes", targets}, {"verify", true}},
+                                        [this, targets](json) {
+                                          ctx_.notify("verify scan of " + joined(targets) +
+                                                      " queued");
+                                          marked_.clear();
+                                          rebuild_labels();
                                         });
                             });
       return true;
@@ -1728,6 +1764,7 @@ class NodesView : public View {
   }
 
   Context& ctx_;
+  std::set<std::string> marked_;   // nodes chosen with Space for the next scan
   json items_ = json::array();
   json foreign_ = json::array();
   std::vector<std::string> labels_;
