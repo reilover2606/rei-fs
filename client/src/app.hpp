@@ -88,6 +88,7 @@ struct Context {
   std::function<void(const std::string&, const std::string&)> show_in_tree;
 
   void start_workers(Api& main, std::function<void(std::function<void()>)> post);
+  void abort_requests();   // fail the requests in flight (quitting)
   void stop_workers();
   void run(bool write, std::function<json(Api&)> work, std::function<void(json)> done,
            const std::string& key = "", std::function<void()> on_error = {});

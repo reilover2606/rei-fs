@@ -351,6 +351,14 @@ directory listing is done by SQLite, and a paired server already known to be unr
 asked again by every refresh. Everything a refresh costs should depend on what is on screen,
 not on how long the server has been in use.
 
+While a job runs the change log grows with every file, which used to invalidate the
+backup-coverage figures on every status poll and recompute them over every copy
+(hundreds of milliseconds, with the GIL held, so the whole API crawled). The status line now
+accepts figures a few seconds old, one computation runs at a time, and the counters it
+reads have indexes. The client keeps its clock ticking in its own thread, so a slow
+status request cannot freeze the display, gives up on a status request after 10 s, and on
+quitting interrupts whatever request is in flight instead of waiting for the server.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

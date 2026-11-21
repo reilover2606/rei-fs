@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import threading
+import time
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -253,19 +254,44 @@ class Coverage:
 # Computing coverage reads every copy (about half a second per 100k files),
 # and clients poll status every couple of seconds. Everything it depends on
 # (copies, deletion marks, tags) is recorded in the change log, so the log's
-# last sequence number is a perfect cache key.
-_coverage_cache: dict[str, tuple[tuple, Coverage]] = {}
+# last sequence number is a perfect cache key. While a job runs, though, the log
+# grows with every file, so the key changes constantly: a display (the status
+# line) may therefore accept a result a few seconds old (``max_age``), and
+# only one computation runs at a time, the others reuse its result.
+STATUS_MAX_AGE = 10.0   # seconds a status may be behind while data keeps changing
+_coverage_cache: dict[str, tuple[tuple, Coverage, float]] = {}
 _coverage_lock = threading.Lock()
+_coverage_compute = threading.Lock()
 
 
-def coverage(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Coverage:
+def coverage(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY,
+             max_age: float = 0.0) -> Coverage:
     seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
     db_file = conn.execute("PRAGMA database_list").fetchone()[2] or ":memory:"
     key = (seq, policy)
-    with _coverage_lock:
-        hit = _coverage_cache.get(db_file)
-        if hit is not None and hit[0] == key and not conn.in_transaction:
+
+    def cached() -> Coverage | None:
+        with _coverage_lock:
+            hit = _coverage_cache.get(db_file)
+        if hit is None or conn.in_transaction:
+            return None
+        if hit[0] == key or (max_age and hit[0][1] == policy
+                             and time.monotonic() - hit[2] < max_age):
             return hit[1]
+        return None
+
+    found = cached()
+    if found is not None:
+        return found
+    with _coverage_compute:   # whoever waited finds the result of the one who computed
+        found = cached()
+        if found is not None:
+            return found
+        return _compute_coverage(conn, policy, db_file, key)
+
+
+def _compute_coverage(conn: sqlite3.Connection, policy: GoalPolicy, db_file: str,
+                      key: tuple) -> Coverage:
     rows = conn.execute("""
         WITH cur AS (
             SELECT file_id, hash, size FROM (
@@ -294,12 +320,12 @@ def coverage(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> C
     )
     if not conn.in_transaction:  # never cache uncommitted state
         with _coverage_lock:
-            _coverage_cache[db_file] = (key, cov)
+            _coverage_cache[db_file] = (key, cov, time.monotonic())
     return cov
 
 
 def status(conn: sqlite3.Connection, policy: GoalPolicy = DEFAULT_POLICY) -> Status:
-    cov = coverage(conn, policy)
+    cov = coverage(conn, policy, max_age=STATUS_MAX_AGE)
     one = lambda q: conn.execute(q).fetchone()[0]  # noqa: E731
     return Status(
         files=one("SELECT COUNT(*) FROM files"),

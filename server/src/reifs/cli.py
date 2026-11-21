@@ -597,6 +597,10 @@ def cmd_serve(args) -> None:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg, conn = open_server(args.home)
     conn.close()
+    # Scans and transfers run Python code for a long time. With the default 5 ms
+    # switch interval a request thread waits for its turn at every step of its
+    # work, which made the API crawl while a job ran. A short interval gives it back.
+    sys.setswitchinterval(0.0005)
     if not cfg.server.password_hash:
         print("warning: no admin password set; clients cannot log in ('reifs passwd')",
               file=sys.stderr)
