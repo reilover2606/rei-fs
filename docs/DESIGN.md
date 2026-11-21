@@ -402,6 +402,12 @@ request must cost what is on screen, not the size of the index:
   while background work changes the index; the user's own actions refresh them at once.
 * **Search** cuts candidates down in SQL with the longest literal part of the pattern, checks the
   exact match on those, and caches the per-folder counts.
+* **Short write transactions**: SQLite allows one writer at a time and the others wait up to 30
+  seconds. Approving thousands of proposals and applying a peer's changes are done in transactions
+  of a few hundred rows (what an item needs is read before the lock is taken), so no writer holds
+  the lock long enough to starve the others. The sync thread and the worker survive a round that
+  fails (a lock that did not clear, a bad answer from a peer) and try again: before, one failure
+  ended the sync thread for good and the servers silently stopped syncing.
 * **Temporary files**: big sorts and groupings spill to disk. SQLite's default folder (`/tmp`, often
   a small RAM disk) made "database or disk is full" on servers with plenty of space; they now go
   to `<server home>/tmp` (or `SQLITE_TMPDIR`).
