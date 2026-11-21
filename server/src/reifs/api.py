@@ -316,6 +316,7 @@ class Api:
                                          " AND online = 1").fetchone()[0],
             "auto_replicate": self.cfg.server.auto_replicate,
             "database": self.database_status(),
+            "connections": dict(CONNECTION_STATS),
             "pair_requests": conn.execute(
                 "SELECT COUNT(*) FROM pair_requests WHERE direction = 'in' AND status = 'pending'"
             ).fetchone()[0],
@@ -963,8 +964,9 @@ class Api:
         token_id = next(self._request_ids)
         with self._requests_lock:
             self._requests[token_id] = time.monotonic()
-        conn = db.open_existing(self.cfg.db_path, timeout=self.busy_timeout)
+        conn = None
         try:
+            conn = db.open_existing(self.cfg.db_path, timeout=self.busy_timeout)
             # Who is calling: the client (bearer token) or a paired server.
             header = headers.get("Authorization")
             token, caller = None, None
@@ -998,13 +1000,14 @@ class Api:
             return (e.status if 400 <= e.status < 500 else 502), {"error": str(e)}
         except USER_ERRORS as e:
             return 400, {"error": str(e).strip("'\"")}
-        except sqlite3.OperationalError as e:
+        except (sqlite3.OperationalError, db.DatabaseLocked) as e:
             db.note_busy_error()
             log.warning("database busy: %s", e)
             return 503, {"error": "the server is busy (its database is locked by another operation); "
                                    f"try again in a moment ({e})"}
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
             db.set_label(None)
             with self._requests_lock:
                 self._requests.pop(token_id, None)
@@ -1050,8 +1053,13 @@ class _Handler(BaseHTTPRequestHandler):
         log.debug("%s %s", self.address_string(), fmt % args)
 
 
+# Why connections end early, for the log and the status (a client that "cannot connect").
+CONNECTION_STATS = {"handshake_failed": 0, "dropped": 0}
+
+
 class TLSServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128   # the default of 5 drops connections when several arrive at once
 
     def __init__(self, address, api: Api, context: ssl.SSLContext):
         family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
@@ -1064,16 +1072,25 @@ class TLSServer(ThreadingHTTPServer):
         # TLS handshake in the request thread, so a slow client cannot block accept().
         request.settimeout(30)
         try:
+            request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            request.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+        try:
             tls_sock = self.context.wrap_socket(request, server_side=True)
         except (ssl.SSLError, OSError) as e:
-            log.debug("TLS handshake with %s failed: %s", client_address, e)
+            CONNECTION_STATS["handshake_failed"] += 1
+            # A client that does not trust our certificate yet hangs up after the
+            # handshake; anything else is worth seeing.
+            log.info("TLS handshake with %s failed: %s", client_address[0], e)
             return
         try:
             super().finish_request(tls_sock, client_address)
         except (ConnectionError, ssl.SSLError, TimeoutError) as e:
             # Clients that reject our certificate hang up right after the
             # handshake; idle keep-alive connections time out. Both are normal.
-            log.debug("connection from %s ended: %s", client_address, e)
+            CONNECTION_STATS["dropped"] += 1
+            log.info("connection from %s ended: %s", client_address[0], e)
         finally:
             try:
                 tls_sock.close()

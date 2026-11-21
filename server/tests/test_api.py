@@ -414,3 +414,20 @@ def test_a_null_body_means_no_body(server):
     with urllib.request.urlopen(req, context=client.ctx, timeout=10) as r:
         assert r.status == 200
     client.post("/api/jobs/run", [1], expect=400)           # a list is still refused
+
+
+def test_a_request_that_cannot_open_the_database_is_answered_and_not_leaked(server, monkeypatch):
+    env, client, srv = server
+    login(client)
+    from reifs import db as dbmod
+    real = dbmod.open_existing
+
+    def locked(*a, **k):
+        raise dbmod.DatabaseLocked("held by someone else")
+
+    monkeypatch.setattr(dbmod, "open_existing", locked)
+    out = client.get("/api/nodes", expect=503)
+    assert "busy" in out["error"]
+    assert srv.api._requests == {}                      # nothing is left "being served"
+    monkeypatch.setattr(dbmod, "open_existing", real)
+    assert client.get("/api/status")["connections"]["handshake_failed"] >= 0

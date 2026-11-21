@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import sqlite3
 import threading
 import time
@@ -399,24 +400,82 @@ def create(path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+class DatabaseLocked(Exception):
+    """Another process holds the database (a server still running, a stuck command)."""
+
+
+def holders_of(path: Path | str) -> list[tuple[int, str]]:
+    """Other processes that have the database file open (Linux; best effort)."""
+    out: list[tuple[int, str]] = []
+    try:
+        target = {os.path.realpath(path), os.path.realpath(str(path) + "-wal"),
+                  os.path.realpath(str(path) + "-shm")}
+        for pid_dir in Path("/proc").iterdir():
+            if not pid_dir.name.isdigit() or int(pid_dir.name) == os.getpid():
+                continue
+            try:
+                for fd in (pid_dir / "fd").iterdir():
+                    if os.path.realpath(fd) in target:
+                        cmd = (pid_dir / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                            "utf-8", "replace").strip()
+                        out.append((int(pid_dir.name), cmd[:120]))
+                        break
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def locked_message(path: Path | str) -> str:
+    who = holders_of(path)
+    text = f"the database {path} is locked by another process"
+    if who:
+        text += ":\n" + "\n".join(f"  pid {pid}: {cmd}" for pid, cmd in who)
+        text += ("\nIf that is a rei-fs server or command you no longer want, stop it "
+                 "(Ctrl+C, or kill the pid) and try again.")
+    else:
+        text += " (a server, a scan or job run, or a backup tool). Try again in a moment."
+    return text
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     for target in range(version + 1, SCHEMA_VERSION + 1):
-        conn.executescript(
-            f"BEGIN;\n{MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;"
-        )
+        try:
+            conn.executescript(
+                f"BEGIN;\n{MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;"
+            )
+        except sqlite3.OperationalError:
+            # Another process migrated while we waited for the write lock: fine.
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= target:
+                continue
+            raise
 
 
-def open_existing(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+def open_existing(path: Path | str, timeout: float = 30,
+                  migration_wait: float = 120) -> sqlite3.Connection:
     conn = connect(path, timeout)
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if 1 <= version < SCHEMA_VERSION:
-        migrate(conn)
-    elif version != SCHEMA_VERSION:
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if 1 <= version < SCHEMA_VERSION:
+            # Rebuilding the change log of a big database takes a while, and a server
+            # that is still running may be writing: be patient.
+            conn.execute(f"PRAGMA busy_timeout = {int(migration_wait * 1000)}")
+            migrate(conn)
+            conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+        elif version != SCHEMA_VERSION:
+            conn.close()
+            raise RuntimeError(
+                f"{path}: database schema version {version}, expected {SCHEMA_VERSION}"
+            )
+    except sqlite3.OperationalError as e:
         conn.close()
-        raise RuntimeError(
-            f"{path}: database schema version {version}, expected {SCHEMA_VERSION}"
-        )
+        if "locked" in str(e) or "busy" in str(e):
+            raise DatabaseLocked(locked_message(path)) from e
+        raise
     return conn
 
 

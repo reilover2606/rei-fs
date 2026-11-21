@@ -622,6 +622,7 @@ class App {
   void poll_status() {
     try {
       ctx_.set_status(poll_api_->get("/api/status"));
+      poll_failures_ = 0;
       set_poll_error("");
     } catch (const ApiError& e) {
       if (e.status == 401) {
@@ -633,11 +634,11 @@ class App {
         } catch (const std::exception& e2) {
           set_poll_error(std::string("session lost: ") + e2.what());
         }
-      } else {
+      } else if (++poll_failures_ >= 3) {   // one stumble is not worth a red message
         set_poll_error(e.what());
       }
     } catch (const std::exception& e) {
-      set_poll_error(e.what());
+      if (++poll_failures_ >= 3) set_poll_error(e.what());
     }
   }
 
@@ -668,6 +669,7 @@ class App {
   Notice notice_;
   std::unique_ptr<Api> poll_api_;
   std::thread poller_, ticker_;
+  int poll_failures_ = 0;   // consecutive failed status polls (poller thread only)
   std::atomic<bool> poller_running_{false};
   std::mutex poller_mutex_;
   std::condition_variable poller_cv_;

@@ -1154,7 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
         args.func(args)
     except (CliError, ConfigError, nodes.NodeError, decisions.DecisionError,
             tags.TagError, jobs.JobError, peers.PeerError, LockError, ValueError,
-            OSError) as e:
+            OSError, db.DatabaseLocked) as e:
         print(f"reifs: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

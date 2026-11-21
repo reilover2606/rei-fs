@@ -1,3 +1,4 @@
+#include <thread>
 #include "api.hpp"
 
 #include <openssl/evp.h>
@@ -109,6 +110,7 @@ void Api::drop_client() {
 }
 
 void Api::abort() {
+  aborted_ = true;
   std::lock_guard lock(abort_mutex_);
   if (live_) live_->stop();   // shuts the socket down; the waiting request fails
 }
@@ -185,9 +187,27 @@ json Api::request(const std::string& method, const std::string& path, const json
   ensure_client();
   httplib::Headers headers;
   if (auto t = token(); !t.empty()) headers.emplace("Authorization", "Bearer " + t);
-  httplib::Result res = method == "GET"
-                            ? client_->Get(path, headers)
-                            : client_->Post(path, headers, body->dump(), "application/json");
+  auto send = [&] {
+    return method == "GET" ? client_->Get(path, headers)
+                           : client_->Post(path, headers, body->dump(), "application/json");
+  };
+  httplib::Result res = send();
+  // A connection that was dropped or reset (the server closed an idle one, a
+  // hiccup on the network) is not an answer: try again on a fresh connection. A
+  // GET can always be repeated; a POST only if it never got to the server.
+  // Not after a long wait (a timeout), and not when quitting.
+  for (int attempt = 1; !res && attempt <= 2 && !aborted_ && elapsed() < 5.0; ++attempt) {
+    auto err = res.error();
+    bool never_sent = err == httplib::Error::Connection;
+    bool transient = err == httplib::Error::Read || err == httplib::Error::Write ||
+                     err == httplib::Error::Connection || err == httplib::Error::ConnectionTimeout;
+    if (!transient || !(method == "GET" || never_sent)) break;
+    log_request(method, path, 0, elapsed(), "retrying after: " + httplib::to_string(err));
+    drop_client();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
+    ensure_client();
+    res = send();
+  }
   if (!res) {
     auto err = res.error();
     log_request(method, path, 0, elapsed(), httplib::to_string(err));
