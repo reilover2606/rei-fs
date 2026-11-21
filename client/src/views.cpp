@@ -1564,7 +1564,7 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  n: add drive  "
+    return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  m: move root  n: add drive  "
            "R: rename  p: priority  t: backup target  o: adopt";
   }
 
@@ -1726,6 +1726,28 @@ class NodesView : public View {
         marked_.clear();
         rebuild_labels();
       });
+      return true;
+    }
+    if (key(e, "m")) {   // change where the node's folder is
+      std::string root = items_[selected_].value("root", "");
+      ctx_.dialogs->ask_text(
+          "New place of the folder of " + name + " (a path ON THE SERVER'S MACHINE):", root,
+          [this, name, root](const std::string& path) {
+            if (path.empty() || path == root) return;
+            ctx_.dialogs->ask_choice(
+                "Folder of " + name + " -> " + path,
+                {"It is already there (the folder was moved, or the drive is mounted elsewhere)",
+                 "Move the folder there for me (same file system; nothing is copied or deleted)",
+                 "Cancel"},
+                [this, name, path](int i) {
+                  if (i == 2) return;
+                  ctx_.send("/api/nodes/" + url_encode(name) + "/root",
+                            {{"path", path}, {"move", i == 1}}, [this, name](json out) {
+                              ctx_.notify(name + " is now at " + out.value("path", ""));
+                              refresh();
+                            });
+                });
+          });
       return true;
     }
     if (key(e, "w")) {   // discover new files only

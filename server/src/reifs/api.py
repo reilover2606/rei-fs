@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, priority, queries, vdirs, vmove,
                replication, ssh, sync, tags, tls)
 from .config import Config
+from .locking import LockError, ServerLock
 from .paths import to_physical
 from .service import Syncer, Worker
 
@@ -147,6 +148,7 @@ class Api:
         r("GET", r"/api/nodes", self.list_nodes)
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
+        r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/stop", self.stop)
@@ -347,6 +349,24 @@ class Api:
             self.syncer.request_daemon_update()
             self.syncer.request_poke()
         return {"ok": True, "id": node_id, "name": name}
+
+    def move_node_root(self, conn, q, body, node, **_):
+        row = nodes.get_node(conn, unquote(node))
+        if row["owner_id"] != nodes.self_id(conn):
+            return peers.forward(conn, row["owner_id"], "POST", f"/api/nodes/{row['id']}/root",
+                                 body)
+        try:
+            with ServerLock(self.cfg.home):   # not while a scan or job uses the node
+                root = nodes.move_root(conn, self.cfg, row["id"], str(body.get("path", "")),
+                                       bool(body.get("move")))
+        except LockError as e:
+            raise ApiError(409, f"{e}; try again when it is done") from None
+        if self.worker:
+            self.worker.request_scan([row["id"]], full=False)
+        if self.syncer:
+            self.syncer.request_daemon_update()
+            self.syncer.request_poke()
+        return {"ok": True, "path": str(root)}
 
     def adopt_node(self, conn, q, body, node, **_):
         name = nodes.adopt_node(conn, unquote(node))

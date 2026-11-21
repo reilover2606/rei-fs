@@ -795,6 +795,13 @@ def cmd_ssh(args) -> None:
             print(line)
 
 
+def cmd_node_move(args) -> None:
+    cfg, conn = open_server(args.home)
+    with ServerLock(cfg.home):
+        root = nodes.move_root(conn, cfg, args.node, args.path, move_folder=args.move)
+    print(f"node {args.node!r} now has its root at {root}")
+
+
 def cmd_node_adopt(args) -> None:
     _, conn = open_server(args.home)
     name = nodes.adopt_node(conn, args.node)
@@ -915,6 +922,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--target", choices=["yes", "no"], help="may receive replication copies")
     s.add_argument("--rename", metavar="NAME")
     s.set_defaults(func=cmd_node_set)
+
+    s = node.add_parser("move", help="change where a node's root folder is on this machine")
+    s.add_argument("node")
+    s.add_argument("path", help="the new absolute path")
+    s.add_argument("--move", action="store_true",
+                   help="move the folder there (default: it is already there)")
+    s.set_defaults(func=cmd_node_move)
 
     s = node.add_parser("adopt", help="take ownership of another server's drive attached here")
     s.add_argument("node", help="name (see 'reifs discover') or path of the drive's node root")

@@ -545,6 +545,7 @@ Endpoints (all JSON, under `/api`):
 | `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
 | `GET priority?path=`, `POST priority {path, priority}` | Update priority of a directory (4.5) |
+| `POST nodes/<name>/root {path, move?}` | Change where a node's root folder is on its server |
 | `POST vmove {paths, to, name?, on_conflict: merge\|preserve, dry_run?}` | Move within the virtual tree (5.5) |
 | `POST mkdir {path}`, `POST rmdir {path}` | Create / remove an empty virtual directory (5.6) |
 | `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |
