@@ -26,9 +26,10 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries, vdirs, vmove,
+from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, priority, queries, vdirs, vmove,
                replication, ssh, sync, tags, tls)
 from .config import Config
+from .locking import LockError, ServerLock
 from .paths import to_physical
 from .service import Syncer, Worker
 
@@ -147,6 +148,7 @@ class Api:
         r("GET", r"/api/nodes", self.list_nodes)
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
+        r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/stop", self.stop)
@@ -162,6 +164,8 @@ class Api:
         r("GET", r"/api/jobs", self.list_jobs)
         r("POST", r"/api/jobs", self.create_job)
         r("POST", r"/api/vmove", self.vmove)
+        r("GET", r"/api/priority", self.get_priority)
+        r("POST", r"/api/priority", self.set_priority)
         r("POST", r"/api/mkdir", self.mkdir)
         r("POST", r"/api/rmdir", self.rmdir)
         r("POST", r"/api/jobs/run", self.run_jobs)
@@ -346,6 +350,24 @@ class Api:
             self.syncer.request_poke()
         return {"ok": True, "id": node_id, "name": name}
 
+    def move_node_root(self, conn, q, body, node, **_):
+        row = nodes.get_node(conn, unquote(node))
+        if row["owner_id"] != nodes.self_id(conn):
+            return peers.forward(conn, row["owner_id"], "POST", f"/api/nodes/{row['id']}/root",
+                                 body)
+        try:
+            with ServerLock(self.cfg.home):   # not while a scan or job uses the node
+                root = nodes.move_root(conn, self.cfg, row["id"], str(body.get("path", "")),
+                                       bool(body.get("move")))
+        except LockError as e:
+            raise ApiError(409, f"{e}; try again when it is done") from None
+        if self.worker:
+            self.worker.request_scan([row["id"]], full=False)
+        if self.syncer:
+            self.syncer.request_daemon_update()
+            self.syncer.request_poke()
+        return {"ok": True, "path": str(root)}
+
     def adopt_node(self, conn, q, body, node, **_):
         name = nodes.adopt_node(conn, unquote(node))
         if self.worker:
@@ -366,9 +388,13 @@ class Api:
                 remote.setdefault(row["owner_id"], []).append(row["id"])
         for owner, ids in remote.items():
             peers.forward(conn, owner, "POST", "/api/scan",
-                          {"nodes": ids, "verify": bool(body.get("verify"))})
+                          {"nodes": ids, "verify": bool(body.get("verify")),
+                           "due": bool(body.get("due")),
+                           "new_only": bool(body.get("new_only"))})
         if local or not remote:
-            self._need_worker().request_scan(local or None, bool(body.get("verify")))
+            self._need_worker().request_scan(local or None, bool(body.get("verify")),
+                                             full=not body.get("due"),
+                                             new_only=bool(body.get("new_only")))
         return {"ok": True, "queued": True}
 
     def _poke(self) -> None:
@@ -391,15 +417,20 @@ class Api:
         entries = queries.list_dir(conn, vdir, replication.policy(self.cfg))
         if entries is None:
             raise ApiError(404, f"not a directory in the virtual tree: {vdir}")
+        prefs = priority.Prefs(priority.load(conn))
+        here = prefs.effective(vdir)
         out = []
         for e in entries:
             if e.is_dir:
-                out.append({"name": e.name, "dir": True, "files": e.files})
+                child = paths.join(vdir, e.name)
+                out.append({"name": e.name, "dir": True, "files": e.files,
+                            "priority": prefs.prefs.get(child, here),
+                            "set_here": child in prefs.prefs})
             else:
                 f = file_json(e.file, full=False)
                 f["dir"] = False
                 out.append(f)
-        return {"path": vdir, "entries": out}
+        return {"path": vdir, "entries": out, "priority": here}
 
     def file(self, conn, q, body, **_):
         info = queries.lookup(conn, q.get("path", ""), replication.policy(self.cfg))
@@ -537,6 +568,16 @@ class Api:
             self.worker.request_jobs()
         return {"job_id": rep.job_id, "items": rep.items,
                 "excluded": {k: len(v) for k, v in rep.excluded.items()}}
+
+    def get_priority(self, conn, q, body, **_):
+        return priority.get(conn, q.get("path", "/"))
+
+    def set_priority(self, conn, q, body, **_):
+        try:
+            value = priority.parse(body.get("priority"))
+            return priority.set_priority(conn, str(body.get("path", "")), value)
+        except priority.PriorityError as e:
+            raise ApiError(400, str(e)) from None
 
     def mkdir(self, conn, q, body, **_):
         try:

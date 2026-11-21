@@ -178,6 +178,58 @@ def rename_node(conn: sqlite3.Connection, node: str, new_name: str) -> str:
     return new_name
 
 
+def move_root(conn: sqlite3.Connection, cfg: Config, node: str, new_path: str,
+              move_folder: bool = False) -> Path:
+    """Change where a storage node's root is on this machine.
+
+    By default the folder is already at ``new_path`` (the drive was remounted
+    elsewhere, the folder was moved by hand): it must carry the node's ID
+    file. With ``move_folder`` the folder is moved there (a rename: same
+    file system, the target must not exist yet). Files are never copied or
+    deleted and the virtual tree does not change.
+    """
+    row = get_node(conn, node)
+    if row["owner_id"] != self_id(conn):
+        raise NodeError(f"node {row['name']!r} belongs to another server; do this there")
+    if row["kind"] == "server":
+        raise NodeError("the server's own folder is set with [storage] root in its config file")
+    target = Path(os.path.expanduser(new_path.strip()))
+    if not target.is_absolute():
+        raise NodeError(f"{new_path!r} is not an absolute path (it is read on the server)")
+    target = Path(os.path.normpath(target))
+    old = Path(row["root_path"]) if row["root_path"] else None
+    for other in conn.execute("SELECT name, root_path FROM nodes WHERE owner_id = ? AND id != ?"
+                              " AND root_path IS NOT NULL", (self_id(conn), row["id"])):
+        if _overlaps(target, Path(other["root_path"])):
+            raise NodeError(f"{target} overlaps node {other['name']!r} at {other['root_path']}")
+    if move_folder:
+        if old is None or not old.is_dir() or read_marker(old) is None:
+            raise NodeError(f"{row['name']!r} is not attached: there is no folder to move")
+        if _overlaps(target, old):
+            raise NodeError("the new place cannot be inside the old one (or the same)")
+        if target.exists():
+            raise NodeError(f"{target} already exists")
+        if not target.parent.is_dir():
+            raise NodeError(f"{target.parent} does not exist")
+        try:
+            os.rename(old, target)
+        except OSError as e:
+            raise NodeError(f"cannot move the folder there ({e.strerror or e}); a move needs the "
+                            "same file system: copy the node to a new drive instead") from e
+    else:
+        if not target.is_dir():
+            raise NodeError(f"{target} is not a folder on the server machine (is it mounted?)")
+        marker = read_marker(target)
+        if marker is None or marker.node_id != row["id"]:
+            raise NodeError(f"{target} is not the folder of node {row['name']!r} (its "
+                            f"{MARKER_DIR}/{MARKER_FILE} file is "
+                            f"{'missing' if marker is None else 'another node' + chr(39) + 's'})")
+    with db.transaction(conn):
+        conn.execute("UPDATE nodes SET root_path = ? WHERE id = ?", (str(target), row["id"]))
+    discover(conn, cfg)   # capabilities, free space, online state, ssh path
+    return target
+
+
 def register_node(
     conn: sqlite3.Connection, root: Path, name: str, kind: str = "storage",
     node_id: str | None = None,

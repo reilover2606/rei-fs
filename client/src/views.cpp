@@ -329,13 +329,18 @@ class OverviewView : public View {
     if (++polls_ % 15 == 0) refresh();  // the backup plan changes rarely (~30 s)
   }
   std::string help() const override {
-    return "s: scan all  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
+    return "s: scan all  w: new files only  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
   }
 
  private:
   bool on_event(const Event& e) {
     if (key(e, "s")) {
       ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan queued"); });
+      return true;
+    }
+    if (key(e, "w")) {
+      ctx_.send("/api/scan", {{"new_only", true}},
+                [this](json) { ctx_.notify("scan for new files queued"); });
       return true;
     }
     if (key(e, "j")) {
@@ -542,6 +547,12 @@ class OverviewView : public View {
 
 // --- Tree ---------------------------------------------------------------------------
 
+const char* priority_name(int p) {
+  static const char* names[] = {"synchronous", "frequent", "infrequent", "archival"};
+  return names[std::clamp(p, 0, 3)];
+}
+
+
 class TreeView : public View {
  public:
   explicit TreeView(Context& ctx) : ctx_(ctx) {
@@ -551,6 +562,7 @@ class TreeView : public View {
     menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
       std::string heading = path_;
+      if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
       return with_detail(list_panel(heading, menu_, labels_.size(),
@@ -563,7 +575,7 @@ class TreeView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  "
-           "v: move to...  n: rename  d: new dir  D: remove empty dir  r: refresh";
+           "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -597,6 +609,7 @@ class TreeView : public View {
           if (requested != path_) return;   // the user has gone elsewhere meanwhile
           loading_ = false;
           entries_ = out["entries"];
+          dir_priority_ = out.value("priority", 2);
           rebuild_labels();
           selected_ = reselect(entries_, name,
                                [](const json& e) { return e.value("name", ""); }, selected_);
@@ -620,8 +633,11 @@ class TreeView : public View {
       bool picked = picked_.count(child_path(e.value("name", ""))) > 0;
       std::string mark = picked ? "» " : "  ";
       if (e.value("dir", false))
-        labels_.push_back(mark + fit("▸ " + e.value("name", "") + "/", 42) + " " +
-                          std::to_string(e.value("files", 0)) + " files");
+        labels_.push_back(mark + fit("▸ " + e.value("name", "") + "/", 34) + " " +
+                          fit(std::to_string(e.value("files", 0)) + " files", 11) +
+                          (e.value("priority", 2) != 2
+                               ? std::string(" [") + priority_name(e.value("priority", 2)) + "]"
+                               : ""));
       else
         labels_.push_back(mark + file_label(e, 40));
     }
@@ -649,8 +665,11 @@ class TreeView : public View {
       detail_ = vbox({hard_wrap(child_path(e->value("name", "")) + "/", kDetailWidth - 1) | bold,
                       separator(),
                       text(std::to_string(e->value("files", 0)) + " file(s) below"),
+                      text(std::string("update priority: ") + priority_name(e->value("priority", 2)) +
+                           (e->value("set_here", false) ? "" : " (inherited)")),
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
-                      text("x: pick up to move it in the tree  n: rename") | dim});
+                      text("x: pick up to move it in the tree  n: rename") | dim,
+                      text("u: update priority (how often it is scanned)") | dim});
       return;
     }
     // Only the detail of the item the user stops on is fetched (same key).
@@ -727,6 +746,13 @@ class TreeView : public View {
       });
       return true;
     }
+    if (key(e, "u")) {   // update priority of the selected directory (or of this one)
+      const json* sel = current();
+      std::string dir_path = sel && sel->value("dir", false)
+                                 ? child_path(sel->value("name", "")) : path_;
+      set_priority(dir_path);
+      return true;
+    }
     const json* cur = current();
     if (!cur) return false;
     std::string target = child_path(cur->value("name", ""));
@@ -774,6 +800,23 @@ class TreeView : public View {
     return false;
   }
 
+  void set_priority(const std::string& dir_path) {
+    ctx_.dialogs->ask_choice(
+        "Update priority of " + dir_path + " (applies to everything below it):\n"
+        "how often it is scanned for changes; archival is only scanned when you ask.",
+        {"0  synchronous (live; for programs saving continuously)", "1  frequent",
+         "2  infrequent (default)", "3  archival (never changes)", "inherit from the parent"},
+        [this, dir_path](int i) {
+          json value = i == 4 ? json(nullptr) : json(i);
+          ctx_.send("/api/priority", {{"path", dir_path}, {"priority", value}},
+                    [this, dir_path](json out) {
+                      ctx_.notify(dir_path + ": " + out.value("name", "") +
+                                  (out.value("inherited", false) ? " (inherited)" : ""));
+                      refresh();
+                    });
+        });
+  }
+
   void move_items(std::vector<std::string> items, const std::string& dest,
                   const std::string& name) {
     virtual_move(ctx_, std::move(items), dest, name, [this] {
@@ -785,6 +828,7 @@ class TreeView : public View {
 
   Context& ctx_;
   std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
+  int dir_priority_ = 2;           // update priority of the directory shown
   int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives
@@ -1189,6 +1233,7 @@ class DecisionsView : public View {
   }
 
   Context& ctx_;
+  std::set<std::string> marked_;   // nodes chosen with Space for the next scan
   json items_ = json::array();
   std::string note_;
   std::vector<std::string> labels_;
@@ -1519,8 +1564,8 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "n: add drive  R: rename  s/S: scan  v: verify  p: priority  t: backup target  "
-           "o: adopt";
+    return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  m: move root  n: add drive  "
+           "R: rename  p: priority  t: backup target  o: adopt";
   }
 
   void refresh() override {
@@ -1528,25 +1573,46 @@ class NodesView : public View {
       std::string keep = current_name();
       items_ = out["nodes"];
       foreign_ = out.value("foreign", json::array());
-      labels_.clear();
-      for (const auto& n : items_) {
-        std::string state = n.value("online", false)
-                                ? (n.value("reachable", true) ? "online" : "unreachable")
-                                : "offline";
-        labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
-                          fit(state, 12) + fit(n.value("owner", ""), 12) +
-                          fit(std::to_string(n.value("files", 0)) + " files", 14) +
-                          human_size(n.value("bytes", std::int64_t{0})));
-      }
-      for (const auto& f : foreign_)
-        labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
-                          fit(f.value("owner", ""), 12) + "press o to adopt");
+      rebuild_labels();
       selected_ = reselect(items_, keep, [](const json& n) { return n.value("name", ""); },
                            selected_);
     }, "nodes");
   }
 
  private:
+  // "»" marks the nodes chosen for a scan (Space).
+  void rebuild_labels() {
+    labels_.clear();
+    for (const auto& n : items_) {
+      std::string state = n.value("online", false)
+                              ? (n.value("reachable", true) ? "online" : "unreachable")
+                              : "offline";
+      labels_.push_back(std::string(marked_.count(n.value("name", "")) ? "» " : "  ") +
+                        fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
+                        fit(state, 12) + fit(n.value("owner", ""), 12) +
+                        fit(std::to_string(n.value("files", 0)) + " files", 14) +
+                        human_size(n.value("bytes", std::int64_t{0})));
+    }
+    for (const auto& f : foreign_)
+      labels_.push_back("  " + fit(f.value("name", ""), 16) + fit("foreign", 9) +
+                        fit("attached", 12) + fit(f.value("owner", ""), 12) +
+                        "press o to adopt");
+  }
+
+  // The nodes to scan: the ones marked with Space, else the selected one.
+  std::vector<std::string> scan_targets(const std::string& selected) {
+    std::vector<std::string> out;
+    for (const auto& n : items_)
+      if (marked_.count(n.value("name", ""))) out.push_back(n.value("name", ""));
+    if (out.empty()) out.push_back(selected);
+    return out;
+  }
+  static std::string joined(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& n : names) out += (out.empty() ? "" : ", ") + n;
+    return out;
+  }
+
   bool on_foreign() const { return selected_ >= static_cast<int>(items_.size()); }
   std::string current_name() const {
     if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
@@ -1648,17 +1714,62 @@ class NodesView : public View {
                              });
       return true;
     }
+    if (key(e, " ")) {   // choose nodes to scan together
+      if (!marked_.erase(name)) marked_.insert(name);
+      rebuild_labels();
+      return true;
+    }
     if (key(e, "s")) {
-      ctx_.send("/api/scan", {{"nodes", {name}}},
-                [this, name](json) { ctx_.notify("scan of " + name + " queued"); });
+      auto targets = scan_targets(name);
+      ctx_.send("/api/scan", {{"nodes", targets}}, [this, targets](json) {
+        ctx_.notify("scan of " + joined(targets) + " queued");
+        marked_.clear();
+        rebuild_labels();
+      });
+      return true;
+    }
+    if (key(e, "m")) {   // change where the node's folder is
+      std::string root = items_[selected_].value("root", "");
+      ctx_.dialogs->ask_text(
+          "New place of the folder of " + name + " (a path ON THE SERVER'S MACHINE):", root,
+          [this, name, root](const std::string& path) {
+            if (path.empty() || path == root) return;
+            ctx_.dialogs->ask_choice(
+                "Folder of " + name + " -> " + path,
+                {"It is already there (the folder was moved, or the drive is mounted elsewhere)",
+                 "Move the folder there for me (same file system; nothing is copied or deleted)",
+                 "Cancel"},
+                [this, name, path](int i) {
+                  if (i == 2) return;
+                  ctx_.send("/api/nodes/" + url_encode(name) + "/root",
+                            {{"path", path}, {"move", i == 1}}, [this, name](json out) {
+                              ctx_.notify(name + " is now at " + out.value("path", ""));
+                              refresh();
+                            });
+                });
+          });
+      return true;
+    }
+    if (key(e, "w")) {   // discover new files only
+      auto targets = scan_targets(name);
+      ctx_.send("/api/scan", {{"nodes", targets}, {"new_only", true}}, [this, targets](json) {
+        ctx_.notify("scan for new files on " + joined(targets) + " queued");
+        marked_.clear();
+        rebuild_labels();
+      });
       return true;
     }
     if (key(e, "v")) {
-      ctx_.dialogs->confirm("Re-hash every file on " + name + "? This reads all its data.",
-                            [this, name] {
-                              ctx_.send("/api/scan", {{"nodes", {name}}, {"verify", true}},
-                                        [this, name](json) {
-                                          ctx_.notify("verify scan of " + name + " queued");
+      auto targets = scan_targets(name);
+      ctx_.dialogs->confirm("Re-hash every file on " + joined(targets) +
+                                "? This reads all their data.",
+                            [this, targets] {
+                              ctx_.send("/api/scan", {{"nodes", targets}, {"verify", true}},
+                                        [this, targets](json) {
+                                          ctx_.notify("verify scan of " + joined(targets) +
+                                                      " queued");
+                                          marked_.clear();
+                                          rebuild_labels();
                                         });
                             });
       return true;
@@ -1689,6 +1800,7 @@ class NodesView : public View {
   }
 
   Context& ctx_;
+  std::set<std::string> marked_;   // nodes chosen with Space for the next scan
   json items_ = json::array();
   json foreign_ = json::array();
   std::vector<std::string> labels_;

@@ -66,6 +66,8 @@ def apply_changes(conn: sqlite3.Connection, entries: list[dict]) -> int:
                 _apply_tag(conn, data)
             elif kind == "vdir":
                 _apply_vdir(conn, data)
+            elif kind == "dirpref":
+                _apply_dirpref(conn, data)
             index.append_change(conn, kind, data, origin_id=origin, origin_seq=seq,
                                 ts=e.get("ts"))
             progress[origin] = seq
@@ -190,6 +192,15 @@ def _apply_mark(conn, me: str, origin: str, d: dict) -> None:
 
 def _newer(a: tuple[str, str], b: tuple[str, str]) -> bool:
     return a > b  # (timestamp, server id): deterministic everywhere
+
+
+def _apply_dirpref(conn, d: dict) -> None:
+    row = conn.execute("SELECT updated, updated_by FROM dirprefs WHERE vpath = ?",
+                       (d["vpath"],)).fetchone()
+    if row is None or _newer((d["updated"], d["updated_by"]), (row[0], row[1])):
+        conn.execute("INSERT OR REPLACE INTO dirprefs(vpath, priority, updated, updated_by)"
+                     " VALUES (?, ?, ?, ?)",
+                     (d["vpath"], d["priority"], d["updated"], d["updated_by"]))
 
 
 def _apply_vdir(conn, d: dict) -> None:

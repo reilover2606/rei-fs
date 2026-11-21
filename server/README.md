@@ -31,7 +31,9 @@ stacks of a running server at any time.
 `reifs serve` listens on `[server] listen` (default `0.0.0.0:7420`). It
 creates a self-signed certificate on first start and prints its
 fingerprint (also shown by `reifs fingerprint`). It also scans every
-`scan.interval_minutes`, scans drives when they are plugged in, and runs
+directories by their update priority (`reifs priority`; `[scan]` minutes per
+priority, 60 by default; archival ones only on request), scans drives when they are
+plugged in, and runs
 jobs in the background. When servers are paired, `serve` also syncs metadata with them and runs a
 read-only rsync daemon on `[rsync] daemon_port` (default 7421) from which
 paired servers pull files. Open both ports between your servers (LAN or

@@ -29,7 +29,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, index, jobs, nodes, paths, vdirs
+from . import db, index, jobs, nodes, paths, priority, vdirs
 
 MODES = ("merge", "preserve")
 
@@ -281,6 +281,7 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
             result.items = len(local)
         for old, new in plan.dir_moves:   # directories made by the user move at once
             vdirs.move(conn, old, new)
+            priority.move(conn, old, new)   # and their update priority
         for fid, node_id, _ in marks:
             hash_ = conn.execute("SELECT hash FROM copies WHERE file_id = ? AND node_id = ?",
                                  (fid, node_id)).fetchone()

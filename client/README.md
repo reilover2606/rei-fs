@@ -60,12 +60,12 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 | Tab | What it shows | Keys |
 |---|---|---|
 | Overview | Copies, what the server is busy with (and for how long), database lock, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
-| Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move to a node, `x` pick up, `p` put here, `v` move to a typed directory, `n` rename, `d` new directory, `D` remove an empty one |
+| Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move to a node, `x` pick up, `p` put here, `v` move to a typed directory, `n` rename, `d` new directory, `D` remove an empty one, `u` update priority |
 | Search | Find files and folders by part of a name (or a glob like `*.jpg`), tag, problems | `/` type a search, `Enter` on a result show it in the Tree, `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
-| Nodes | Nodes of all servers, foreign drives | `n` add a drive, `R` rename, `s`/`S` scan, `v` verify, `p` priority, `t` backup target, `o` adopt |
+| Nodes | Nodes of all servers, foreign drives | `n` add a drive, `R` rename, `Space` choose nodes, `s` scan the chosen (or the selected) node, `S` scan all, `w` discover new files only, `m` move the node's root folder, `v` verify the same, `p` priority, `t` backup target, `o` adopt |
 | Marked | Copies waiting for you to delete them | `u`/`U` keep (unmark) |
 | Servers | This server's fingerprint, paired servers, pairing requests | `p` pair, `a`/`x` accept/reject, `d` unpair, `t` transport (daemon/SSH), `k` SSH key and authorize peers, `s` sync now |
 

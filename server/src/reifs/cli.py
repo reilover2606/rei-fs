@@ -20,7 +20,7 @@ from . import (__version__, auth, db, decisions, index, jobs, nodes, peers, quer
 from .config import ConfigError, default_home
 from .hashing import short
 from .locking import LockError, ServerLock
-from .paths import to_physical
+from .paths import VPathError, to_physical
 from .server import init_server, open_server
 
 
@@ -164,7 +164,8 @@ def cmd_scan(args) -> None:
 
     with ServerLock(cfg.home):
         disc, results = scanner.scan_all(conn, cfg, args.nodes or None, verify=args.verify,
-                                         progress=progress)
+                                         progress=progress, full=not args.due,
+                                         new_only=args.new_only)
     if sys.stderr.isatty():
         print("\r" + " " * 110 + "\r", end="", file=sys.stderr)
     for name in disc.offline:
@@ -177,7 +178,9 @@ def cmd_scan(args) -> None:
                              ("reappeared", s.reappeared), ("forgotten", s.forgotten),
                              ("deleted as marked", s.deleted_marked),
                              ("VERIFY MISMATCH", s.verify_mismatch),
-                             ("dirs pruned", s.pruned_dirs), ("errors", len(res.errors))):
+                             ("dirs pruned", s.pruned_dirs),
+                             ("dirs not due (skipped)", s.skipped_dirs),
+                             ("errors", len(res.errors))):
             if value:
                 parts.append(f"{value} {label}")
         print(f"{res.node_name}: " + ", ".join(parts))
@@ -250,6 +253,22 @@ def cmd_find(args) -> None:
              " ".join(f.tags)] for f in results]
     print(table(rows, ["PATH", "SIZE", "COPIES", "NODES", "TAGS"]))
     print(f"{len(results)} file(s)")
+
+
+def cmd_priority(args) -> None:
+    from . import priority
+
+    cfg, conn = open_server(args.home)
+    try:
+        if args.value is not None:
+            info = priority.set_priority(conn, args.vdir, priority.parse(args.value))
+        else:
+            info = priority.get(conn, args.vdir)
+    except (priority.PriorityError, VPathError) as e:
+        raise SystemExit(f"error: {e}") from None
+    where = "set here" if not info["inherited"] else \
+        f"inherited from {info['set_on']}" if info["set_on"] else "the default"
+    print(f"{info['path']}: {info['priority']} {info['name']} ({where})")
 
 
 def cmd_tag(args) -> None:
@@ -776,6 +795,13 @@ def cmd_ssh(args) -> None:
             print(line)
 
 
+def cmd_node_move(args) -> None:
+    cfg, conn = open_server(args.home)
+    with ServerLock(cfg.home):
+        root = nodes.move_root(conn, cfg, args.node, args.path, move_folder=args.move)
+    print(f"node {args.node!r} now has its root at {root}")
+
+
 def cmd_node_adopt(args) -> None:
     _, conn = open_server(args.home)
     name = nodes.adopt_node(conn, args.node)
@@ -897,6 +923,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--rename", metavar="NAME")
     s.set_defaults(func=cmd_node_set)
 
+    s = node.add_parser("move", help="change where a node's root folder is on this machine")
+    s.add_argument("node")
+    s.add_argument("path", help="the new absolute path")
+    s.add_argument("--move", action="store_true",
+                   help="move the folder there (default: it is already there)")
+    s.set_defaults(func=cmd_node_move)
+
     s = node.add_parser("adopt", help="take ownership of another server's drive attached here")
     s.add_argument("node", help="name (see 'reifs discover') or path of the drive's node root")
     s.set_defaults(func=cmd_node_adopt)
@@ -922,7 +955,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("nodes", nargs="*", help="node names (default: all online)")
     s.add_argument("--verify", action="store_true", help="re-hash every file")
     s.add_argument("--max-errors", type=int, default=20)
+    s.add_argument("--new-only", action="store_true",
+                   help="only discover files not indexed yet (no re-hashing, no missing/renamed)")
+    s.add_argument("--due", action="store_true",
+                   help="only directories due for an automatic scan (by update priority)")
     s.set_defaults(func=cmd_scan)
+
+    s = sub.add_parser("priority", help="show or set the update priority of a directory")
+    s.add_argument("vdir", nargs="?", default="/")
+    s.add_argument("value", nargs="?",
+                   help="0|1|2|3 or synchronous|frequent|infrequent|archival, or 'inherit'")
+    s.set_defaults(func=cmd_priority)
 
     s = sub.add_parser("ls", help="list a virtual directory")
     s.add_argument("vdir", nargs="?", default="/")

@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -327,6 +327,40 @@ INSERT INTO changes_v6(seq, origin_id, origin_seq, kind, data, ts)
     SELECT seq, origin_id, origin_seq, kind, data, ts FROM changes;
 DROP TABLE changes;
 ALTER TABLE changes_v6 RENAME TO changes;
+""",
+    7: """
+-- Update priority of directories (0 synchronous, 1 frequent, 2 infrequent,
+-- 3 archival). The nearest directory at or above a path that has a value
+-- decides; NULL is a tombstone (inherit again). Replicated like tags.
+CREATE TABLE dirprefs (
+    vpath      TEXT PRIMARY KEY,
+    priority   INTEGER CHECK (priority IS NULL OR priority BETWEEN 0 AND 3),
+    updated    TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+-- When each priority class of a node was last scanned (local, not replicated).
+CREATE TABLE scan_state (
+    node_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    priority INTEGER NOT NULL,
+    scanned  REAL NOT NULL,
+    PRIMARY KEY (node_id, priority)
+);
+
+-- New kinds of log entries need no table change from now on.
+CREATE TABLE changes_v7 (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_id  TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    UNIQUE (origin_id, origin_seq)
+);
+INSERT INTO changes_v7(seq, origin_id, origin_seq, kind, data, ts)
+    SELECT seq, origin_id, origin_seq, kind, data, ts FROM changes;
+DROP TABLE changes;
+ALTER TABLE changes_v7 RENAME TO changes;
 """,
 }
 
