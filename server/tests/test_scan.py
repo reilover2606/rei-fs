@@ -309,3 +309,86 @@ def test_status_and_find(env):
     assert [f.vpath for f in queries.find(env.conn, under_replicated=True)] == ["/one.txt"]
     assert [f.vpath for f in queries.find(env.conn, node="ssd")] == ["/both.txt"]
     assert [f.vpath for f in queries.find(env.conn, "ONE*")] == ["/one.txt"]
+
+
+def test_scan_never_holds_the_write_lock_while_hashing(env, monkeypatch):
+    """Hashing a huge file (or reading a stalled disk) takes minutes: another
+    writer (the API, the sync thread) must not have to wait for it."""
+    import sqlite3
+
+    for i in range(30):
+        write(env.root / "d" / f"f{i}.txt", f"content {i}")
+    write(env.root / "d" / "huge.bin", "x")
+    other = sqlite3.connect(env.cfg.db_path, isolation_level=None, timeout=0.3)
+    waits = []
+    real = scanner.hash_file
+
+    def probing_hash(path):
+        t = __import__("time").time()
+        try:                      # a writer elsewhere, while we are "reading the file"
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("UPDATE meta SET value = value WHERE key = 'server_id'")
+            other.execute("COMMIT")
+            waits.append(("ok", __import__("time").time() - t))
+        except sqlite3.OperationalError:
+            waits.append(("LOCKED", __import__("time").time() - t))
+        return real(path)
+
+    monkeypatch.setattr(scanner, "hash_file", probing_hash)
+    env.scan()
+    assert len(waits) == 31
+    assert [w for w in waits if w[0] != "ok"] == []
+    monkeypatch.setattr(scanner, "hash_file", real)
+    other.close()
+
+
+def test_find_by_part_of_a_name(env):
+    for name in ("Report-2025.pdf", "holiday/beach photo.jpg", "notes.txt",
+                 "docs/annual report.docx", "docs/sub/other.txt"):
+        write(env.root / name, name)
+    env.scan()
+    names = lambda pattern, **kw: [f.vpath for f in queries.find(env.conn, pattern, **kw)]  # noqa: E731
+    # Without wildcards the text only has to be contained, whatever its case.
+    assert names("report") == ["/Report-2025.pdf", "/docs/annual report.docx"]
+    assert names("PHOTO") == ["/holiday/beach photo.jpg"]
+    assert names("txt") == ["/docs/sub/other.txt", "/notes.txt"]
+    assert names("nothing like this") == []
+    # With a "/" the text is matched against the whole path.
+    assert names("docs/sub") == ["/docs/sub/other.txt"]
+    # The exact name still works, and so do globs (which match the whole name).
+    assert names("notes.txt") == ["/notes.txt"]
+    assert names("*.docx") == ["/docs/annual report.docx"]
+    assert names("rep*") == ["/Report-2025.pdf"]
+    assert names("report", tag="none") == []
+    assert [f.vpath for f in queries.find(env.conn)] != []   # no pattern: everything
+
+
+def test_search_finds_folders_too(env):
+    for name in ("holiday/beach/a.jpg", "holiday/beach/b.jpg", "holiday/notes.txt",
+                 "work/Holiday-plan.docx", "work/projects/x.txt", "misc.txt"):
+        write(env.root / name, name)
+    env.scan()
+    ids, dirs = queries.search(env.conn, "holiday")
+    # The file "Holiday-plan.docx" matches by its name; the folder by its own.
+    assert [queries.file_info(env.conn, i).vpath for i in ids] == ["/work/Holiday-plan.docx"]
+    assert dirs == [("/holiday", 3)]                       # files below it, counted recursively
+    # Nested folders are listed too, each with its own count.
+    assert queries.search(env.conn, "beach")[1] == [("/holiday/beach", 2)]
+    assert queries.search(env.conn, "o")[1] == [         # "beach" has no "o": not listed
+        ("/holiday", 3), ("/work", 2), ("/work/projects", 1)]
+    assert queries.search(env.conn, "e")[1] == [("/holiday/beach", 2), ("/work/projects", 1)]
+    # A path pattern is matched against the folder's whole path.
+    assert queries.search(env.conn, "holiday/b")[1] == [("/holiday/beach", 2)]
+    # Globs match the whole folder name.
+    assert queries.search(env.conn, "pro*")[1] == [("/work/projects", 1)]
+    assert queries.search(env.conn, "proj")[1] == [("/work/projects", 1)]
+    assert queries.search(env.conn, "hol*")[1] == [("/holiday", 3)]
+    # No pattern: no folders (they would all match). Nothing matching: nothing.
+    assert queries.search(env.conn)[1] == []
+    assert queries.search(env.conn, "zzz") == ([], [])
+    # The other filters decide which files are counted below a folder.
+    tags.set_tag(env.conn, tags.resolve_targets(env.conn, "/holiday/beach/a.jpg", False),
+                 "keep", True, env.server_id)
+    assert queries.search(env.conn, "holiday", tag="keep")[1] == [("/holiday", 1)]
+    assert queries.search(env.conn, "beach", tag="keep")[1] == [("/holiday/beach", 1)]
+    assert queries.search(env.conn, "work", tag="keep")[1] == []   # nothing tagged below it

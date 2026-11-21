@@ -145,6 +145,19 @@ basenames match are preferred.
   user decides, `P` and `Q` are separate files and `Q` keeps a copy of `P`'s
   tags.
 
+### 4.2b Unicode names
+
+Names are Unicode strings, stored and compared exactly (no normalisation, so
+NFC and NFD spellings are different files). A name that is not valid UTF-8
+cannot be stored and is skipped with an error. Case-insensitive comparisons use
+Unicode case folding. The 255 limit counts UTF-8 bytes, which is the strictest
+of the common file systems. To read names correctly whatever the locale, the
+`reifs` command restarts itself in Python's UTF-8 mode when the file system
+encoding is not UTF-8, and its output never fails on a character the terminal
+cannot show. rsync receives names as bytes (`--files-from` with NUL separators,
+UTF-8); the path of a node on a remote server is backslash-escaped for the
+remote shell when the client's rsync does not do it itself (before 3.2.4).
+
 ### 4.3 Diverging versions (decision: `divergent`)
 
 When copies of the same vpath have different hashes, the copy with the
@@ -457,7 +470,7 @@ Endpoints (all JSON, under `/api`):
 | `GET nodes`, `POST nodes/<name>` | Nodes; set priority / backup target |
 | `POST scan {nodes?, verify?}`, `POST stop` | Queue a scan; stop current work |
 | `GET tree?path=`, `GET file?path=` | Browse the virtual tree; file details |
-| `GET find?q=&tag=&node=&issues=1&under=1` | Search (max 1000 results) |
+| `GET find?q=&tag=&node=&issues=1&under=1` | Search (max 1000 results). `q` is text the name contains (any case), or a glob such as `*.jpg` that must match the whole name; with a `/` it is matched against the whole path. Folders are matched the same way by their own name: `dirs` lists them with the number of files below that pass the other filters |
 | `GET tags`, `POST tags {action, tag, paths, recursive}` | Tags |
 | `GET decisions`, `POST decisions/<id> {option}` | Decision stack |
 | `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |
@@ -485,6 +498,14 @@ Endpoints (all JSON, under `/api`):
   `reifs fingerprint`, then pins it per `host:port`. A changed fingerprint
   is refused with a warning unless the user explicitly trusts the new one.
   The CA chain and host name are not used.
+* Server calls never run on the interface thread. A background executor
+  (one for reads, one for writes, plus the status poller, each with its own
+  connection sharing one session) runs them and hands results back to the
+  interface thread; loads triggered by the selection are coalesced so only
+  the latest runs. The status bar shows requests that are still waiting.
+  The Overview shows the server's activity and the database lock
+  (`GET status` has a `database` section: free, held by whom for how long,
+  locked by another program, waiting writers, requests being served).
 * Tabs: Overview, Tree, Search, Decisions, Wanted, Jobs, Nodes, Marked,
   Servers. A background thread polls `GET status` every 2 s for the status
   bar and the live Jobs view. Decisions, Wanted and Jobs show every paired

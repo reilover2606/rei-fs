@@ -85,7 +85,7 @@ def _generate_with_openssl(cert: Path, key: Path, server_name: str) -> None:
 
 def fingerprint(cert: Path) -> str:
     """SHA-256 of the DER certificate, as colon-separated upper-case hex."""
-    der = ssl.PEM_cert_to_DER_cert(Path(cert).read_text())
+    der = ssl.PEM_cert_to_DER_cert(Path(cert).read_text(encoding="ascii"))
     digest = hashlib.sha256(der).hexdigest().upper()
     return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
 

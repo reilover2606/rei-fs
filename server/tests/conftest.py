@@ -39,7 +39,7 @@ class Env:
 
 def write(path: Path, content: str, mtime: int | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    path.write_text(content, encoding="utf-8")
     if mtime is not None:
         os.utime(path, (mtime, mtime))
     return path

@@ -10,10 +10,14 @@ namespace reifs {
 namespace fs = std::filesystem;
 
 fs::path Profiles::config_dir() {
-  if (const char* env = std::getenv("REIFS_CLIENT_HOME"); env && *env) return fs::path(env);
 #ifdef _WIN32
-  if (const char* appdata = std::getenv("APPDATA"); appdata && *appdata)
-    return fs::path(appdata) / "rei-fs-client";
+  // Wide-character variables: the narrow ones are in the legacy code page, which
+  // cannot hold a user name with CJK (or any non-Latin) characters.
+  if (const wchar_t* env = _wgetenv(L"REIFS_CLIENT_HOME"); env && *env) return fs::path(env);
+  if (const wchar_t* appdata = _wgetenv(L"APPDATA"); appdata && *appdata)
+    return fs::path(appdata) / L"rei-fs-client";
+#else
+  if (const char* env = std::getenv("REIFS_CLIENT_HOME"); env && *env) return fs::path(env);
 #endif
   if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg)
     return fs::path(xdg) / "rei-fs-client";

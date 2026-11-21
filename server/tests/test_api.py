@@ -121,6 +121,11 @@ def test_browse(server):
     client.get("/api/tree?path=/nope", expect=404)
     f = client.get("/api/file?path=" + urllib.request.quote("/docs/a.txt"))
     assert f["good_copies"] == 1 and f["copies"][0]["node"] == "srv"
+    # Folders are searched too, with the number of files below them.
+    out = client.get("/api/find?q=doc")
+    assert out["dirs"] == [{"path": "/docs", "name": "docs", "files": 2}]
+    assert out["dirs_total"] == 1 and out["files"] == []
+    assert client.get("/api/find?q=top")["dirs"] == []
     found = client.get("/api/find?q=*.txt&issues=1")
     expected = [] if sys.platform == "win32" else ["/docs/b?.txt"]
     assert [x["path"] for x in found["files"]] == expected
@@ -271,3 +276,58 @@ def test_add_and_rename_a_node(server):
     assert "already exists" in client.post("/api/nodes/stick", {"name": "ssd"}, expect=400)["error"]
     assert "named after the server" in client.post("/api/nodes/srv", {"name": "x"},
                                                    expect=400)["error"]
+
+
+def test_status_shows_database_lock_and_scan_progress(server, monkeypatch):
+    import sqlite3
+
+    from reifs import db, hashing, scanner
+
+    env, client, srv = server
+    srv.api.busy_timeout = 1
+    login(client)
+    st = client.get("/api/status")["database"]
+    assert st["lock"] == "free" and st["holders"] == [] and st["waiting"] == []
+
+    # A writer inside this server: reported as the holder, with its label.
+    conn = db.open_existing(env.cfg.db_path)
+    with db.transaction(conn, "test: saving things"):
+        st = client.get("/api/status")["database"]
+        assert st["lock"] == "held"
+        assert [h["who"] for h in st["holders"]] == ["test: saving things"]
+    conn.close()
+
+    # Locked by something this server does not know about (another process).
+    outside = sqlite3.connect(env.cfg.db_path, isolation_level=None)
+    outside.execute("BEGIN IMMEDIATE")
+    try:
+        st = client.get("/api/status")["database"]
+        assert st["lock"] == "locked" and st["holders"] == []
+        # ...and a write from the client fails fast, with an explanation.
+        err = client.post("/api/nodes/ssd", {"priority": 3}, expect=503)["error"]
+        assert "busy" in err
+        assert client.get("/api/status")["database"]["busy_errors"] >= 1
+    finally:
+        outside.execute("ROLLBACK")
+        outside.close()
+
+    # A long hash: the scan says which file it is reading, and the database
+    # lock is free meanwhile.
+    write(env.root / "huge.bin", "x" * (17 << 20), mtime=2_000_000)
+    real = hashing.hash_file
+    monkeypatch.setattr(scanner, "hash_file",
+                        lambda p: (time.sleep(3), real(p))[1] if str(p).endswith("huge.bin") else real(p))
+    client.post("/api/scan")
+    seen = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        status = client.get("/api/status")
+        detail = status["activity"]["detail"]
+        if "huge.bin" in detail:
+            seen = (detail, status["database"]["lock"])
+            break
+        time.sleep(0.1)
+    assert seen is not None, "the scan never reported the big file"
+    assert "srv:" in seen[0] and "hashing /huge.bin (17 MiB)" in seen[0]
+    assert seen[1] == "free"
+    wait_idle(client)

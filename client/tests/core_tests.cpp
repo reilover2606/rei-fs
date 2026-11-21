@@ -1,10 +1,13 @@
 // Unit tests for the client core. With REIFS_TEST_PORT and
 // REIFS_TEST_PASSWORD set (and a server on localhost), also exercises
 // certificate pinning and login against a live server.
+#include <clocale>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
+
+#include <ftxui/screen/string.hpp>
 
 #include "../src/api.hpp"
 #include "../src/format.hpp"
@@ -31,6 +34,42 @@ static void test_format() {
   CHECK(reifs::format_time(0).empty());
 }
 
+static void test_unicode() {
+  // Percent-encoding works on the UTF-8 bytes: 日 = E6 97 A5, 😀 = F0 9F 98 80.
+  CHECK(reifs::url_encode("/日本語/ファイル.txt") ==
+        "/%E6%97%A5%E6%9C%AC%E8%AA%9E/%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB.txt");
+  CHECK(reifs::url_encode("😀") == "%F0%9F%98%80");
+  CHECK(reifs::url_encode("a b&c=d+e%f") == "a%20b%26c%3Dd%2Be%25f");
+  CHECK(reifs::url_encode("café") == "caf%C3%A9");
+  // isalnum() depends on the locale; under a Latin-1 locale it accepts é (0xE9),
+  // which must not stop the byte from being encoded. Try one if it is installed.
+  for (const char* name : {"en_US.ISO-8859-1", "en_US.iso88591", "de_DE.ISO-8859-1", "fr_FR.ISO-8859-1"}) {
+    if (std::setlocale(LC_CTYPE, name)) {
+      CHECK(reifs::url_encode("café 日本") == "caf%C3%A9%20%E6%97%A5%E6%9C%AC");
+      break;
+    }
+  }
+  std::setlocale(LC_CTYPE, "C");
+
+  // Display widths: CJK and emoji take two cells, combining marks none.
+  auto width = [](const std::string& t) { return ftxui::string_width(t); };
+  CHECK(width("日本語") == 6);
+  CHECK(width("ファイル") == 8);
+  CHECK(width("파일") == 4);
+  CHECK(width("😀") == 2);
+  CHECK(width("e\u0301") == 1);          // e + combining acute accent
+  CHECK(width("ＡＢＣ") == 6);            // full-width Latin
+  CHECK(reifs::fit("日本語", 8) == "日本語  ");
+  CHECK(reifs::fit("日本語", 6) == "日本語");
+  CHECK(reifs::fit("日本語", 5) == "日本~");   // never splits a character: 4 cells + "~"
+  CHECK(reifs::fit("日本語", 4) == "日~ ");
+  CHECK(reifs::fit("😀a", 3) == "😀a");
+  CHECK(reifs::fit("e\u0301", 3) == "e\u0301  ");
+  CHECK(reifs::fit("日本語ab", 7) == "日本語~");
+  for (const char* text : {"日本語/ファイル.txt", "한국어 파일", "العربية", "😀 party 🎉", "𠮷野家"})
+    CHECK(width(reifs::fit(text, 12)) == 12);   // every cell is accounted for
+}
+
 static void test_fingerprint() {
   const unsigned char data[] = {'a', 'b', 'c'};
   // SHA-256("abc")
@@ -51,10 +90,12 @@ static void test_profiles() {
   CHECK(p.last_port == 7420);
   p.last_host = "nas";
   p.known_servers[reifs::Profiles::key("nas", 7420)] = "AA:BB";
+  p.known_servers[reifs::Profiles::key("ホスト.例.jp", 7420)] = "CC:DD";   // a CJK host name
   p.save();
   auto q = reifs::Profiles::load();
   CHECK(q.last_host == "nas");
   CHECK(q.known_servers.at("nas:7420") == "AA:BB");
+  CHECK(q.known_servers.at("ホスト.例.jp:7420") == "CC:DD");
   std::filesystem::remove_all(dir);
 }
 
@@ -109,6 +150,7 @@ static void test_live() {
 
 int main() {
   test_format();
+  test_unicode();
   test_fingerprint();
   test_profiles();
   test_live();

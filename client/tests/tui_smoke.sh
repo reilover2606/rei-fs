@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Drive the real terminal UI in tmux against a running server and check that
 # it renders, stays idle, and (with a sanitizer build) never touches freed
-# memory. Usage: tui_smoke.sh CLIENT_BINARY PORT PASSWORD
+# memory. Usage: tui_smoke.sh CLIENT_BINARY PORT PASSWORD [QUERY EXPECTED]
+#
+# With QUERY and EXPECTED (for example 日本語 日本語/ファイル.txt) it also types
+# QUERY into the Search tab and checks that EXPECTED is listed: CJK input,
+# the search and the display of wide characters.
 #
 # It goes through the first-connection fingerprint prompt, visits every tab,
 # opens a few dialogs and quits.
@@ -10,6 +14,8 @@ set -euo pipefail
 BIN=$(realpath "$1")
 PORT=$2
 PASSWORD=$3
+QUERY=${4:-}
+EXPECTED=${5:-}
 SESSION=reifs-smoke-$$
 WORK=$(mktemp -d)
 trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
@@ -23,8 +29,9 @@ fail() {
   exit 1
 }
 
-tmux new-session -d -s "$SESSION" -x 130 -y 36 \
-  "REIFS_CLIENT_HOME='$WORK/home' ASAN_OPTIONS=halt_on_error=1 '$BIN' 127.0.0.1:$PORT 2>'$WORK/stderr'; echo \$? > '$WORK/exit'; sleep 600"
+# -u and a UTF-8 locale: tmux and the client must treat input and output as UTF-8.
+tmux -u new-session -d -s "$SESSION" -x 130 -y 36 \
+  "LC_ALL=C.UTF-8 LANG=C.UTF-8 REIFS_CLIENT_HOME='$WORK/home' ASAN_OPTIONS=halt_on_error=1 '$BIN' 127.0.0.1:$PORT 2>'$WORK/stderr'; echo \$? > '$WORK/exit'; sleep 600"
 
 send() { tmux send-keys -t "$SESSION" "$@"; sleep 1; }
 screen() { tmux capture-pane -t "$SESSION" -p; }
@@ -51,6 +58,16 @@ send 1; send g; send Escape
 send 7; send n; send Escape       # the add-drive dialog
 send 1
 sleep 3
+
+if [ -n "$QUERY" ]; then
+  send 3; send /; send "$QUERY"; send Enter
+  for _ in $(seq 1 15); do                       # the first scan may still be running
+    screen | grep -qF -- "$EXPECTED" && break
+    send Enter
+  done
+  screen | grep -qF -- "$EXPECTED" || fail "searching '$QUERY' did not list '$EXPECTED'"
+  send Escape; send 1
+fi
 
 # Idle: the client must not spin.
 pid=$(pgrep -f "^$BIN 127.0.0.1:$PORT" | head -1) || fail "the client is not running"

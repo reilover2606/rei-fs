@@ -123,11 +123,25 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     return out + sorted(files, key=lambda e: e.name)
 
 
-def find_ids(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
-             node: str | None = None, issues_only: bool = False,
-             under_replicated: bool = False,
-             policy: GoalPolicy = DEFAULT_POLICY) -> list[int]:
-    """Ids of matching files, in path order (cheap: no per-file details)."""
+def name_pattern(pattern: str | None) -> str | None:
+    """The glob to match names (or paths, if it contains "/") against.
+
+    Without wildcards the text means "contains it", ignoring case, so that
+    typing ``report`` finds ``Annual Report.pdf``. With ``*``, ``?`` or ``[``
+    the pattern is a glob that must match the whole name.
+    """
+    if not pattern:
+        return None
+    pat = pattern.casefold()
+    if not any(c in pat for c in "*?["):
+        pat = f"*{pat}*"
+    return pat
+
+
+def _candidates(conn: sqlite3.Connection, tag: str | None, node: str | None,
+                issues_only: bool, under_replicated: bool,
+                policy: GoalPolicy) -> list[tuple[int, str]]:
+    """``(id, vpath)`` of the files passing every filter except the name, in path order."""
     q = "SELECT DISTINCT f.id, f.vpath FROM files f"
     where, args = [], []
     if tag:
@@ -143,18 +157,50 @@ def find_ids(conn: sqlite3.Connection, pattern: str | None = None, tag: str | No
     if where:
         q += " WHERE " + " AND ".join(where)
     q += " ORDER BY f.vpath"
-    pat = pattern.casefold() if pattern else None
     cov = coverage(conn, policy) if under_replicated else None
-    out = []
-    for r in conn.execute(q, args):
-        if pat:
-            target = r["vpath"] if "/" in pat else paths.basename(r["vpath"])
-            if not fnmatch.fnmatchcase(target.casefold(), pat):
-                continue
-        if cov is not None and not cov.is_under(r["id"], policy.copies):
-            continue
-        out.append(r["id"])
-    return out
+    return [(r["id"], r["vpath"]) for r in conn.execute(q, args)
+            if cov is None or cov.is_under(r["id"], policy.copies)]
+
+
+def _name_matches(pat: str, vpath: str) -> bool:
+    target = vpath if "/" in pat else paths.basename(vpath)
+    return fnmatch.fnmatchcase(target.casefold(), pat)
+
+
+def search(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
+           node: str | None = None, issues_only: bool = False, under_replicated: bool = False,
+           policy: GoalPolicy = DEFAULT_POLICY) -> tuple[list[int], list[tuple[str, int]]]:
+    """Matching files (ids, in path order) and matching folders.
+
+    A folder matches when its name (or its path, if the pattern contains a
+    "/") matches, like for files. Each folder comes with the number of files
+    below it that pass the other filters. Without a pattern there are no
+    folders (every folder would match).
+    """
+    candidates = _candidates(conn, tag, node, issues_only, under_replicated, policy)
+    pat = name_pattern(pattern)
+    if pat is None:
+        return [fid for fid, _ in candidates], []
+    ids = [fid for fid, vpath in candidates if _name_matches(pat, vpath)]
+    matching: dict[str, bool] = {}
+    counts: dict[str, int] = {}
+    for _, vpath in candidates:
+        d = paths.parent(vpath)
+        while d != "/":
+            if d not in matching:
+                matching[d] = _name_matches(pat, d)
+            if matching[d]:
+                counts[d] = counts.get(d, 0) + 1
+            d = paths.parent(d)
+    return ids, sorted(counts.items())
+
+
+def find_ids(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
+             node: str | None = None, issues_only: bool = False,
+             under_replicated: bool = False,
+             policy: GoalPolicy = DEFAULT_POLICY) -> list[int]:
+    """Ids of matching files, in path order (cheap: no per-file details)."""
+    return search(conn, pattern, tag, node, issues_only, under_replicated, policy)[0]
 
 
 def find(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,

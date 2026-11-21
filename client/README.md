@@ -59,9 +59,9 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 
 | Tab | What it shows | Keys |
 |---|---|---|
-| Overview | Copies, activity, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
+| Overview | Copies, what the server is busy with (and for how long), database lock, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
 | Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move |
-| Search | Find by name/path glob, tag, problems | `/` type a search, `C`/`M` copy/move all results |
+| Search | Find files and folders by part of a name (or a glob like `*.jpg`), tag, problems | `/` type a search, `Enter` on a result show it in the Tree, `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
@@ -73,6 +73,14 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 (for example `/media/me/SSD`, so it must be mounted there), then its name
 (the folder's name by default). The server writes the drive's ID file, scans it,
 and finds it again wherever it is mounted later.
+
+**The interface never waits for the server.** Every request runs in the
+background: a slow or busy server shows up as `waiting for the server (N, S s)`
+in the status bar while the rest of the interface stays usable, and results
+appear when they arrive. The Overview's *Activity and database* panel shows
+what the server is doing (for example `scanning for 3 min 12 s` and the file it
+is reading), whether the database's write lock is free, in use (and by what)
+or held by another program, and how many writers wait for it.
 
 Decisions, Wanted and Jobs show the items of every paired server (marked
 `@server`); actions on them are sent to that server. Copying to another

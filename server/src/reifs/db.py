@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -307,8 +310,8 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def connect(path: Path | str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+def connect(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, isolation_level=None, timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -332,8 +335,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         )
 
 
-def open_existing(path: Path | str) -> sqlite3.Connection:
-    conn = connect(path)
+def open_existing(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+    conn = connect(path, timeout)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if 1 <= version < SCHEMA_VERSION:
         migrate(conn)
@@ -345,30 +348,107 @@ def open_existing(path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+# --- who is using the database ---------------------------------------------------
+#
+# SQLite allows one writer at a time (readers never wait for it). Every write
+# transaction goes through ``transaction`` below, which records who holds the
+# write lock and who waits for it, so the client can show it.
+
+_state_lock = threading.Lock()
+_holders: dict[int, dict] = {}
+_waiters: dict[int, dict] = {}
+_tokens = itertools.count(1)
+_busy_errors = 0
+_local = threading.local()
+
+
+def set_label(label: str | None) -> None:
+    """Name what the current thread is doing (shown while it holds the lock)."""
+    _local.label = label
+
+
+def _who(label: str | None) -> str:
+    return label or getattr(_local, "label", None) or threading.current_thread().name
+
+
+def note_busy_error() -> None:
+    global _busy_errors
+    with _state_lock:
+        _busy_errors += 1
+
+
+def lock_activity() -> dict:
+    """Snapshot: holders of the write lock, waiting writers, busy errors so far."""
+    now = time.monotonic()
+    with _state_lock:
+        holders = [{"who": h["who"], "seconds": round(now - h["since"], 2)}
+                   for h in _holders.values()]
+        waiting = [{"who": w["who"], "seconds": round(now - w["since"], 2)}
+                   for w in _waiters.values()]
+        return {"holders": holders, "waiting": waiting, "busy_errors": _busy_errors}
+
+
+def probe_lock(path: Path | str) -> bool:
+    """Is the write lock free right now? True = free. Takes it for an instant.
+
+    Catches a lock held by another process (a CLI command), which the
+    in-process records above cannot see.
+    """
+    conn = sqlite3.connect(path, isolation_level=None, timeout=0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
 class transaction:
     """``with transaction(conn):`` -- BEGIN IMMEDIATE / COMMIT / ROLLBACK.
 
-    Nested use joins the outer transaction.
+    Nested use joins the outer transaction. ``label`` says what the
+    transaction is for (default: what the thread declared with set_label, or
+    the thread's name).
     """
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, label: str | None = None):
         self.conn = conn
         self.outer = False
+        self.label = label
+        self.token = 0
 
     def __enter__(self) -> sqlite3.Connection:
         if self.conn.in_transaction:
             self.outer = True
-        else:
+            return self.conn
+        self.token = next(_tokens)
+        who = _who(self.label)
+        with _state_lock:
+            _waiters[self.token] = {"who": who, "since": time.monotonic()}
+        try:
             self.conn.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            with _state_lock:
+                _waiters.pop(self.token, None)
+            raise
+        with _state_lock:
+            _waiters.pop(self.token, None)
+            _holders[self.token] = {"who": who, "since": time.monotonic()}
         return self.conn
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.outer:
             return
-        if exc_type is None:
-            self.conn.execute("COMMIT")
-        else:
-            self.conn.execute("ROLLBACK")
+        try:
+            if exc_type is None:
+                self.conn.execute("COMMIT")
+            else:
+                self.conn.execute("ROLLBACK")
+        finally:
+            with _state_lock:
+                _holders.pop(self.token, None)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
