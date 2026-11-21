@@ -165,7 +165,15 @@ std::string Api::server_name() const {
 
 json Api::get(const std::string& path) { return request("GET", path, nullptr); }
 
-json Api::post(const std::string& path, const json& body) { return request("POST", path, &body); }
+json Api::post(const std::string& path, const json& body) {
+  // A body written as {} in the code is a null json, which is not what the server
+  // wants: "no body" always goes out as an empty object.
+  if (body.is_null()) {
+    json empty = json::object();
+    return request("POST", path, &empty);
+  }
+  return request("POST", path, &body);
+}
 
 json Api::request(const std::string& method, const std::string& path, const json* body) {
   auto started = std::chrono::steady_clock::now();

@@ -952,6 +952,8 @@ class Api:
         fn, access, match = route
         try:
             body = json.loads(body_bytes or b"{}")
+            if body is None:       # "null" is how a client says "no body"
+                body = {}
             if not isinstance(body, dict):
                 raise ValueError("body must be a JSON object")
         except ValueError as e:
