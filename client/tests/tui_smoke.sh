@@ -55,6 +55,7 @@ send 2; send Enter; send Left
 send 9; send k; send Escape
 send '?'; send Escape
 send 1; send g; send Escape
+send 2; send x; send Escape      # pick up an item and put it down again
 send 7; send n; send Escape       # the add-drive dialog
 send 1
 sleep 3

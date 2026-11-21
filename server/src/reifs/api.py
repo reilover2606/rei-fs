@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries,
+from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries, vmove,
                replication, ssh, sync, tags, tls)
 from .config import Config
 from .paths import to_physical
@@ -161,6 +161,7 @@ class Api:
         r("POST", r"/api/wanted", self.act_wanted)
         r("GET", r"/api/jobs", self.list_jobs)
         r("POST", r"/api/jobs", self.create_job)
+        r("POST", r"/api/vmove", self.vmove)
         r("POST", r"/api/jobs/run", self.run_jobs)
         r("GET", r"/api/jobs/(?P<id>\d+)", self.show_job)
         r("POST", r"/api/jobs/(?P<id>\d+)/(?P<action>cancel|retry)", self.job_action)
@@ -509,6 +510,16 @@ class Api:
 
     def create_job(self, conn, q, body, **_):
         kind = body.get("kind")
+        if kind == "rename":  # from the server that planned a virtual move
+            try:
+                rep = vmove.create_rename_job(conn, str(body.get("node", "")),
+                                              list(body.get("renames", [])),
+                                              str(body.get("description") or "rename"))
+            except (jobs.JobError, nodes.NodeError) as e:
+                raise ApiError(409, str(e)) from None
+            if rep.job_id is not None and self.worker:
+                self.worker.request_jobs()
+            return {"job_id": rep.job_id, "items": rep.items, "excluded": {}}
         if kind not in ("copy", "move"):
             raise ApiError(400, "kind must be 'copy' or 'move'")
         try:
@@ -524,6 +535,33 @@ class Api:
             self.worker.request_jobs()
         return {"job_id": rep.job_id, "items": rep.items,
                 "excluded": {k: len(v) for k, v in rep.excluded.items()}}
+
+    def vmove(self, conn, q, body, **_):
+        """Move files/directories within the virtual tree (renames on every node).
+
+        With ``dry_run`` only report what would happen (the client uses it to
+        ask merge-or-preserve when the names clash).
+        """
+        sources = [str(p) for p in body.get("paths", [])]
+        dest = str(body.get("to", "/"))
+        name = body.get("name") or None
+        try:
+            plan = vmove.plan_move(conn, sources, dest, name,
+                                   str(body.get("on_conflict") or "merge"))
+        except vmove.MoveError as e:
+            raise ApiError(400, str(e)) from None
+        out = plan.summary()
+        if body.get("dry_run"):
+            out["dry_run"] = True
+            return out
+        res = vmove.apply_plan(conn, plan, vmove.describe(sources, dest, name))
+        if res.job_id is not None and self.worker:
+            self.worker.request_jobs()
+        out.update({"job_id": res.job_id, "items": res.items + sum(n for _, _, n in
+                                                                   res.remote_jobs),
+                    "remote_jobs": len(res.remote_jobs), "marked": res.marked,
+                    "errors": res.errors})
+        return out
 
     def run_jobs(self, conn, q, body, **_):
         self._need_worker().request_jobs()

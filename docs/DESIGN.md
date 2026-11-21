@@ -256,6 +256,34 @@ capabilities. Restricted-name nodes reject non-portable names. Case-
 insensitive nodes reject vpaths that would collide with an existing file
 there.
 
+### 5.5 Moving within the virtual tree
+
+The user can move files and directories to another place in the virtual tree
+(`POST vmove {paths, to, name?, on_conflict, dry_run}`). The *vpath* of the
+files changes, so every node holding a copy renames it: the plan is made from
+the replicated index, nodes of this server get a job of `rename` items, and the
+server owning other nodes is asked (`POST jobs {kind: "rename", node, renames}`)
+to rename on its own. Nothing is copied or deleted. Tags follow the move, an
+offline node renames when it comes back, and a rename that cannot be done (the
+target exists on disk, the file changed, a name the node cannot hold) is
+reported by the job and left as it was.
+
+When the destination already holds something with the same name the user picks
+(`dry_run` tells the client whether to ask):
+
+* **merge** (default). Directories are combined (they are only prefixes). A file
+  meeting a file of the same name becomes *one* file with the copies of both.
+  Identical copies on one node are redundant: the moved one is marked for
+  deletion, never deleted. Different content makes two versions of one file, the
+  newest wins and the usual `divergent` decision offers to update the stale
+  copies. If one node holds both files with different content they cannot be one
+  file there, so the moved file keeps its own name with `(2)` added.
+* **preserve**. Nothing is mixed: the moved item takes a free name (`photos (2)`,
+  `a (2).txt`).
+
+A file moved onto a directory name (or the reverse), and two moved items with the
+same name, always get a free name. Moving a directory into itself is refused.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies
@@ -475,6 +503,7 @@ Endpoints (all JSON, under `/api`):
 | `GET decisions`, `POST decisions/<id> {option}` | Decision stack |
 | `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |
 | `GET jobs?all=1`, `GET jobs/<id>`, `POST jobs {kind, paths, tag, to, from}` | Jobs |
+| `POST vmove {paths, to, name?, on_conflict: merge\|preserve, dry_run?}` | Move within the virtual tree (5.5) |
 | `POST jobs/run`, `POST jobs/<id>/cancel`, `POST jobs/<id>/retry` | Job control |
 | `GET marked?node=`, `POST unmark {paths, node, all}` | Deletion marks |
 | `GET replication`, `POST replication {copies, tag_copies, auto_replicate}`, `POST replication/plan` | Copy goal |
