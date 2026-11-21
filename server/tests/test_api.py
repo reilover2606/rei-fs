@@ -386,3 +386,19 @@ def test_long_lists_are_bounded(server):
     assert len(client.get("/api/decisions")["decisions"]) == len(fids)       # no limit: all
     marked = client.get("/api/marked?limit=1")
     assert len(marked["marked"]) == 1 and marked["total"] == len(fids) and marked["total_size"] > 0
+
+
+def test_tree_says_what_this_servers_node_holds(server):
+    env, client, _ = server
+    login(client)
+    out = client.get("/api/tree?path=/")
+    assert out["this_node"] == "srv"
+    assert {e["name"]: e["here"] for e in out["entries"] if e["dir"]} == {"docs": 2}
+    # A file only the ssd node holds is not "here".
+    write(env.ssd / "only-ssd" / "x.txt", "x", mtime=1_000_000)
+    client.post("/api/scan")
+    wait_idle(client)
+    out = client.get("/api/tree?path=/")
+    assert {e["name"]: e["here"] for e in out["entries"] if e["dir"]} == {"docs": 2, "only-ssd": 0}
+    top = client.get("/api/tree?path=/docs")
+    assert all(e["here"] for e in top["entries"] if not e["dir"])

@@ -70,6 +70,9 @@ class ScanSection:
     synchronous_minutes: int = 1
     frequent_minutes: int = 10
     archival_minutes: int = 0
+    # A scan that finds at least this many files vanished from (or moved out of)
+    # the same folder raises ONE decision for the folder, not one per file.
+    group_decisions_min: int = 5
     ignore_hidden_dirs: bool = True
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
@@ -231,6 +234,9 @@ interval_minutes = {self.scan.interval_minutes}
 synchronous_minutes = {self.scan.synchronous_minutes}
 frequent_minutes = {self.scan.frequent_minutes}
 archival_minutes = {self.scan.archival_minutes}
+# Files that vanish or move together (a deleted or moved folder) are decided as one.
+# 0 = one decision per file.
+group_decisions_min = {self.scan.group_decisions_min}
 # Skip directories whose name starts with '.'.
 ignore_hidden_dirs = {b(self.scan.ignore_hidden_dirs)}
 # Glob patterns. Without '/', a pattern matches a file or directory name;

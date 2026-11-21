@@ -227,6 +227,38 @@ def add_decision(
     return cur.lastrowid
 
 
+def group_decisions(conn: sqlite3.Connection, member_kind: str, node_id: str,
+                    entries: list[tuple[int, str, dict]], minimum: int) -> int:
+    """Gather decisions that belong together under one 'group' decision.
+
+    ``entries``: (decision id, group key, what to show for the group). Keys with
+    at least ``minimum`` members get a group (or join the open group with that
+    key). Returns the number of decisions grouped.
+    """
+    if minimum <= 0:
+        return 0
+    buckets: dict[str, list[tuple[int, dict]]] = {}
+    for did, key, info in entries:
+        buckets.setdefault(key, []).append((did, info))
+    grouped = 0
+    for key, members in buckets.items():
+        existing = conn.execute(
+            "SELECT id FROM decisions WHERE kind = 'group' AND status = 'open' AND node_id = ?"
+            " AND json_extract(data, '$.key') = ? AND json_extract(data, '$.member_kind') = ?",
+            (node_id, key, member_kind)).fetchone()
+        if existing is None and len(members) < minimum:
+            continue
+        if existing is not None:
+            gid = existing[0]
+        else:
+            info = dict(members[0][1], key=key, member_kind=member_kind)
+            gid = add_decision(conn, "group", None, node_id, info)
+        conn.executemany("UPDATE decisions SET parent_id = ? WHERE id = ?",
+                         [(gid, did) for did, _ in members])
+        grouped += len(members)
+    return grouped
+
+
 def obsolete_decisions(
     conn: sqlite3.Connection, fid: int, kinds: tuple[str, ...], node_id: str | None = None,
     statuses: tuple[str, ...] = ("open",),

@@ -87,8 +87,34 @@ def file_json(info: queries.FileInfo, full: bool = True) -> dict:
     return out
 
 
-def decision_json(d: decisions.Decision, names: dict[str, str]) -> dict:
-    if d.kind == "missing":
+def _human(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def decision_json(d: decisions.Decision, names: dict[str, str],
+                  conn: sqlite3.Connection | None = None) -> dict:
+    members = 0
+    kind = d.kind
+    if d.kind == "group":
+        members, size = decisions.group_info(conn, d.id) if conn is not None else (0, 0)
+        mk, where = d.data.get("member_kind", ""), d.node_name
+        kind = {"missing": "gone files", "rename": "moved folder"}.get(mk, "group")
+        if mk == "missing" and d.data.get("mode") == "gone":
+            kind = "gone folder"
+            summary = f"Folder {d.data['dir']}/ vanished from {where}: {members} file(s)"
+        elif mk == "missing":
+            summary = f"{members} file(s) vanished from {d.data['dir']}/ on {where}"
+        else:
+            summary = (f"Folder moved on {where}: {d.data['from']}/ -> {d.data['to']}/ "
+                       f"({members} file(s)); still at the old path on other nodes")
+        if members:
+            summary += f", {_human(size)}"
+    elif d.kind == "missing":
         summary = f"Copy vanished from {d.node_name}"
         if d.data.get("other_copies") == 0:
             summary += " (it was the last copy)"
@@ -105,9 +131,14 @@ def decision_json(d: decisions.Decision, names: dict[str, str]) -> dict:
                    f"on {d.node_name}")
     else:
         summary = d.kind
-    return {"id": d.id, "kind": d.kind, "path": d.vpath or d.data.get("vpath"),
-            "node": d.node_name, "summary": summary, "created": d.created,
-            "options": [{"key": k, "label": v} for k, v in d.options.items()]}
+    path = d.vpath or d.data.get("vpath") or (d.data.get("dir") or d.data.get("from"))
+    out = {"id": d.id, "kind": kind, "path": path,
+           "node": d.node_name, "summary": summary, "created": d.created,
+           "options": [{"key": k, "label": v} for k, v in d.options.items()]}
+    if d.kind == "group":
+        out["group"] = True
+        out["members"] = members
+    return out
 
 
 def job_json(conn: sqlite3.Connection, j: sqlite3.Row) -> dict:
@@ -162,6 +193,7 @@ class Api:
         r("GET", r"/api/tags", self.list_tags)
         r("POST", r"/api/tags", self.edit_tags)
         r("GET", r"/api/decisions", self.list_decisions)
+        r("GET", r"/api/decisions/(?P<id>\d+)/members", self.decision_members)
         r("POST", r"/api/decisions/(?P<id>\d+)", self.resolve_decision)
         r("GET", r"/api/wanted", self.list_wanted)
         r("POST", r"/api/wanted", self.act_wanted)
@@ -441,14 +473,17 @@ class Api:
         for e in entries:
             if e.is_dir:
                 child = paths.join(vdir, e.name)
-                out.append({"name": e.name, "dir": True, "files": e.files,
+                out.append({"name": e.name, "dir": True, "files": e.files, "here": e.here,
                             "priority": prefs.prefs.get(child, here),
                             "set_here": child in prefs.prefs})
             else:
                 f = file_json(e.file, full=False)
                 f["dir"] = False
+                f["here"] = bool(e.here)
                 out.append(f)
-        return {"path": vdir, "entries": out, "priority": here}
+        mine = conn.execute("SELECT name FROM nodes WHERE id = ?", (nodes.self_id(conn),)).fetchone()
+        return {"path": vdir, "entries": out, "priority": here,
+                "this_node": mine[0] if mine else ""}
 
     def file(self, conn, q, body, **_):
         info = queries.lookup(conn, q.get("path", ""), replication.policy(self.cfg))
@@ -490,12 +525,19 @@ class Api:
     def list_decisions(self, conn, q, body, caller=None, **_):
         names = {r[0]: r[1] for r in conn.execute("SELECT id, name FROM nodes")}
         limit = min(int(q.get("limit", 0) or 0), 5000) or None   # None: all (the CLI, scripts)
-        items = [decision_json(d, names) for d in decisions.list_decisions(conn, limit=limit)]
+        items = [decision_json(d, names, conn)
+                 for d in decisions.list_decisions(conn, limit=limit)]
         total = decisions.count_decisions(conn)
         path = "/api/decisions" + (f"?limit={limit}" if limit else "")
         result = self._everywhere(conn, q, caller, path, "decisions", items)
         result["total"] = total
         return result
+
+    def decision_members(self, conn, q, body, id, **_):
+        """Some of the paths a group decision stands for."""
+        n, _ = decisions.group_info(conn, int(id))
+        return {"members": n, "paths": decisions.group_members(conn, int(id),
+                                                              min(int(q.get("limit", 50)), 500))}
 
     def resolve_decision(self, conn, q, body, id, **_):
         summary = decisions.resolve(conn, int(id), str(body.get("option", "")))
