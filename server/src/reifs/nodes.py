@@ -191,8 +191,6 @@ def move_root(conn: sqlite3.Connection, cfg: Config, node: str, new_path: str,
     row = get_node(conn, node)
     if row["owner_id"] != self_id(conn):
         raise NodeError(f"node {row['name']!r} belongs to another server; do this there")
-    if row["kind"] == "server":
-        raise NodeError("the server's own folder is set with [storage] root in its config file")
     target = Path(os.path.expanduser(new_path.strip()))
     if not target.is_absolute():
         raise NodeError(f"{new_path!r} is not an absolute path (it is read on the server)")
@@ -226,6 +224,9 @@ def move_root(conn: sqlite3.Connection, cfg: Config, node: str, new_path: str,
                             f"{'missing' if marker is None else 'another node' + chr(39) + 's'})")
     with db.transaction(conn):
         conn.execute("UPDATE nodes SET root_path = ? WHERE id = ?", (str(target), row["id"]))
+    if row["kind"] == "server":   # the config names the server's folder too
+        cfg.storage.root = str(target)
+        cfg.save()
     discover(conn, cfg)   # capabilities, free space, online state, ssh path
     return target
 
@@ -318,6 +319,10 @@ def discover(conn: sqlite3.Connection, cfg: Config) -> Discovery:
     for row in owned.values():
         if row["root_path"]:
             consider(Path(row["root_path"]))
+    # The server's own folder as the config names it: moving the folder and
+    # editing [storage] root must find the node again.
+    if cfg.storage.root:
+        consider(Path(cfg.storage.root))
 
     # Always look at the mount points too: a moved drive, or another server's
     # drive plugged in here (shown as foreign, can be adopted).
