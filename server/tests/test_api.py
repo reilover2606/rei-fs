@@ -442,7 +442,7 @@ def test_routine_connection_endings_are_not_logged_or_counted(caplog):
         apimod._connection_problem("handshake_failed", "127.0.0.1", ConnectionResetError())
     assert apimod.CONNECTION_STATS == before and caplog.records == []
     with caplog.at_level(logging.INFO, logger="reifs.api"):
-        apimod._last_summary[0] = 0.0
+        apimod._last_summary[0] = float("-inf")
         apimod._connection_problem("dropped", "10.0.0.5", OSError("something odd"))
         apimod._connection_problem("dropped", "10.0.0.5", OSError("again"))
     assert apimod.CONNECTION_STATS["dropped"] == before["dropped"] + 2

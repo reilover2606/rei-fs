@@ -1094,7 +1094,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 # Why connections end early, for the log and the status (a client that "cannot connect").
 CONNECTION_STATS = {"handshake_failed": 0, "dropped": 0}
-_last_summary = [0.0]
+_last_summary = [float("-inf")]   # monotonic time counts from boot: 0 would mean "just now"
 _ROUTINE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError,
             ssl.SSLEOFError, ssl.SSLZeroReturnError)
 
