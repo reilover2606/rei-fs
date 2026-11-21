@@ -42,8 +42,12 @@ std::string format_time(std::int64_t seconds) {
 std::string url_encode(const std::string& value) {
   static const char* hex = "0123456789ABCDEF";
   std::string out;
+  // Every byte of a UTF-8 sequence is >= 0x80 and gets percent-encoded. The
+  // ASCII test is spelled out: isalnum() depends on the locale and may accept
+  // some bytes >= 0x80 (Latin-1 locales), which would corrupt CJK text.
   for (unsigned char c : value) {
-    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+    bool ascii_alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    if (ascii_alnum || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
       out += static_cast<char>(c);
     } else {
       out += '%';

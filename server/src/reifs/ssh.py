@@ -48,7 +48,7 @@ def ensure_key(home: Path, comment: str) -> str:
     """Create the server's key pair if needed; return the public key line."""
     priv, pub = key_path(home), key_path(home).with_suffix(".pub")
     if priv.exists() and pub.exists():
-        return pub.read_text().strip()
+        return pub.read_text(encoding="utf-8").strip()
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -66,7 +66,7 @@ def ensure_key(home: Path, comment: str) -> str:
     line = key.public_key().public_bytes(serialization.Encoding.OpenSSH,
                                          serialization.PublicFormat.OpenSSH).decode()
     line = f"{line} rei-fs:{comment}"
-    pub.write_text(line + "\n")
+    pub.write_text(line + "\n", encoding="utf-8")
     return line
 
 
@@ -115,13 +115,16 @@ def install(lines: list[str], path: Path | None = None) -> tuple[Path, int]:
         os.chmod(path.parent, 0o700)
     except OSError:
         pass
-    existing = path.read_text().splitlines() if path.exists() else []
+    # authorized_keys belongs to the user and may contain anything (comments in any
+    # script, even bytes that are not UTF-8): read it so that it is written back unchanged.
+    existing = (path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+                if path.exists() else [])
     keys_present = {" ".join(_key_of(line)) for line in existing}
     new = [line for line in lines if " ".join(_key_of(line)) not in keys_present]
     if new:
         needs_newline = path.exists() and path.stat().st_size > 0 and \
             not path.read_bytes().endswith(b"\n")
-        with open(path, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8", errors="surrogateescape") as f:
             f.write(("\n" if needs_newline else "") + "".join(line + "\n" for line in new))
         try:
             os.chmod(path, 0o600)

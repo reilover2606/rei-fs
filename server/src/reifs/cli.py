@@ -1024,7 +1024,45 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _use_utf8() -> None:
+    """File names are Unicode: make sure Python reads and writes them as UTF-8.
+
+    On a machine whose locale is not UTF-8 (LANG=C, a Latin-1 locale) Python's
+    file system encoding would be ASCII or Latin-1, and every CJK name would
+    be read as garbage or rejected. Python's UTF-8 mode fixes that but can only
+    be chosen at startup, so the command restarts itself once with it. (Not
+    needed on Windows, where names are always UTF-16 for Python, nor when
+    called from a program or test with explicit arguments.)
+    """
+    if os.environ.get("REIFS_NO_REEXEC") or sys.flags.utf8_mode:
+        return
+    if sys.getfilesystemencoding().lower().replace("-", "").replace("_", "") == "utf8":
+        return
+    os.environ["PYTHONUTF8"] = "1"
+    try:
+        os.execv(sys.executable, [sys.executable, "-X", "utf8", "-m", "reifs", *sys.argv[1:]])
+    except OSError:
+        pass   # cannot restart: carry on with what we have
+
+
+def _robust_streams() -> None:
+    """Printing a name the terminal cannot show must not crash the command:
+    unsupported characters are written as escapes (\u65e5) instead. A redirected
+    output on Windows is UTF-8, not the console's legacy code page."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if os.name == "nt" and not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            else:
+                stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:        # started as a command, not called by a program
+        _use_utf8()
+    _robust_streams()
     args = build_parser().parse_args(argv)
     if args.home is None:
         args.home = default_home()

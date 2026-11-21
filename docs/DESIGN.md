@@ -145,6 +145,19 @@ basenames match are preferred.
   user decides, `P` and `Q` are separate files and `Q` keeps a copy of `P`'s
   tags.
 
+### 4.2b Unicode names
+
+Names are Unicode strings, stored and compared exactly (no normalisation, so
+NFC and NFD spellings are different files). A name that is not valid UTF-8
+cannot be stored and is skipped with an error. Case-insensitive comparisons use
+Unicode case folding. The 255 limit counts UTF-8 bytes, which is the strictest
+of the common file systems. To read names correctly whatever the locale, the
+`reifs` command restarts itself in Python's UTF-8 mode when the file system
+encoding is not UTF-8, and its output never fails on a character the terminal
+cannot show. rsync receives names as bytes (`--files-from` with NUL separators,
+UTF-8); the path of a node on a remote server is backslash-escaped for the
+remote shell when the client's rsync does not do it itself (before 3.2.4).
+
 ### 4.3 Diverging versions (decision: `divergent`)
 
 When copies of the same vpath have different hashes, the copy with the

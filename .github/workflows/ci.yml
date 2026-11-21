@@ -90,6 +90,9 @@ jobs:
           cd server
           uv sync
           uv run reifs init --name ci --root "$RUNNER_TEMP/reifs-root"
+          # Names in other scripts: indexed, searched and shown by the client.
+          mkdir -p "$RUNNER_TEMP/reifs-root/日本語"
+          echo hello > "$RUNNER_TEMP/reifs-root/日本語/ファイル.txt"
           uv run python -c "from reifs.config import Config, default_home; from reifs import auth; c = Config.load(default_home()); c.server.password_hash = auth.hash_password('secret'); c.server.listen = '127.0.0.1:7499'; c.save()"
           uv run reifs serve > "$RUNNER_TEMP/serve.log" 2>&1 &
           for i in $(seq 1 30); do sleep 1; uv run reifs fingerprint > /dev/null 2>&1 && break; done
@@ -104,8 +107,8 @@ jobs:
           test "$SEEN" = "$FP"
           if [ "$RUNNER_OS" = "Linux" ]; then
             # Drive the real terminal UI (first connection, every tab, dialogs).
-            tests/tui_smoke.sh build-asan/rei-fs 7499 secret
-            tests/tui_smoke.sh build/rei-fs 7499 secret
+            tests/tui_smoke.sh build-asan/rei-fs 7499 secret 日本 /日本語/
+            tests/tui_smoke.sh build/rei-fs 7499 secret ファイル 日本語/ファイル.txt
           fi
           cat "$RUNNER_TEMP/serve.log"
       - name: Stop the server

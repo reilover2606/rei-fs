@@ -21,6 +21,34 @@ Status: all five planned milestones are done:
 5. replication to two copies, with optional automatic approval. See the server's
 [README](server/README.md) to try it.
 
+## Unicode
+
+File, folder, node and tag names can use any script (CJK, Korean, Thai, Arabic,
+Hebrew, emoji, characters outside the basic plane, ...). Names are kept exactly
+as they are on disk, and every part of the system is tested with them: scanning,
+search, the API, the client's display and input, and transfers (rsync, the
+rsync daemon and SSH).
+
+* **Exact names.** Two spellings of the same visible name (for example `é` as
+  one character or as `e` plus a combining accent) are two different files.
+  Some file systems (macOS) rewrite names to the second form; copy between such
+  a drive and others and you will see the file under both spellings.
+* **Names that are not valid UTF-8** (possible on Linux file systems that store
+  raw bytes) cannot be represented and are skipped, with a message in the scan
+  result.
+* **The locale does not matter.** On a machine whose locale is not UTF-8
+  (`LANG=C`, a Latin-1 locale) the `reifs` command restarts itself in Python's
+  UTF-8 mode, so names are not read as garbage. A terminal that cannot show a
+  character gets an escape (`\u65e5`) instead of an error.
+* **Terminal and fonts.** The client needs a UTF-8 terminal and a font that has the
+  characters; wide characters (CJK, emoji) take two cells and are aligned
+  accordingly.
+* **Length.** A name may be up to 255 bytes in UTF-8 (about 85 CJK characters);
+  longer names are flagged as non-portable.
+* **SSH transfers** assume a POSIX shell on the machine serving the files, and
+  work whatever the folder's name contains (spaces, quotes, `$`, CJK), also with
+  rsync older than 3.2.4 and with `rrsync`-restricted keys.
+
 ## Platforms
 
 CI (`.github/workflows/ci.yml`) runs on every push, on Linux and Windows.

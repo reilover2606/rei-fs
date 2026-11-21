@@ -18,6 +18,7 @@ hash afterwards.
 
 from __future__ import annotations
 
+import functools
 import os
 import queue
 import re
@@ -77,7 +78,8 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
     """rsync command line; ``remote`` (peers.RemoteSource) pulls from a peer's daemon."""
     style = cfg.rsync.path_style
     scratch = Path(dst_root) / SCRATCH
-    source = remote.url() if remote else rsync_path(src_root, style).rstrip("/\\") + "/"
+    source = remote.url(manual_escape=needs_manual_escape(cfg)) if remote \
+        else rsync_path(src_root, style).rstrip("/\\") + "/"
     if remote is None:
         daemon_opts = []
     elif getattr(remote, "password", None) is None:  # over SSH
@@ -100,6 +102,32 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
         source,
         rsync_path(dst_root, style).rstrip("/\\") + "/",
     ]
+
+
+@functools.lru_cache(maxsize=8)
+def rsync_version(rsync: str) -> tuple[int, int, int]:
+    """(major, minor, patch) of the rsync program; a recent one if it cannot be told."""
+    try:
+        out = subprocess.run([rsync, "--version"], capture_output=True, text=True, timeout=10,
+                             errors="replace").stdout
+        m = re.search(r"version\s+(\d+)\.(\d+)(?:\.(\d+))?", out)
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return (3, 9, 0)
+
+
+def needs_manual_escape(cfg: Config) -> bool:
+    """Does this rsync send a remote (SSH) path unprotected?
+
+    rsync 3.2.4 started to backslash-escape remote arguments itself; before
+    that, or with RSYNC_OLD_ARGS set, it does not and we must (see
+    peers.escape_remote_path).
+    """
+    if os.environ.get("RSYNC_OLD_ARGS"):
+        return True
+    return rsync_version(cfg.rsync.path) < (3, 2, 4)
 
 
 def ssh_command(cfg: Config, remote) -> str:
@@ -146,7 +174,8 @@ def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: lis
         cmd = build_command(cfg, src_root, dst_root, list_file, remote)
         env = None
         if remote is not None and getattr(remote, "password", None) is not None:
-            env = dict(os.environ, RSYNC_PASSWORD=remote.password)
+            env = dict(os.environ, RSYNC_PASSWORD=remote.password)       # rsync daemon
+
         with tempfile.TemporaryFile(dir=tmp_dir) as err:
             try:
                 # Its own process group (POSIX): rsync is several processes, and

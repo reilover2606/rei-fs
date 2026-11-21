@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import re
 import secrets
 import sqlite3
 import ssl
@@ -344,9 +345,25 @@ class RemoteSource:
     user: str
     password: str
 
-    def url(self) -> str:
+    def url(self, manual_escape: bool = False) -> str:
         host = f"[{self.host}]" if ":" in self.host else self.host
         return f"rsync://{self.user}@{host}:{self.port}/{self.module}/"
+
+
+def escape_remote_path(path: str) -> str:
+    """Backslash-escape a path for an rsync pull over SSH, as rsync >= 3.2.4 does
+    by itself, for older rsync clients that send it unprotected.
+
+    The remote shell splits and expands what ssh sends it, and ``rrsync`` (the
+    read-only restriction on the key) splits on whitespace and understands
+    backslash escapes only, not quotes; so spaces, quotes, ``$``, parentheses
+    and so on in a node's folder need a backslash. Characters of other scripts
+    (CJK, ...) are special to neither and are left alone. Like current rsync
+    this does not turn ``*?[`` into literals for rsync's own wildcard matching:
+    a pattern that matches nothing is used as written.
+    Assumes a POSIX shell on the serving machine.
+    """
+    return re.sub(r"([^A-Za-z0-9_./,:+@%=~\-\x80-\U0010ffff])", r"\\\1", path)
 
 
 @dataclass
@@ -357,10 +374,12 @@ class SshSource:
     user: str
     root: str          # node root as rsync on that machine names it
 
-    def url(self) -> str:
+    def url(self, manual_escape: bool = False) -> str:
+        """``manual_escape``: the rsync client does not protect the path itself."""
         host = f"[{self.host}]" if ":" in self.host else self.host
         user = f"{self.user}@" if self.user else ""
-        return f"{user}{host}:{self.root.rstrip('/')}/"
+        path = self.root.rstrip("/") + "/"
+        return f"{user}{host}:{escape_remote_path(path) if manual_escape else path}"
 
 
 def ssh_source(peer: sqlite3.Row, node: sqlite3.Row) -> SshSource | None:
