@@ -174,6 +174,9 @@ class Api:
         self.tokens: dict[str, float] = {}
         self.tokens_lock = threading.Lock()
         self.server_id = ""
+        self._tree_cache: dict[str, tuple] = {}
+        self._tree_lock = threading.Lock()
+        self._tree_compute = threading.Lock()
         self.routes: list[Route] = []
         r = self._route
         r("POST", r"/api/login", self.login, "public")
@@ -307,6 +310,7 @@ class Api:
             "divergent": s.divergent, "missing_copies": s.missing_copies,
             "marked_delete": s.marked_delete, "non_portable": s.non_portable,
             "open_decisions": s.open_decisions, "open_wanted": s.open_wanted,
+            "coverage_stale": s.coverage_stale,
             "active_jobs": conn.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running', 'waiting')"
             ).fetchone()[0],
@@ -325,18 +329,19 @@ class Api:
     def list_nodes(self, conn, q, body, **_):
         me = nodes.self_id(conn)
         out = []
+        # The totals per node come with the coverage figures (one pass, cached), not from
+        # a scan of every copy for every node on every request.
+        cov, _stale = queries.coverage_stats(conn, replication.policy(self.cfg))
         for r in conn.execute(
-            "SELECT n.*, s.name AS owner, s.online AS owner_online,"
-            " (SELECT COUNT(*) FROM copies c WHERE c.node_id = n.id)"
-            " AS files, (SELECT COALESCE(SUM(size), 0) FROM copies c WHERE c.node_id = n.id)"
-            " AS bytes FROM nodes n JOIN servers s ON s.id = n.owner_id ORDER BY n.name"
+            "SELECT n.*, s.name AS owner, s.online AS owner_online"
+            " FROM nodes n JOIN servers s ON s.id = n.owner_id ORDER BY n.name"
         ):
             out.append({
                 "id": r["id"], "name": r["name"], "kind": r["kind"], "online": bool(r["online"]),
                 "owner": "self" if r["owner_id"] == me else r["owner"],
                 "owner_id": r["owner_id"],
                 "reachable": bool(r["online"]) and (r["owner_id"] == me or bool(r["owner_online"])),
-                "files": r["files"], "bytes": r["bytes"],
+                "files": cov.node_files.get(r["id"], 0), "bytes": cov.node_bytes.get(r["id"], 0),
                 "case_sensitive": bool(r["case_sensitive"]),
                 "restricted_names": bool(r["restricted_names"]), "priority": r["priority"],
                 "replication_target": bool(r["replication_target"]),
@@ -465,6 +470,30 @@ class Api:
 
     def tree(self, conn, q, body, **_):
         vdir = paths.normalize(q.get("path", "/"))
+        # Listing a directory with millions of files below it takes seconds: such a
+        # listing may be a few seconds old while background work changes the index
+        # (our own changes clear the cache, so the user always sees their actions).
+        seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] or 0
+        now = time.monotonic()
+        with self._tree_lock:
+            hit = self._tree_cache.get(vdir)
+        if hit is not None and (hit[0] == seq or (hit[2] > 0.3 and now - hit[3] < max(10, 3 * hit[2]))):
+            return hit[1]
+        with self._tree_compute:   # one at a time; others reuse the result
+            with self._tree_lock:
+                hit = self._tree_cache.get(vdir)
+            if hit is not None and hit[0] == seq:
+                return hit[1]
+            started = time.monotonic()
+            payload = self._tree_payload(conn, vdir)
+            took = time.monotonic() - started
+            with self._tree_lock:
+                self._tree_cache[vdir] = (seq, payload, took, time.monotonic())
+                if len(self._tree_cache) > 200:
+                    self._tree_cache.pop(next(iter(self._tree_cache)))
+            return payload
+
+    def _tree_payload(self, conn, vdir: str) -> dict:
         entries = queries.list_dir(conn, vdir, replication.policy(self.cfg))
         if entries is None:
             raise ApiError(404, f"not a directory in the virtual tree: {vdir}")
@@ -483,7 +512,7 @@ class Api:
                 f["here"] = bool(e.here)
                 out.append(f)
         mine = conn.execute("SELECT name FROM nodes WHERE id = ?", (nodes.self_id(conn),)).fetchone()
-        return {"path": vdir, "entries": out, "priority": here,
+        return {"path": vdir, "entries": out, "priority": here, "more_files": entries.more,
                 "this_node": mine[0] if mine else ""}
 
     def file(self, conn, q, body, **_):
@@ -959,6 +988,9 @@ class Api:
                 raise ValueError("body must be a JSON object")
         except ValueError as e:
             return 400, {"error": f"bad JSON body: {e}"}
+        if method == "POST":
+            with self._tree_lock:
+                self._tree_cache.clear()   # the user's own changes show at once
         # A client waits for the answer: report a busy database after 10 s, not 30.
         db.set_label(f"{method} {parts.path}")
         token_id = next(self._request_ids)
@@ -1001,8 +1033,15 @@ class Api:
         except USER_ERRORS as e:
             return 400, {"error": str(e).strip("'\"")}
         except (sqlite3.OperationalError, db.DatabaseLocked) as e:
-            db.note_busy_error()
-            log.warning("database busy: %s", e)
+            if "disk is full" not in str(e):
+                db.note_busy_error()
+                log.warning("database busy: %s", e)
+            if "disk is full" in str(e):
+                log.error("SQLite ran out of room for its temporary files (%s): they go to %s;"
+                          " set SQLITE_TMPDIR to a folder with space", e,
+                          os.environ.get("SQLITE_TMPDIR") or "the system temp directory")
+                return 500, {"error": f"the database ran out of room for temporary files ({e}); "
+                                      "set SQLITE_TMPDIR to a folder with more space"}
             return 503, {"error": "the server is busy (its database is locked by another operation); "
                                    f"try again in a moment ({e})"}
         finally:
@@ -1055,6 +1094,26 @@ class _Handler(BaseHTTPRequestHandler):
 
 # Why connections end early, for the log and the status (a client that "cannot connect").
 CONNECTION_STATS = {"handshake_failed": 0, "dropped": 0}
+_last_summary = [float("-inf")]   # monotonic time counts from boot: 0 would mean "just now"
+_ROUTINE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError,
+            ssl.SSLEOFError, ssl.SSLZeroReturnError)
+
+
+def _connection_problem(kind: str, address: str, error: Exception) -> None:
+    """A connection that ended early. A client closing its side (it gave up waiting,
+    retried on a fresh connection, quit) is routine: debug level and not counted. Anything
+    else is counted for the status, and logged at most once a minute."""
+    log.debug("connection from %s: %s: %s", address, kind, error)
+    if isinstance(error, _ROUTINE):
+        return
+    CONNECTION_STATS[kind] += 1
+    now = time.monotonic()
+    if now - _last_summary[0] >= 60:
+        _last_summary[0] = now
+        log.info("connection problems so far: %d TLS handshake(s) failed, %d dropped "
+                 "(latest from %s: %s); 'reifs serve -v' logs each one",
+                 CONNECTION_STATS["handshake_failed"], CONNECTION_STATS["dropped"],
+                 address, error)
 
 
 class TLSServer(ThreadingHTTPServer):
@@ -1079,18 +1138,16 @@ class TLSServer(ThreadingHTTPServer):
         try:
             tls_sock = self.context.wrap_socket(request, server_side=True)
         except (ssl.SSLError, OSError) as e:
-            CONNECTION_STATS["handshake_failed"] += 1
             # A client that does not trust our certificate yet hangs up after the
-            # handshake; anything else is worth seeing.
-            log.info("TLS handshake with %s failed: %s", client_address[0], e)
+            # handshake: routine. Other failures are counted and summarised.
+            _connection_problem("handshake_failed", client_address[0], e)
             return
         try:
             super().finish_request(tls_sock, client_address)
         except (ConnectionError, ssl.SSLError, TimeoutError) as e:
             # Clients that reject our certificate hang up right after the
             # handshake; idle keep-alive connections time out. Both are normal.
-            CONNECTION_STATS["dropped"] += 1
-            log.info("connection from %s ended: %s", client_address[0], e)
+            _connection_problem("dropped", client_address[0], e)
         finally:
             try:
                 tls_sock.close()

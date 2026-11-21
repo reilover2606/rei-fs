@@ -106,6 +106,10 @@ class ReplicationSection:
     copies: int = 2
     # More copies for files with these tags, e.g. {"important": 3}.
     tag_copies: dict[str, int] = field(default_factory=dict)
+    # Planning is done in pieces: at most this many proposals are open at a time, and at
+    # most max_examined files are looked at per run (millions of files may be below goal).
+    max_proposals: int = 10000
+    max_examined: int = 100000
 
 
 @dataclass
@@ -271,6 +275,10 @@ copies = {self.replication.copies}
 # More copies for files with these tags (the highest goal applies),
 # e.g. {{ "important" = 3, "photos" = 3 }}.
 tag_copies = {tbl(self.replication.tag_copies)}
+# Planning is done in pieces: at most this many proposals are open at a time,
+# and at most max_examined files are looked at per run.
+max_proposals = {self.replication.max_proposals}
+max_examined = {self.replication.max_examined}
 
 [ssh]
 # Let paired servers pull from this machine over SSH instead of the rsync

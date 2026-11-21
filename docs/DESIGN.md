@@ -382,6 +382,30 @@ reads have indexes. The client keeps its clock ticking in its own thread, so a s
 status request cannot freeze the display, gives up on a status request after 10 s, and on
 quitting interrupts whatever request is in flight instead of waiting for the server.
 
+### 5.9 Millions of files
+
+Measured on a synthetic index of 2.5 million files in four nodes (3.6 million copies). Every
+request must cost what is on screen, not the size of the index:
+
+* **Coverage figures** (status line, node totals, backup counts) are one SQL aggregation (about
+  2 s) instead of a Python dict per file (64 s and gigabytes). They are cached by the last
+  change-log sequence number and, on a database where computing takes more than 0.3 s, refreshed
+  in the background: a request is answered with figures a few seconds old, never waits for them.
+* **Planning backups** looks at one file at a time (indexed queries when the file comes up),
+  never preloads tables: 25 s and 110 MB instead of minutes and gigabytes. At most
+  `[replication] max_proposals` (10000) proposals are open and `max_examined` (100000) files are
+  looked at per run; the rest is planned as these are decided. It runs at most every ten times
+  its own duration.
+* **Directory listings** walk the index by jumping (the cost is the entries listed, not the files
+  below them), list at most 2000 files of one folder and say how many more there are, and count
+  "has a copy on this server's node" up to 10001 files. Slow listings may be a few seconds old
+  while background work changes the index; the user's own actions refresh them at once.
+* **Search** cuts candidates down in SQL with the longest literal part of the pattern, checks the
+  exact match on those, and caches the per-folder counts.
+* **Temporary files**: big sorts and groupings spill to disk. SQLite's default folder (`/tmp`, often
+  a small RAM disk) made "database or disk is full" on servers with plenty of space; they now go
+  to `<server home>/tmp` (or `SQLITE_TMPDIR`).
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

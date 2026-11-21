@@ -52,6 +52,7 @@ class Worker:
         self.cfg = cfg
         self.syncer = syncer
         self.tasks: queue.Queue = queue.Queue()
+        self._plan_seconds = 0.0   # how long the last planning took
         self.stop_requested = threading.Event()
         self.shutdown = threading.Event()
         self._lock = threading.Lock()
@@ -157,7 +158,10 @@ class Worker:
                 if now - last_plan_check >= PLAN_CHECK_SECONDS:
                     last_plan_check = now
                     seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
-                    if seq != planned_at_seq or now - last_plan >= PLAN_SECONDS:
+                    # Planning walks the whole index (seconds on a big one): not more often
+                    # than ten times its own duration, however busy the change log is.
+                    spaced = now - last_plan >= max(PLAN_CHECK_SECONDS, 10 * self._plan_seconds)
+                    if spaced and (seq != planned_at_seq or now - last_plan >= PLAN_SECONDS):
                         planned_at_seq, last_plan = seq, now
                         self.request_plan()
                 try:
@@ -207,10 +211,14 @@ class Worker:
         db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups"}[kind])
         self._set(state=state, detail="", since=db.now())
         if kind == "plan":
+            started = time.monotonic()
             try:
                 report, approved = replication.cycle(conn, self.cfg)
+                self._plan_seconds = time.monotonic() - started
                 msg = (f"backup plan: {report.proposed} proposed, "
                        f"{report.no_destination} without destination")
+                if report.truncated:
+                    msg += " (the rest of the files is planned as these are decided)"
                 if approved is not None:
                     msg += f", {report.auto_approved} approved automatically"
                     if approved.errors:
