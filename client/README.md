@@ -65,9 +65,14 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
-| Nodes | Nodes of all servers, foreign drives | `s`/`S` scan, `v` verify, `p` priority, `t` backup target, `o` adopt |
+| Nodes | Nodes of all servers, foreign drives | `n` add a drive, `R` rename, `s`/`S` scan, `v` verify, `p` priority, `t` backup target, `o` adopt |
 | Marked | Copies waiting for you to delete them | `u`/`U` keep (unmark) |
 | Servers | This server's fingerprint, paired servers, pairing requests | `p` pair, `a`/`x` accept/reject, `d` unpair, `t` transport (daemon/SSH), `k` SSH key and authorize peers, `s` sync now |
+
+`n` registers a drive: type the path of its folder *on the server's machine*
+(for example `/media/me/SSD`, so it must be mounted there), then its name
+(the folder's name by default). The server writes the drive's ID file, scans it,
+and finds it again wherever it is mounted later.
 
 Decisions, Wanted and Jobs show the items of every paired server (marked
 `@server`); actions on them are sent to that server. Copying to another

@@ -11,6 +11,7 @@ import getpass
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -120,23 +121,24 @@ def cmd_node_list(args) -> None:
 def cmd_node_set(args) -> None:
     _, conn = open_server(args.home)
     node = nodes.get_node(conn, args.node)
+    if args.priority is None and args.target is None and not args.rename:
+        raise CliError("nothing to change")
+    if node["owner_id"] != nodes.self_id(conn):
+        raise CliError(f"node {node['name']!r} belongs to another server; change it there "
+                       "(or from the client)")
+    if args.rename:
+        nodes.rename_node(conn, node["id"], args.rename)
     updates = {}
     if args.priority is not None:
         updates["priority"] = args.priority
     if args.target is not None:
         updates["replication_target"] = int(args.target == "yes")
-    if args.rename:
-        updates["name"] = args.rename
-    if not updates:
-        raise CliError("nothing to change")
-    sets = ", ".join(f"{k} = ?" for k in updates)
-    if node["owner_id"] != nodes.self_id(conn):
-        raise CliError(f"node {node['name']!r} belongs to another server; change it there "
-                       "(or from the client)")
-    with db.transaction(conn):
-        conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
-        index.log_node(conn, node["id"])
-    print(f"Updated node {node['name']!r}.")
+    if updates:
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        with db.transaction(conn):
+            conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
+            index.log_node(conn, node["id"])
+    print(f"Updated node {args.rename or node['name']!r}.")
 
 
 def cmd_discover(args) -> None:
@@ -460,6 +462,108 @@ def cmd_unmark(args) -> None:
     print(f"Removed the deletion mark from {n} cop(ies).")
 
 
+def _make_ctrl_c_work() -> None:
+    """Make sure Ctrl+C can reach us (POSIX).
+
+    * A terminal left in raw mode by a crashed or killed full-screen program
+      has signals disabled (``stty -isig``): Ctrl+C is then just an input
+      character and nothing stops the server. Re-enable them (only when we
+      are the foreground job, otherwise changing the terminal would stop us).
+    * SIGINT/SIGTERM/SIGHUP blocked in the inherited signal mask are unblocked.
+    """
+    if os.name != "posix":
+        return
+    import signal
+
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK,
+                               {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+    except (ValueError, OSError):
+        pass
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        if not sys.stdin.isatty() or os.getpgrp() != os.tcgetpgrp(sys.stdin.fileno()):
+            return
+        attrs = termios.tcgetattr(sys.stdin.fileno())
+        if not attrs[3] & termios.ISIG:
+            attrs[3] |= termios.ISIG
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+            print("note: this terminal had Ctrl+C disabled (a program that did not exit "
+                  "cleanly leaves it like that; 'stty sane' also fixes it). Enabled it.",
+                  file=sys.stderr, flush=True)
+    except (OSError, ValueError, termios.error):
+        pass
+
+
+class _QuitKey:
+    """Press q to stop the server (works without Enter, in a terminal).
+
+    While the server runs in a terminal's foreground, the keyboard is put in
+    cbreak mode (single keys, Ctrl+C still works) and restored on exit. With
+    no terminal (a service, a pipe, a background job) nothing is read.
+    """
+
+    def __init__(self, on_quit):
+        self.on_quit = on_quit
+        self.saved = None
+        self.active = False
+
+    def start(self) -> bool:
+        if not sys.stdin or not sys.stdin.isatty():
+            return False
+        if os.name == "posix":
+            try:
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                if os.getpgrp() != os.tcgetpgrp(fd):
+                    return False       # background job: reading would stop it
+                self.saved = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except (ImportError, OSError, ValueError):
+                self.saved = None
+                return False
+        self.active = True
+        threading.Thread(target=self._watch, name="reifs-keys", daemon=True).start()
+        return True
+
+    def _watch(self) -> None:
+        import select
+
+        while self.active:
+            try:
+                if os.name == "posix":
+                    if not select.select([sys.stdin], [], [], 0.5)[0]:
+                        continue
+                    key = os.read(sys.stdin.fileno(), 1).decode("utf-8", "ignore")
+                else:
+                    import msvcrt
+
+                    key = msvcrt.getwch()
+            except (OSError, ValueError):
+                return
+            if not key:
+                return                 # input closed
+            if key in ("q", "Q"):
+                self.on_quit()
+                return
+
+    def restore(self) -> None:
+        self.active = False
+        if self.saved is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self.saved)
+            except (ImportError, OSError, ValueError, termios.error):
+                pass
+            self.saved = None
+
+
 def cmd_serve(args) -> None:
     import logging
 
@@ -502,13 +606,23 @@ def cmd_serve(args) -> None:
             faulthandler.register(signal.SIGUSR1, all_threads=True)
         except (ValueError, OSError, RuntimeError):
             pass
-    print("Press Ctrl+C to stop.", flush=True)
+    _make_ctrl_c_work()
+    quit_reason = []
+
+    def quit_from_keyboard() -> None:
+        quit_reason.append("q")
+        server.shutdown()              # makes serve_forever() return
+
+    keys = _QuitKey(quit_from_keyboard)
+    has_keys = keys.start()
+    print("Press q (or Ctrl+C) to stop." if has_keys else "Press Ctrl+C to stop.", flush=True)
     worker.start()
     syncer.start()
 
     def force_exit(code: int) -> None:
         from . import transfer
 
+        keys.restore()                 # do not leave the terminal in cbreak mode
         transfer.kill_all()
         syncer.daemon.stop()
         sys.stderr.flush()
@@ -516,8 +630,11 @@ def cmd_serve(args) -> None:
 
     try:
         server.serve_forever()
+        if quit_reason:
+            print("\nshutting down... (Ctrl+C to force)", file=sys.stderr, flush=True)
     except KeyboardInterrupt:
         print("\nshutting down... (Ctrl+C again to force)", file=sys.stderr, flush=True)
+    keys.restore()
     # Shutdown must always end: show what is stuck after a few seconds, and
     # exit regardless after a few more (also covers threads that would block
     # the interpreter's own exit).

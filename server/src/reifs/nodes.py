@@ -139,11 +139,51 @@ def _overlaps(a: Path, b: Path) -> bool:
     return a == b or a in b.parents or b in a.parents
 
 
+def clean_name(name: str) -> str:
+    """A node name as the user will type it in commands: no slashes, no
+    surrounding spaces, not empty, at most 64 characters."""
+    name = (name or "").strip()
+    if not name:
+        raise NodeError("the node needs a name")
+    if len(name) > 64 or "/" in name or "\\" in name or any(ord(c) < 32 for c in name):
+        raise NodeError("a node name is at most 64 characters, without slashes or control "
+                        "characters")
+    return name
+
+
+def rename_node(conn: sqlite3.Connection, node: str, new_name: str) -> str:
+    """Rename a storage node owned by this server (also in its ID file)."""
+    row = get_node(conn, node)
+    if row["owner_id"] != self_id(conn):
+        raise NodeError(f"node {row['name']!r} belongs to another server; rename it there")
+    if row["kind"] == "server":
+        raise NodeError("a server's own node is named after the server")
+    new_name = clean_name(new_name)
+    if new_name == row["name"]:
+        return new_name
+    if conn.execute("SELECT 1 FROM nodes WHERE name = ? AND id != ?",
+                    (new_name, row["id"])).fetchone():
+        raise NodeError(f"a node named {new_name!r} already exists")
+    with db.transaction(conn):
+        conn.execute("UPDATE nodes SET name = ? WHERE id = ?", (new_name, row["id"]))
+        index.log_node(conn, row["id"])
+    if row["root_path"]:  # keep the drive's own ID file in step, if it is attached
+        try:
+            marker = read_marker(row["root_path"])
+            if marker is not None and marker.node_id == row["id"]:
+                marker.name = new_name
+                write_marker(row["root_path"], marker)
+        except (NodeError, OSError):
+            pass
+    return new_name
+
+
 def register_node(
     conn: sqlite3.Connection, root: Path, name: str, kind: str = "storage",
     node_id: str | None = None,
 ) -> str:
     """Create (or adopt) a node at root, owned by this server."""
+    name = clean_name(name)
     owner = self_id(conn)
     root = root.resolve()
     if not root.is_dir():

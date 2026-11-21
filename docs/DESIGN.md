@@ -467,6 +467,8 @@ Endpoints (all JSON, under `/api`):
 | `GET replication`, `POST replication {copies, tag_copies, auto_replicate}`, `POST replication/plan` | Copy goal |
 | `POST peers/<id>/transport {transport}`, `POST peers/authorize {apply}` | rsync over SSH (client only) |
 | `GET peer/info` | Server to server: SSH offer and public key |
+| `POST nodes {path, name?}` | Register a storage node (drive or folder on the server's machine) |
+| `POST nodes/<name> {name?, priority?, replication_target?}` | Rename a node (also in its ID file) or change settings |
 | `POST nodes/<name>/adopt` | Adopt another server's drive attached here |
 | `GET peers`, `POST peers/probe`, `POST peers/pair` | Pairing (client only) |
 | `POST peers/requests/<id>/accept\|reject`, `POST peers/<id>/unpair`, `POST peers/sync` | Pairing (client only) |
