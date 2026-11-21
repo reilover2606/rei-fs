@@ -87,7 +87,7 @@ std::string file_label(const json& f, int name_width) {
   for (const auto& fl : f.value("flags", json::array())) flags += " " + fl.get<std::string>();
   if (!f.value("issues", json::array()).empty()) flags += " !";
   return fit(f.value("name", f.value("path", "")), name_width) + " " +
-         fit(human_size(f.value("size", 0)), 10) + " " +
+         fit(human_size(f.value("size", std::int64_t{0})), 10) + " " +
          fit(std::to_string(f.value("good_copies", 0)) + "/" + std::to_string(f.value("goal", 2)) +
                  flags, 16);
 }
@@ -98,7 +98,7 @@ Element file_details(const json& f) {
   Elements rows = {
       hard_wrap(f.value("path", ""), kDetailWidth - 1) | bold,
       separator(),
-      label_value("size", human_size(f.value("size", 0))),
+      label_value("size", human_size(f.value("size", std::int64_t{0}))),
       label_value("modified", format_time(f.value("mtime", 0))),
       label_value("good copies", copies_badge(f.value("good_copies", 0), f.value("goal", 2))),
   };
@@ -126,7 +126,7 @@ Element file_details(const json& f) {
         text(fit(state, 16)) | color(col),
     }));
     rows.push_back(hbox({text("  "), text(format_time(c.value("mtime", 0)) + "  " +
-                                         human_size(c.value("size", 0)) + "  " +
+                                         human_size(c.value("size", std::int64_t{0})) + "  " +
                                          c.value("hash", "")) | dim}));
   }
   return vbox(rows);
@@ -352,7 +352,7 @@ class OverviewView : public View {
     Elements left = {
         text("Index") | bold,
         separator(),
-        line("files", num("files") + "  (" + human_size(s.value("bytes", 0)) + ")"),
+        line("files", num("files") + "  (" + human_size(s.value("bytes", std::int64_t{0})) + ")"),
         line("with at least 2 copies", num("satisfied"), Color::Green, true),
         line("under-replicated", num("under_replicated"), Color::Red, under > 0),
         line("  with a single copy", num("single_copy"), Color::Red, s.value("single_copy", 0) > 0),
@@ -1388,7 +1388,7 @@ class NodesView : public View {
         labels_.push_back(fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
                           fit(state, 12) + fit(n.value("owner", ""), 12) +
                           fit(std::to_string(n.value("files", 0)) + " files", 14) +
-                          human_size(n.value("bytes", 0)));
+                          human_size(n.value("bytes", std::int64_t{0})));
       }
       for (const auto& f : foreign_)
         labels_.push_back(fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
@@ -1426,7 +1426,7 @@ class NodesView : public View {
         label_value("owner", n.value("owner", "")),
         label_path("root", n.value("root", "")),
         label_value("files", std::to_string(n.value("files", 0)) + " (" +
-                                 human_size(n.value("bytes", 0)) + ")"),
+                                 human_size(n.value("bytes", std::int64_t{0})) + ")"),
         label_value("case-sensitive", yes(n.value("case_sensitive", false))),
         label_value("Windows names", yes(n.value("restricted_names", false))),
         label_value("priority", std::to_string(n.value("priority", 0))),
@@ -1765,7 +1765,7 @@ class MarkedView : public View {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
       std::int64_t total = 0;
-      for (const auto& m : items_) total += m.value("size", 0);
+      for (const auto& m : items_) total += m.value("size", std::int64_t{0});
       auto list = list_panel(std::to_string(items_.size()) + " cop(ies) marked for deletion, " +
                                  human_size(total),
                              menu_, labels_.size(), "nothing is marked for deletion");
@@ -1774,7 +1774,7 @@ class MarkedView : public View {
         const json& m = items_[selected_];
         detail = vbox({hard_wrap(m.value("path", ""), kDetailWidth - 1) | bold, separator(),
                        label_value("node", m.value("node", "")),
-                       label_value("size", human_size(m.value("size", 0))),
+                       label_value("size", human_size(m.value("size", std::int64_t{0}))),
                        label_path("physical", m.value("physical", ""))});
       }
       return vbox({paragraph(" The server never deletes files. Delete these yourself; the next "
@@ -1794,7 +1794,7 @@ class MarkedView : public View {
       labels_.clear();
       for (const auto& m : items_)
         labels_.push_back(fit(m.value("node", ""), 12) + fit(m.value("path", ""), 50) + " " +
-                          human_size(m.value("size", 0)));
+                          human_size(m.value("size", std::int64_t{0})));
       selected_ = std::min(selected_, std::max(0, static_cast<int>(items_.size()) - 1));
     }, "marked");
   }
