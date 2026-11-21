@@ -457,7 +457,7 @@ Endpoints (all JSON, under `/api`):
 | `GET nodes`, `POST nodes/<name>` | Nodes; set priority / backup target |
 | `POST scan {nodes?, verify?}`, `POST stop` | Queue a scan; stop current work |
 | `GET tree?path=`, `GET file?path=` | Browse the virtual tree; file details |
-| `GET find?q=&tag=&node=&issues=1&under=1` | Search (max 1000 results) |
+| `GET find?q=&tag=&node=&issues=1&under=1` | Search (max 1000 results). `q` is text the name contains (any case), or a glob such as `*.jpg` that must match the whole name; with a `/` it is matched against the whole path |
 | `GET tags`, `POST tags {action, tag, paths, recursive}` | Tags |
 | `GET decisions`, `POST decisions/<id> {option}` | Decision stack |
 | `GET wanted`, `POST wanted {action, ids or all}` | Proposed jobs |

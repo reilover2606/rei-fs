@@ -61,7 +61,7 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 |---|---|---|
 | Overview | Copies, what the server is busy with (and for how long), database lock, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
 | Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move |
-| Search | Find by name/path glob, tag, problems | `/` type a search, `C`/`M` copy/move all results |
+| Search | Find by part of a name (or a glob like `*.jpg`), tag, problems | `/` type a search, `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |

@@ -929,7 +929,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_where)
 
     s = sub.add_parser("find", help="search files")
-    s.add_argument("pattern", nargs="?", help="glob on the name (or on the path if it has '/')")
+    s.add_argument("pattern", nargs="?",
+                   help="text in the name, e.g. report (or a glob such as '*.jpg' that must match "
+                        "the whole name; with '/' it is matched against the path)")
     s.add_argument("--tag")
     s.add_argument("--node")
     s.add_argument("--issues", action="store_true", help="only non-portable names")

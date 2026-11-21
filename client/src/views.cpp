@@ -643,7 +643,7 @@ class SearchView : public View {
     InputOption opt;
     opt.multiline = false;
     opt.on_enter = [this] { search(); };
-    query_input_ = Input(&query_, "name glob, e.g. *.jpg (or a path glob with /)", opt);
+    query_input_ = Input(&query_, "part of a name, e.g. report  (wildcards: *.jpg)", opt);
     tag_input_ = Input(&tag_, "tag", opt);
     auto issues = Checkbox("non-portable", &issues_);
     auto under = Checkbox("under-replicated", &under_);
@@ -655,7 +655,8 @@ class SearchView : public View {
     // Focusable line holding the keyboard focus while not typing, so that the
     // number keys keep switching tabs ("/" starts typing a search).
     hint_ = Renderer([this](bool focused) {
-      auto line = text(" / to type a search   tags: " + tags_line_);
+      auto line = text(" / to type a search (a name or part of one; a tag in the second field)   "
+                       "tags: " + tags_line_);
       return focused ? line | bold : line | dim;
     });
     auto layout = Container::Vertical({hint_, form, menu_});

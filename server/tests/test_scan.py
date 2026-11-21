@@ -340,3 +340,24 @@ def test_scan_never_holds_the_write_lock_while_hashing(env, monkeypatch):
     assert [w for w in waits if w[0] != "ok"] == []
     monkeypatch.setattr(scanner, "hash_file", real)
     other.close()
+
+
+def test_find_by_part_of_a_name(env):
+    for name in ("Report-2025.pdf", "holiday/beach photo.jpg", "notes.txt",
+                 "docs/annual report.docx", "docs/sub/other.txt"):
+        write(env.root / name, name)
+    env.scan()
+    names = lambda pattern, **kw: [f.vpath for f in queries.find(env.conn, pattern, **kw)]  # noqa: E731
+    # Without wildcards the text only has to be contained, whatever its case.
+    assert names("report") == ["/Report-2025.pdf", "/docs/annual report.docx"]
+    assert names("PHOTO") == ["/holiday/beach photo.jpg"]
+    assert names("txt") == ["/docs/sub/other.txt", "/notes.txt"]
+    assert names("nothing like this") == []
+    # With a "/" the text is matched against the whole path.
+    assert names("docs/sub") == ["/docs/sub/other.txt"]
+    # The exact name still works, and so do globs (which match the whole name).
+    assert names("notes.txt") == ["/notes.txt"]
+    assert names("*.docx") == ["/docs/annual report.docx"]
+    assert names("rep*") == ["/Report-2025.pdf"]
+    assert names("report", tag="none") == []
+    assert [f.vpath for f in queries.find(env.conn)] != []   # no pattern: everything

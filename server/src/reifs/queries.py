@@ -123,6 +123,21 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     return out + sorted(files, key=lambda e: e.name)
 
 
+def name_pattern(pattern: str | None) -> str | None:
+    """The glob to match names (or paths, if it contains "/") against.
+
+    Without wildcards the text means "contains it", ignoring case, so that
+    typing ``report`` finds ``Annual Report.pdf``. With ``*``, ``?`` or ``[``
+    the pattern is a glob that must match the whole name.
+    """
+    if not pattern:
+        return None
+    pat = pattern.casefold()
+    if not any(c in pat for c in "*?["):
+        pat = f"*{pat}*"
+    return pat
+
+
 def find_ids(conn: sqlite3.Connection, pattern: str | None = None, tag: str | None = None,
              node: str | None = None, issues_only: bool = False,
              under_replicated: bool = False,
@@ -143,7 +158,7 @@ def find_ids(conn: sqlite3.Connection, pattern: str | None = None, tag: str | No
     if where:
         q += " WHERE " + " AND ".join(where)
     q += " ORDER BY f.vpath"
-    pat = pattern.casefold() if pattern else None
+    pat = name_pattern(pattern)
     cov = coverage(conn, policy) if under_replicated else None
     out = []
     for r in conn.execute(q, args):
