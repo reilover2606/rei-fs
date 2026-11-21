@@ -16,6 +16,7 @@ in ``<dst>/.rei-fs/partial`` so even a half-copied large file resumes.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -29,6 +30,7 @@ from .control import StopFn, check
 from .hashing import hash_file
 from .nodes import discover
 
+log = logging.getLogger(__name__)
 ProgressFn = Callable[[str], None]
 MAX_MESSAGES = 200
 
@@ -164,9 +166,42 @@ class _Runner:
                              " WHERE job_id = ? AND state = 'running'", (job["id"],))
                 jobs.refresh_status(conn, job["id"])
             raise
+        self._verify_done(job["id"], rep)
         with db.transaction(conn):
             rep.status = jobs.refresh_status(conn, job["id"], after_run=True)
         return rep
+
+    def _verify_done(self, job_id: int, rep: JobReport) -> None:
+        """Before calling a job finished, look again at every file it says it copied.
+
+        A transfer is verified by hash when it ends; this checks that the files
+        are still there (and of the recorded size) once the whole job is over. A file
+        that is not goes back to pending, and the job says so instead of "done".
+        """
+        conn = self.conn
+        lost = 0
+        for item in conn.execute("SELECT * FROM job_items WHERE job_id = ? AND state = 'done'"
+                                 " AND op IN ('copy', 'overwrite')", (job_id,)).fetchall():
+            root = self.roots.get(item["dst_node"])
+            if root is None:
+                continue  # not attached here: its owner is the one who can look
+            fid = index.file_id(conn, item["vpath"])
+            row = conn.execute("SELECT size FROM copies WHERE file_id = ? AND node_id = ?"
+                               " AND state = 'present'", (fid, item["dst_node"])).fetchone() \
+                if fid is not None else None
+            try:
+                st = os.stat(paths.to_physical(root, item["vpath"]))
+                ok = row is None or st.st_size == row["size"]
+            except OSError:
+                ok = False
+            if not ok:
+                lost += 1
+                with db.transaction(conn):
+                    self._set(item, "pending", "missing after the job finished; copying again")
+                rep.done -= 1
+                rep.note(item["vpath"], "missing after the job finished; will be copied again")
+        if lost:
+            log.warning("job #%d: %d copied file(s) not found afterwards", job_id, lost)
 
     # --- item state -------------------------------------------------------------
 

@@ -26,8 +26,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, priority, queries, vdirs, vmove,
-               replication, ssh, sync, tags, tls)
+from . import (__version__, audit, auth, db, decisions, index, jobs, nodes, paths, peers,
+               priority, queries, replication, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
 from .paths import to_physical
@@ -115,7 +115,10 @@ def job_json(conn: sqlite3.Connection, j: sqlite3.Row) -> dict:
     return {"id": j["id"], "kind": j["kind"], "status": j["status"],
             "description": j["description"], "created": j["created"],
             "started": j["started"], "finished": j["finished"], "counts": counts,
-            "total": sum(counts.values()), "done": counts.get("done", 0)}
+            "total": sum(counts.values()), "done": counts.get("done", 0),
+            # Items not done and not going to be without the user: never hide them.
+            "issues": sum(counts.get(k, 0) for k in ("failed", "conflict"))
+            + jobs.unresolved_skips(conn, j["id"])}
 
 
 # --- the API ------------------------------------------------------------------------
@@ -149,6 +152,7 @@ class Api:
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
+        r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/stop", self.stop)
@@ -349,6 +353,20 @@ class Api:
             self.syncer.request_daemon_update()
             self.syncer.request_poke()
         return {"ok": True, "id": node_id, "name": name}
+
+    def audit_node(self, conn, q, body, node, **_):
+        """Compare a node's folder with the index (reads only; can take a while)."""
+        row = nodes.get_node(conn, unquote(node))
+        if row["owner_id"] != nodes.self_id(conn):
+            return peers.forward(conn, row["owner_id"], "GET", f"/api/nodes/{row['id']}/audit",
+                                 timeout=600)
+        root = next((loc.root for loc in nodes.discover(conn, self.cfg).online
+                     if loc.node_id == row["id"]), None)
+        if root is None:
+            raise ApiError(409, f"node {row['name']!r} is not attached")
+        out = audit.audit_node(conn, self.cfg, row["id"], root)
+        out["node"] = row["name"]
+        return out
 
     def move_node_root(self, conn, q, body, node, **_):
         row = nodes.get_node(conn, unquote(node))

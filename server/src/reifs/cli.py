@@ -795,6 +795,34 @@ def cmd_ssh(args) -> None:
             print(line)
 
 
+def cmd_node_audit(args) -> None:
+    from . import audit
+
+    cfg, conn = open_server(args.home)
+    row = nodes.get_node(conn, args.node)
+    root = next((loc.root for loc in nodes.discover(conn, cfg).online
+                 if loc.node_id == row["id"]), None)
+    if root is None:
+        raise CliError(f"node {row['name']!r} is not attached here")
+    out = audit.audit_node(conn, cfg, row["id"], root)
+    print(f"{row['name']}: {out['files_on_disk']} files on disk, {out['files_indexed']} indexed")
+    for item in out["not_in_index"]:
+        print(f"  {item['count']:>7} not in the index: {item['reason']}")
+        for ex in item["examples"][:args.examples]:
+            print(f"            {ex}")
+    for item in out["other"]:
+        print(f"  {item['count']:>7} {item['reason']}")
+        for ex in item["examples"][:args.examples]:
+            print(f"            {ex}")
+    gone = out["listed_but_not_on_disk"]
+    if gone["count"]:
+        print(f"  {gone['count']:>7} listed in the index but not on disk")
+        for ex in gone["examples"][:args.examples]:
+            print(f"            {ex}")
+    if not (out["not_in_index_total"] or gone["count"] or out["other"]):
+        print("  everything on disk is in the index, and the other way round.")
+
+
 def cmd_node_move(args) -> None:
     cfg, conn = open_server(args.home)
     with ServerLock(cfg.home):
@@ -922,6 +950,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--target", choices=["yes", "no"], help="may receive replication copies")
     s.add_argument("--rename", metavar="NAME")
     s.set_defaults(func=cmd_node_set)
+
+    s = node.add_parser("audit", help="list what is on a node's disk but not in the index, and why")
+    s.add_argument("node")
+    s.add_argument("--examples", type=int, default=10, help="paths to show per reason")
+    s.set_defaults(func=cmd_node_audit)
 
     s = node.add_parser("move", help="change where a node's root folder is on this machine")
     s.add_argument("node")

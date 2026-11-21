@@ -245,7 +245,11 @@ class Worker:
                 else:
                     reports = runner.run_jobs(conn, self.cfg, None, self._progress, stop)
                     done = sum(r.done for r in reports)
-                    self._set(last_result=f"jobs run: {done} item(s) done", last_error="")
+                    other = {k: sum(getattr(r, k) for r in reports)
+                             for k in ("skipped", "failed", "conflicts", "retry")}
+                    note = "".join(f", {n} {k}" for k, n in other.items() if n)
+                    self._set(last_result=f"jobs run: {done} item(s) done{note}",
+                              last_error="")
                     if done and self.syncer is not None:
                         self.syncer.request_poke()
         except Stopped:
