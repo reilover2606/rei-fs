@@ -348,3 +348,19 @@ def test_migration_from_v1(tmp_path):
     conn = db.open_existing(path)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     conn.execute("SELECT * FROM job_items")
+
+
+def test_a_locked_database_is_explained(tmp_path, monkeypatch):
+    path = tmp_path / "reifs.db"
+    db.create(path).close()
+    # A newer version that needs a migration: that needs the write lock.
+    monkeypatch.setitem(db.MIGRATIONS, db.SCHEMA_VERSION + 1, "CREATE TABLE zz (x);")
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1)
+    holder = db.connect(path)
+    holder.execute("BEGIN IMMEDIATE")                   # another process is writing
+    with pytest.raises(db.DatabaseLocked) as e:
+        db.open_existing(path, timeout=0.2, migration_wait=0.3)
+    assert "locked by another process" in str(e.value)
+    holder.execute("ROLLBACK")
+    holder.close()
+    db.open_existing(path).close()                      # free again: it migrates
