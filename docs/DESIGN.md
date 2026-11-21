@@ -180,7 +180,9 @@ the directories whose class is due, per node (`scan_state`); a directory not due
 is not even read, and a node with nothing due costs nothing. Files in directories
 a scan did not visit are never reported missing. A scan the user asks for, from the
 client or `reifs scan`, always covers everything, which is also how changes in an
-archive are noticed. Nested settings work: an archive can hold a frequent folder.
+archive are noticed. A **new-files-only** scan (`reifs scan --new-only`, `w` in the client) just discovers
+files the index does not know: nothing indexed is read again, changes are not noticed and
+nothing is reported missing or renamed, so it is the cheapest scan. Nested settings work: an archive can hold a frequent folder.
 `interval_minutes = 0` still turns all automatic scans off. The same classes will
 decide which directories live scanning watches.
 

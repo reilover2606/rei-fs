@@ -369,10 +369,12 @@ class Api:
         for owner, ids in remote.items():
             peers.forward(conn, owner, "POST", "/api/scan",
                           {"nodes": ids, "verify": bool(body.get("verify")),
-                           "due": bool(body.get("due"))})
+                           "due": bool(body.get("due")),
+                           "new_only": bool(body.get("new_only"))})
         if local or not remote:
             self._need_worker().request_scan(local or None, bool(body.get("verify")),
-                                             full=not body.get("due"))
+                                             full=not body.get("due"),
+                                             new_only=bool(body.get("new_only")))
         return {"ok": True, "queued": True}
 
     def _poke(self) -> None:

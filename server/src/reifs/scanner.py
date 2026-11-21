@@ -179,9 +179,15 @@ def scan_node(
     progress: ProgressFn | None = None,
     stop: StopFn | None = None,
     classes: set[int] | None = None,
+    new_only: bool = False,
 ) -> ScanResult:
     """Scan a node. ``classes``: only the directories of these update priorities
-    (an automatic scan); None scans everything (one the user asked for)."""
+    (an automatic scan); None scans everything (one the user asked for).
+
+    ``new_only`` only discovers files the index does not know yet: nothing
+    already indexed is looked at again (no re-hashing of changed files, and
+    nothing is reported missing or renamed), so it is the cheapest scan.
+    """
     node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if node is None:
         raise NodeError(f"unknown node {node_id}")
@@ -248,6 +254,8 @@ def scan_node(
             stats.seen += 1
             seen.add(vpath)
             row = existing.get(vpath)
+            if new_only and row is not None:
+                continue
             if row is not None and not verify and row["size"] == size \
                     and row["mtime_ns"] == mtime_ns:
                 if row["state"] == "missing":
@@ -275,6 +283,16 @@ def scan_node(
             pass
         finish("aborted" if isinstance(exc, (KeyboardInterrupt, Stopped)) else "failed")
         raise
+
+    if new_only:
+        with db.transaction(conn, "scan: saving results"):
+            for fid in touched:
+                if conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone():
+                    index.evaluate_divergence(conn, fid)
+        finish("complete")
+        if progress:
+            progress(stats, "")
+        return ScanResult(node["name"], scan_id, "complete", stats, walker.errors)
 
     # --- phase 2: vanished copies, renames, pruning ---------------------------
     stats.skipped_dirs = len(walker.skipped)
@@ -476,7 +494,7 @@ def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
 def scan_all(
     conn: sqlite3.Connection, cfg: Config, names: list[str] | None = None, *,
     verify: bool = False, progress: ProgressFn | None = None, stop: StopFn | None = None,
-    full: bool = True,
+    full: bool = True, new_only: bool = False,
 ):
     """Discover owned nodes, then scan the online ones (optionally filtered).
 
@@ -498,5 +516,6 @@ def scan_all(
             if not classes:
                 continue
         results.append(scan_node(conn, cfg, loc.node_id, loc.root,
-                                 verify=verify, progress=progress, stop=stop, classes=classes))
+                                 verify=verify, progress=progress, stop=stop, classes=classes,
+                                 new_only=new_only))
     return disc, results

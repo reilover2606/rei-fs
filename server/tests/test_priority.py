@@ -125,3 +125,22 @@ def test_priority_replicates_and_follows_a_move(env):
     env.scan()
     assert priority.get(env.conn, "/papers")["priority"] == 3
     assert priority.get(env.conn, "/docs")["priority"] == 2
+
+
+def test_new_only_scan_only_discovers_new_files(env):
+    write(env.root / "a.txt", "one", mtime=1_000_000)
+    write(env.root / "b.txt", "two", mtime=1_000_000)
+    env.scan()
+    write(env.root / "a.txt", "one changed", mtime=2_000_000)     # changed
+    os.remove(env.root / "b.txt")                                 # gone
+    write(env.root / "sub" / "c.txt", "three", mtime=1_000_000)   # new
+    (_, results) = scanner.scan_all(env.conn, env.cfg, new_only=True)
+    s = results[0].stats
+    assert (s.added, s.hashed, s.changed, s.missing, s.renamed) == (1, 1, 0, 0, 0)
+    assert queries.lookup(env.conn, "/sub/c.txt") is not None
+    old_hash = queries.lookup(env.conn, "/a.txt").copies[0].hash
+    assert old_hash != scanner.hash_file(env.root / "a.txt")      # the change was not looked at
+    assert queries.lookup(env.conn, "/b.txt").copies[0].state == "present"   # not "missing"
+    full = env.scan()
+    (r,) = full.values()
+    assert (r.stats.changed, r.stats.missing, r.stats.added) == (1, 1, 0)

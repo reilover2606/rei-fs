@@ -164,7 +164,8 @@ def cmd_scan(args) -> None:
 
     with ServerLock(cfg.home):
         disc, results = scanner.scan_all(conn, cfg, args.nodes or None, verify=args.verify,
-                                         progress=progress, full=not args.due)
+                                         progress=progress, full=not args.due,
+                                         new_only=args.new_only)
     if sys.stderr.isatty():
         print("\r" + " " * 110 + "\r", end="", file=sys.stderr)
     for name in disc.offline:
@@ -940,6 +941,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("nodes", nargs="*", help="node names (default: all online)")
     s.add_argument("--verify", action="store_true", help="re-hash every file")
     s.add_argument("--max-errors", type=int, default=20)
+    s.add_argument("--new-only", action="store_true",
+                   help="only discover files not indexed yet (no re-hashing, no missing/renamed)")
     s.add_argument("--due", action="store_true",
                    help="only directories due for an automatic scan (by update priority)")
     s.set_defaults(func=cmd_scan)

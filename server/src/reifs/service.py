@@ -78,9 +78,10 @@ class Worker:
                     "queued": self.tasks.qsize()}
 
     def request_scan(self, nodes: list[str] | None = None, verify: bool = False,
-                     full: bool = True) -> None:
-        """Scan (full: everything, as asked by the user; otherwise only what is due)."""
-        self._enqueue(("scan", tuple(sorted(nodes or [])), verify, full))
+                     full: bool = True, new_only: bool = False) -> None:
+        """Scan (full: everything, as asked by the user; otherwise only what is due).
+        ``new_only``: just discover files not indexed yet."""
+        self._enqueue(("scan", tuple(sorted(nodes or [])), verify, full, new_only))
 
     def request_jobs(self) -> None:
         self._enqueue(("jobs",))
@@ -229,7 +230,8 @@ class Worker:
                 if kind == "scan":
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
-                        progress=self._scan_progress, stop=stop, full=task[3])
+                        progress=self._scan_progress, stop=stop, full=task[3],
+                        new_only=task[4])
                     summary = "; ".join(
                         f"{r.node_name}: +{r.stats.added} ~{r.stats.changed} "
                         f"-{r.stats.missing}" for r in results)

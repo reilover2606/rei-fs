@@ -329,13 +329,18 @@ class OverviewView : public View {
     if (++polls_ % 15 == 0) refresh();  // the backup plan changes rarely (~30 s)
   }
   std::string help() const override {
-    return "s: scan all  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
+    return "s: scan all  w: new files only  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
   }
 
  private:
   bool on_event(const Event& e) {
     if (key(e, "s")) {
       ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan queued"); });
+      return true;
+    }
+    if (key(e, "w")) {
+      ctx_.send("/api/scan", {{"new_only", true}},
+                [this](json) { ctx_.notify("scan for new files queued"); });
       return true;
     }
     if (key(e, "j")) {
@@ -1559,7 +1564,7 @@ class NodesView : public View {
   std::string title() const override { return "Nodes"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Space: choose  s: scan the chosen (or this) node  S: scan all  v: verify  n: add drive  "
+    return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  n: add drive  "
            "R: rename  p: priority  t: backup target  o: adopt";
   }
 
@@ -1718,6 +1723,15 @@ class NodesView : public View {
       auto targets = scan_targets(name);
       ctx_.send("/api/scan", {{"nodes", targets}}, [this, targets](json) {
         ctx_.notify("scan of " + joined(targets) + " queued");
+        marked_.clear();
+        rebuild_labels();
+      });
+      return true;
+    }
+    if (key(e, "w")) {   // discover new files only
+      auto targets = scan_targets(name);
+      ctx_.send("/api/scan", {{"nodes", targets}, {"new_only", true}}, [this, targets](json) {
+        ctx_.notify("scan for new files on " + joined(targets) + " queued");
         marked_.clear();
         rebuild_labels();
       });
