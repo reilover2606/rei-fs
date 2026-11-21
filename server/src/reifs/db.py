@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -302,6 +302,31 @@ ALTER TABLE servers ADD COLUMN ssh_port INTEGER;
 ALTER TABLE servers ADD COLUMN ssh_user TEXT;
 ALTER TABLE servers ADD COLUMN ssh_pubkey TEXT;
 ALTER TABLE nodes ADD COLUMN ssh_root TEXT;
+""",
+    6: """
+-- Directories made by the user in the virtual tree. Without this a directory
+-- exists only as the prefix of file paths and vanishes with its last file. Like
+-- tags, an entry is a last-writer-wins record (present = 0 is a tombstone).
+CREATE TABLE vdirs (
+    vpath      TEXT PRIMARY KEY,
+    present    INTEGER NOT NULL,
+    updated    TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE changes_v6 (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_id  TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('copy', 'node', 'tag', 'mark', 'vdir')),
+    data       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    UNIQUE (origin_id, origin_seq)
+);
+INSERT INTO changes_v6(seq, origin_id, origin_seq, kind, data, ts)
+    SELECT seq, origin_id, origin_seq, kind, data, ts FROM changes;
+DROP TABLE changes;
+ALTER TABLE changes_v6 RENAME TO changes;
 """,
 }
 

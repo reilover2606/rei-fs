@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries, vmove,
+from . import (__version__, auth, db, decisions, index, jobs, nodes, paths, peers, queries, vdirs, vmove,
                replication, ssh, sync, tags, tls)
 from .config import Config
 from .paths import to_physical
@@ -162,6 +162,8 @@ class Api:
         r("GET", r"/api/jobs", self.list_jobs)
         r("POST", r"/api/jobs", self.create_job)
         r("POST", r"/api/vmove", self.vmove)
+        r("POST", r"/api/mkdir", self.mkdir)
+        r("POST", r"/api/rmdir", self.rmdir)
         r("POST", r"/api/jobs/run", self.run_jobs)
         r("GET", r"/api/jobs/(?P<id>\d+)", self.show_job)
         r("POST", r"/api/jobs/(?P<id>\d+)/(?P<action>cancel|retry)", self.job_action)
@@ -535,6 +537,18 @@ class Api:
             self.worker.request_jobs()
         return {"job_id": rep.job_id, "items": rep.items,
                 "excluded": {k: len(v) for k, v in rep.excluded.items()}}
+
+    def mkdir(self, conn, q, body, **_):
+        try:
+            return {"path": vdirs.make(conn, str(body.get("path", "")))}
+        except vdirs.VDirError as e:
+            raise ApiError(409, str(e)) from None
+
+    def rmdir(self, conn, q, body, **_):
+        try:
+            return {"removed": vdirs.remove(conn, str(body.get("path", "")))}
+        except vdirs.VDirError as e:
+            raise ApiError(409, str(e)) from None
 
     def vmove(self, conn, q, body, **_):
         """Move files/directories within the virtual tree (renames on every node).

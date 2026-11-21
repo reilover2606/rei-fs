@@ -7,7 +7,7 @@ import threading
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import index, paths
+from . import index, paths, vdirs
 from .tags import tags_of
 
 DEFAULT_COPIES = 2
@@ -117,7 +117,11 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
             dirs[head] = dirs.get(head, 0) + 1
         else:
             files.append(DirEntry(head, False, 1, file_info(conn, r["id"], policy)))
-    if not dirs and not files and vdir != "/":
+    # Directories made by the user show even when empty.
+    for d in vdirs.under(conn, vdir, include_self=False):
+        head = d[len(lo):].partition("/")[0]
+        dirs.setdefault(head, 0)
+    if not dirs and not files and vdir != "/" and not vdirs.under(conn, vdir):
         return None
     out = [DirEntry(name, True, n) for name, n in sorted(dirs.items())]
     return out + sorted(files, key=lambda e: e.name)

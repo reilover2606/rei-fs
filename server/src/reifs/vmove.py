@@ -29,7 +29,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, index, jobs, nodes, paths
+from . import db, index, jobs, nodes, paths, vdirs
 
 MODES = ("merge", "preserve")
 
@@ -56,6 +56,7 @@ class Plan:
     conflicts: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)  # (vpath, reason)
     renamed: list[tuple[str, str]] = field(default_factory=list)  # (wanted, given) names
+    dir_moves: list[tuple[str, str]] = field(default_factory=list)  # (old, new) directories
 
     @property
     def files(self) -> int:
@@ -70,7 +71,8 @@ class Plan:
         return sum(len(m.duplicates) for m in self.moves)
 
     def summary(self) -> dict:
-        return {"files": self.files, "conflicts": sorted(set(self.conflicts)), "merged": self.merged,
+        return {"files": self.files, "dirs": len(self.dir_moves),
+                "conflicts": sorted(set(self.conflicts)), "merged": self.merged,
                 "duplicates": self.duplicates,
                 "renamed": [{"wanted": a, "given": b} for a, b in self.renamed],
                 "skipped": [{"path": p, "reason": r} for p, r in self.skipped[:50]]}
@@ -84,9 +86,7 @@ def _is_file(conn: sqlite3.Connection, vpath: str) -> bool:
 
 
 def _is_dir(conn: sqlite3.Connection, vpath: str) -> bool:
-    lo, hi = paths.prefix_range(vpath)
-    return conn.execute("SELECT 1 FROM files WHERE vpath >= ? AND vpath < ? LIMIT 1",
-                        (lo, hi)).fetchone() is not None
+    return vdirs.exists(conn, vpath)
 
 
 def _files_under(conn: sqlite3.Connection, vdir: str) -> list[tuple[int, str]]:
@@ -176,6 +176,8 @@ def plan_move(conn: sqlite3.Connection, sources: list[str], dest: str,
             continue  # already there
         top = _resolve_top(conn, plan, top, is_file, on_conflict, taken_tops)
         taken_tops.add(top)
+        if not is_file:
+            plan.dir_moves.append((src, top))
         pairs = [(fid, p, top + p[len(src):]) for fid, p in
                  ([(index.file_id(conn, src), src)] if is_file else _files_under(conn, src))]
         for fid, old, new in pairs:
@@ -277,6 +279,8 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
                 " updated) VALUES (?, 'rename', ?, ?, ?, ?, 0, ?)",
                 [(result.job_id, m.old, m.new, node_id, node_id, ts) for m, node_id in local])
             result.items = len(local)
+        for old, new in plan.dir_moves:   # directories made by the user move at once
+            vdirs.move(conn, old, new)
         for fid, node_id, _ in marks:
             hash_ = conn.execute("SELECT hash FROM copies WHERE file_id = ? AND node_id = ?",
                                  (fid, node_id)).fetchone()

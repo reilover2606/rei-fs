@@ -60,7 +60,7 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 | Tab | What it shows | Keys |
 |---|---|---|
 | Overview | Copies, what the server is busy with (and for how long), database lock, the backup plan | `s` scan all, `j` run jobs, `p` plan backups, `g` copy goal, `a` automatic approval on/off, `x` stop |
-| Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move to a node, `x` pick up, `p` put here, `v` move to a typed directory, `n` rename |
+| Tree | The virtual tree, where each file lives | `Enter`/`→` open, `←` up, `t`/`T` tag/untag, `c` copy, `m` move to a node, `x` pick up, `p` put here, `v` move to a typed directory, `n` rename, `d` new directory, `D` remove an empty one |
 | Search | Find files and folders by part of a name (or a glob like `*.jpg`), tag, problems | `/` type a search, `Enter` on a result show it in the Tree, `C`/`M` copy/move all results |
 | Decisions | The decision stack | `Enter` decide, `a` apply to all of a kind |
 | Wanted | Proposed jobs | `Space` select, `a`/`x` approve/reject, `A`/`X` all |

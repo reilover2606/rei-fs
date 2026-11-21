@@ -218,7 +218,7 @@ void virtual_move(Context& ctx, std::vector<std::string> paths, const std::strin
   json probe = {{"paths", paths}, {"to", dest}, {"dry_run", true}};
   if (!name.empty()) probe["name"] = name;
   ctx.send("/api/vmove", probe, [&ctx, paths, dest, name, done](json plan) {
-    if (plan.value("files", 0) == 0) {
+    if (plan.value("files", 0) == 0 && plan.value("dirs", 0) == 0) {
       ctx.notify("nothing to move (it is already there)");
       return;
     }
@@ -226,7 +226,9 @@ void virtual_move(Context& ctx, std::vector<std::string> paths, const std::strin
       json body = {{"paths", paths}, {"to", dest}, {"on_conflict", mode}};
       if (!name.empty()) body["name"] = name;
       ctx.send("/api/vmove", body, [&ctx, done](json out) {
-        std::string msg = std::to_string(out.value("files", 0)) + " file(s) moved";
+        std::string msg = out.value("files", 0) == 0
+                              ? "moved"
+                              : std::to_string(out.value("files", 0)) + " file(s) moved";
         if (!out["job_id"].is_null() || out.value("remote_jobs", 0) > 0)
           msg += "; renaming on the nodes (job #" + std::to_string(out.value("job_id", 0)) + ")";
         if (out.value("merged", 0) > 0)
@@ -561,7 +563,7 @@ class TreeView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  "
-           "v: move to...  n: rename  r: refresh";
+           "v: move to...  n: rename  d: new dir  D: remove empty dir  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -711,6 +713,20 @@ class TreeView : public View {
       rebuild_labels();
       return true;
     }
+    if (key(e, "d")) {   // new (empty) directory here
+      ctx_.dialogs->ask_text("New directory in " + path_ + " (a/b/c makes several):", "",
+                             [this](const std::string& name) {
+        if (name.empty()) return;
+        std::string full = path_ == "/" ? "/" + name : path_ + "/" + name;
+        ctx_.send("/api/mkdir", {{"path", full}}, [this, full](json) {
+          ctx_.notify("created " + full);
+          want_ = full.substr(path_ == "/" ? 1 : path_.size() + 1);
+          want_ = want_.substr(0, want_.find('/'));
+          refresh();
+        });
+      });
+      return true;
+    }
     const json* cur = current();
     if (!cur) return false;
     std::string target = child_path(cur->value("name", ""));
@@ -726,6 +742,15 @@ class TreeView : public View {
     if (key(e, "x")) {   // pick up / put down this item
       if (!picked_.erase(target)) picked_.insert(target);
       rebuild_labels();
+      return true;
+    }
+    if (key(e, "D") && dir) {   // remove an empty directory
+      ctx_.dialogs->confirm("Remove the empty directory " + target + "?", [this, target] {
+        ctx_.send("/api/rmdir", {{"path", target}}, [this, target](json) {
+          ctx_.notify("removed " + target);
+          refresh();
+        });
+      });
       return true;
     }
     if (key(e, "n")) {   // rename in place
