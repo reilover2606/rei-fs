@@ -2003,11 +2003,16 @@ class ServersView : public View {
                           fit(r.value("address", ""), 24) +
                           (in ? "press a to accept, x to reject" : "waiting for them to accept"));
       } else {
-        std::string state = r.value("online", false) ? "online" : "unreachable";
+        std::string state = r.value("online", false)
+                                ? (r.value("sync_note", "").empty() ? "online" : "catching up")
+                                : "unreachable";
+        // Why it is unreachable, right in the list (the details show it in full).
+        std::string why = !r.value("online", false) && !r.value("last_error", "").empty()
+                              ? "  ! " + r.value("last_error", "") : "";
         labels_.push_back(fit("paired", 13) + fit(r.value("name", ""), 16) +
                           fit(r.value("address", ""), 24) + fit(state, 12) +
                           fit(r.value("transport", "daemon"), 8) +
-                          r.value("last_sync", "").substr(0, 19));
+                          r.value("last_sync", "").substr(0, 19) + why);
       }
     }
     selected_ = std::min(selected_, std::max(0, static_cast<int>(rows_.size()) - 1));
@@ -2028,6 +2033,8 @@ class ServersView : public View {
                                                           kDetailWidth - kLabelWidth - 1))};
     if ((*r)["row"] == "peer") {
       rows.push_back(label_value("state", r->value("online", false) ? "online" : "unreachable"));
+      if (!r->value("sync_note", "").empty())
+        rows.push_back(label_value("syncing", r->value("sync_note", "")));
       rows.push_back(label_value("transport",
                                  std::string(r->value("transport", "daemon") == "ssh"
                                                  ? "rsync over SSH"

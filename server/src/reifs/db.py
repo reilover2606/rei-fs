@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -381,6 +381,10 @@ CREATE INDEX decisions_parent ON decisions(parent_id) WHERE parent_id IS NOT NUL
 CREATE INDEX wanted_file ON wanted(file_id);
 DROP INDEX copies_node;
 CREATE INDEX copies_node ON copies(node_id, size);
+""",
+    11: """
+-- What a peer's sync is doing right now ("catching up: N entries"), shown next to its state.
+ALTER TABLE servers ADD COLUMN sync_note TEXT;
 """,
 }
 

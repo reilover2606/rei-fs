@@ -360,3 +360,61 @@ def test_the_sync_thread_survives_a_failed_round(env, monkeypatch):
     t.start()
     t.join(10)
     assert not t.is_alive() and calls["n"] == 3      # it went on after both failures
+
+
+def test_copying_to_a_server_whose_file_list_is_behind_says_so(cluster, monkeypatch):
+    a, b = cluster("alpha"), cluster("beta")
+    pair(a, b)
+    write(a.root / "docs" / "x.txt", "x", mtime=1_000_000)
+    scanner.scan_all(a.conn, a.cfg)       # alpha knows the file; beta has not synced it yet
+    sync_peer(a.conn, b.id)               # alpha learns beta's node (beta learns nothing)
+    monkeypatch.setattr(api.time, "sleep", lambda s: None)
+    body = {"kind": "copy", "paths": ["/docs"], "to": "beta", "from": "alpha"}
+    with pytest.raises(api.ApiError) as e:
+        a.httpd.api.create_job(a.conn, {}, body)
+    assert e.value.status == 409 and "does not have that in its list of files yet" in str(e.value)
+    # Once beta has caught up the same request works.
+    sync_peer(b.conn, a.id)
+    out = a.httpd.api.create_job(a.conn, {}, body)
+    assert out["items"] == 1 and out["server"] == b.id
+
+
+def test_pairing_a_triangle_transfers_nothing_that_is_already_known(cluster):
+    a, b, c = cluster("alpha"), cluster("beta"), cluster("gamma")
+    pair(a, b)
+    pair(a, c)
+    for i in range(5):
+        write(a.root / "d" / f"f{i}.txt", str(i), mtime=1_000_000)
+    scanner.scan_all(a.conn, a.cfg)
+    for _ in range(2):
+        for s in (a, b, c):
+            for p in peers.paired_peers(s.conn):
+                sync_peer(s.conn, p["id"])
+    pair(b, c)                                    # closes the loop
+    assert sync_peer(b.conn, c.id) == 0           # beta already has all of gamma's log (via alpha)
+    assert sync_peer(c.conn, b.id) == 0
+    row = peers.peer_row(b.conn, c.id)
+    assert row["online"] == 1 and not row["sync_note"] and not row["last_error"]
+    assert row["pull_cursor"] > 0                 # moved to the end of its log at once
+
+
+def test_a_long_catch_up_is_in_slices_and_the_peer_is_online_meanwhile(cluster, monkeypatch):
+    from reifs import service, sync
+    a, b = cluster("alpha"), cluster("beta")
+    pair(a, b)
+    for i in range(8):
+        write(a.root / "d" / f"f{i}.txt", str(i), mtime=1_000_000)
+    scanner.scan_all(a.conn, a.cfg)
+    monkeypatch.setattr(sync, "BATCH", 3)
+    monkeypatch.setattr(service, "SYNC_SLICE_SECONDS", -1.0)        # one batch per round
+    n1 = sync_peer(b.conn, a.id)
+    row = peers.peer_row(b.conn, a.id)
+    assert n1 == 3 and row["online"] == 1 and "catching up" in row["sync_note"]
+    assert a.id in service.CATCHING_UP
+    for _ in range(10):
+        sync_peer(b.conn, a.id)
+        if a.id not in service.CATCHING_UP:
+            break
+    row = peers.peer_row(b.conn, a.id)
+    assert a.id not in service.CATCHING_UP and not row["sync_note"]
+    assert queries.lookup(b.conn, "/d/f7.txt") is not None          # everything arrived

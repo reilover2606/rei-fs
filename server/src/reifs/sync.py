@@ -22,24 +22,52 @@ import sqlite3
 
 from . import db, index
 
-BATCH = 1000
+BATCH = 2000
 
 
 def export_changes(conn: sqlite3.Connection, since: int, limit: int = BATCH,
-                   exclude_origin: str | None = None) -> dict:
+                   exclude_origin: str | None = None,
+                   have: dict[str, int] | None = None) -> dict:
+    """Log entries after ``since`` that the asker lacks.
+
+    ``have`` is what the asker already holds per origin server: entries it has are not
+    sent. That matters when servers are paired in a triangle: the new partner already got
+    everything through the common one, and without this the whole log (millions of entries
+    for a big index) would be transferred just to be skipped.
+    """
+    where, args = ["seq > ?"], [since]
+    if exclude_origin:
+        where.append("origin_id != ?")
+        args.append(exclude_origin)
+    for origin, seq in (have or {}).items():
+        where.append("NOT (origin_id = ? AND origin_seq <= ?)")
+        args += [origin, int(seq)]
     rows = conn.execute(
-        "SELECT * FROM changes WHERE seq > ? ORDER BY seq LIMIT ?", (since, limit + 1)
-    ).fetchall()
+        f"SELECT * FROM changes WHERE {' AND '.join(where)} ORDER BY seq LIMIT ?",
+        (*args, limit + 1)).fetchall()
     more = len(rows) > limit
     rows = rows[:limit]
-    last = rows[-1]["seq"] if rows else since
+    if rows and more:
+        last = rows[-1]["seq"]
+    else:   # nothing (more) to send: everything up to the end of the log was looked at
+        last = conn.execute("SELECT IFNULL(MAX(seq), 0) FROM changes").fetchone()[0]
+        last = max(last, since)
     return {
         "changes": [{"origin_id": r["origin_id"], "origin_seq": r["origin_seq"],
                      "kind": r["kind"], "data": json.loads(r["data"]), "ts": r["ts"]}
-                    for r in rows if r["origin_id"] != exclude_origin],
+                    for r in rows],
         "last_seq": last,
         "more": more,
     }
+
+
+def progress_vector(conn: sqlite3.Connection) -> dict[str, int]:
+    """What we hold of each origin's log (including our own entries)."""
+    have = {r[0]: r[1] for r in conn.execute("SELECT origin_id, last_seq FROM origin_progress")}
+    me = index.self_id(conn)
+    have[me] = conn.execute("SELECT IFNULL(MAX(origin_seq), 0) FROM changes WHERE origin_id = ?",
+                            (me,)).fetchone()[0]
+    return have
 
 
 APPLY_CHUNK = 200   # entries per transaction: the write lock is never held for long

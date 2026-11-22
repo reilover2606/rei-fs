@@ -402,6 +402,12 @@ request must cost what is on screen, not the size of the index:
   while background work changes the index; the user's own actions refresh them at once.
 * **Search** cuts candidates down in SQL with the longest literal part of the pattern, checks the
   exact match on those, and caches the per-folder counts.
+* **Pairing servers that already share a partner** (a triangle): a new pair pulls the other's whole
+  log, which for a big index is millions of entries, nearly all already received through the
+  common partner. The asker now says what it holds per origin server (`have=origin:seq,...`) and
+  the peer sends only the rest, so closing a loop transfers almost nothing. A long pull is
+  done in slices of 20 s per peer per round, the peer counts as reachable from its first
+  answer ("catching up: N entries" is shown), and the Servers tab shows why a server is unreachable.
 * **Short write transactions**: SQLite allows one writer at a time and the others wait up to 30
   seconds. Approving thousands of proposals and applying a peer's changes are done in transactions
   of a few hundred rows (what an item needs is read before the lock is taken), so no writer holds

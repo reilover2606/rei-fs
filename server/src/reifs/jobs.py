@@ -11,7 +11,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, index, nodes, paths
+from . import db, index, nodes, paths, vdirs
 
 TERMINAL_ITEM_STATES = ("done", "failed", "skipped", "cancelled")
 
@@ -42,6 +42,8 @@ def select_files(conn: sqlite3.Connection, vpaths: list[str],
             "SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ?", (lo, hi)
         ).fetchall()
         if not rows:
+            if vdirs.exists(conn, vpath):
+                raise JobError(f"{vpath} is a folder without files, there is nothing to copy")
             raise JobError(f"not in the virtual tree: {vpath}")
         selected.update({r[0]: r[1] for r in rows})
     if tag:

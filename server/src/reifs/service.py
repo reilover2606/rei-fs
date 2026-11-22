@@ -377,7 +377,8 @@ class Syncer:
             self.sync_all(conn, poke)
             offline = conn.execute("SELECT 1 FROM servers WHERE paired = 1"
                                    " AND online = 0 LIMIT 1").fetchone()
-            state["next_sync"] = time.monotonic() + (RETRY_SECONDS if offline else SYNC_SECONDS)
+            state["next_sync"] = time.monotonic() + (
+                1.0 if CATCHING_UP else RETRY_SECONDS if offline else SYNC_SECONDS)
         self.wake.wait(TICK_SECONDS)
 
     def sync_all(self, conn, poke: bool = False) -> int:
@@ -392,22 +393,44 @@ class Syncer:
         return total
 
 
+SYNC_SLICE_SECONDS = 20     # at most this long per peer per round: the others get their turn
+CATCHING_UP: set[str] = set()   # peers whose log is not fully pulled yet
+
+
 def sync_peer(conn, server_id: str, poke: bool = False) -> int:
-    """Pull a peer's changes and deliver our outbox to it. Returns entries applied."""
+    """Pull a peer's changes and deliver our outbox to it. Returns entries applied.
+
+    The peer counts as reachable from its first answer, not from the end of the pull
+    (a newly paired server may have millions of log entries to send), progress is
+    stored after every batch, and a long pull is done in slices so the other peers
+    are not kept waiting: it continues in the next round.
+    """
     applied = 0
+    started = time.monotonic()
     try:
         client = peers.client_for(conn, server_id, timeout=30)
         if poke:
             client.request("POST", "/api/peer/poke", {})
         cursor = peers.peer_row(conn, server_id)["pull_cursor"]
         while True:
-            data = client.request("GET", f"/api/peer/changes?since={cursor}&limit={sync.BATCH}")
+            have = ",".join(f"{o}:{n}" for o, n in sync.progress_vector(conn).items())
+            data = client.request(
+                "GET", f"/api/peer/changes?since={cursor}&limit={sync.BATCH}&have={have}")
             applied += sync.apply_changes(conn, data["changes"])
             cursor = int(data["last_seq"])
+            more = bool(data.get("more"))
             with db.transaction(conn):
-                conn.execute("UPDATE servers SET pull_cursor = ? WHERE id = ?", (cursor, server_id))
-            if not data.get("more"):
+                conn.execute(
+                    "UPDATE servers SET pull_cursor = ?, online = 1, last_error = NULL,"
+                    " sync_note = ? WHERE id = ?",
+                    (cursor, f"catching up: {applied} entries pulled so far" if more else None,
+                     server_id))
+            if not more:
+                CATCHING_UP.discard(server_id)
                 break
+            CATCHING_UP.add(server_id)
+            if time.monotonic() - started > SYNC_SLICE_SECONDS:
+                break   # the rest in the next round
         deliver_outbox(conn, server_id, client)
         try:  # what the peer offers (SSH access, its public key)
             info = client.request("GET", "/api/peer/info")
@@ -426,9 +449,10 @@ def sync_peer(conn, server_id: str, poke: bool = False) -> int:
             conn.execute("UPDATE servers SET online = 1, last_sync = ?, last_error = NULL"
                          " WHERE id = ?", (db.now(), server_id))
     except peers.PeerError as e:
+        CATCHING_UP.discard(server_id)
         with db.transaction(conn):
-            conn.execute("UPDATE servers SET online = 0, last_error = ? WHERE id = ?",
-                         (str(e), server_id))
+            conn.execute("UPDATE servers SET online = 0, last_error = ?, sync_note = NULL"
+                         " WHERE id = ?", (str(e), server_id))
     return applied
 
 
