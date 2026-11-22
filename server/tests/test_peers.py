@@ -360,3 +360,20 @@ def test_the_sync_thread_survives_a_failed_round(env, monkeypatch):
     t.start()
     t.join(10)
     assert not t.is_alive() and calls["n"] == 3      # it went on after both failures
+
+
+def test_copying_to_a_server_whose_file_list_is_behind_says_so(cluster, monkeypatch):
+    a, b = cluster("alpha"), cluster("beta")
+    pair(a, b)
+    write(a.root / "docs" / "x.txt", "x", mtime=1_000_000)
+    scanner.scan_all(a.conn, a.cfg)       # alpha knows the file; beta has not synced it yet
+    sync_peer(a.conn, b.id)               # alpha learns beta's node (beta learns nothing)
+    monkeypatch.setattr(api.time, "sleep", lambda s: None)
+    body = {"kind": "copy", "paths": ["/docs"], "to": "beta", "from": "alpha"}
+    with pytest.raises(api.ApiError) as e:
+        a.httpd.api.create_job(a.conn, {}, body)
+    assert e.value.status == 409 and "does not have that in its list of files yet" in str(e.value)
+    # Once beta has caught up the same request works.
+    sync_peer(b.conn, a.id)
+    out = a.httpd.api.create_job(a.conn, {}, body)
+    assert out["items"] == 1 and out["server"] == b.id

@@ -656,13 +656,37 @@ class Api:
                                            body.get("from") or None, move=kind == "move")
         except jobs.RemoteDestination as e:
             # The destination's owner runs transfers into its nodes.
-            out = peers.forward(conn, e.owner_id, "POST", "/api/jobs", body)
+            out = self._forward_job(conn, e.owner_id, body)
             out["server"] = e.owner_id
             return out
         if rep.job_id is not None and self.worker:
             self.worker.request_jobs()
         return {"job_id": rep.job_id, "items": rep.items,
                 "excluded": {k: len(v) for k, v in rep.excluded.items()}}
+
+    def _forward_job(self, conn, owner_id: str, body: dict) -> dict:
+        """Ask the server owning the destination node to create the job. It selects the
+        files in ITS copy of the file list, which may be a little behind ours (the lists
+        are kept in step by syncing): then it is asked to catch up and we try once more."""
+        try:
+            return peers.forward(conn, owner_id, "POST", "/api/jobs", body)
+        except peers.PeerError as first:
+            if not any(m in str(first) for m in ("not in the virtual tree", "unknown node")):
+                raise
+        name = (conn.execute("SELECT name FROM servers WHERE id = ?", (owner_id,)).fetchone()
+                or [owner_id[:8]])[0]
+        try:
+            peers.forward(conn, owner_id, "POST", "/api/peer/poke", {}, timeout=10)
+        except peers.PeerError:
+            pass
+        time.sleep(4)
+        try:
+            return peers.forward(conn, owner_id, "POST", "/api/jobs", body)
+        except peers.PeerError as second:
+            raise ApiError(
+                409, f"server {name} does not have that in its list of files yet ({second}). "
+                     "Its list is behind this server's; it was asked to catch up, so try again "
+                     "in a moment (Servers tab: sync) and check the servers are syncing.") from None
 
     def get_priority(self, conn, q, body, **_):
         return priority.get(conn, q.get("path", "/"))
