@@ -344,6 +344,7 @@ class RemoteSource:
     module: str
     user: str
     password: str
+    subpath: str = ""          # a folder inside the module (a staged relay: its request id)
 
     def url(self, manual_escape: bool = False) -> str:
         host = f"[{self.host}]" if ":" in self.host else self.host

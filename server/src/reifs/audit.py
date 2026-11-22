@@ -38,7 +38,10 @@ class _Tally:
 
 def audit_node(conn: sqlite3.Connection, cfg: Config, node_id: str, root: Path,
                stop: StopFn | None = None) -> dict:
-    ignorer = Ignorer(cfg.scan)
+    from .scanner import reserved_dirs
+
+    reserved = reserved_dirs(conn, cfg, node_id)
+    ignorer = Ignorer(cfg.scan, reserved)
     indexed = {r["vpath"]: r for r in conn.execute(
         "SELECT f.vpath, c.size, c.state FROM copies c JOIN files f ON f.id = c.file_id"
         " WHERE c.node_id = ?", (node_id,))}
@@ -79,7 +82,10 @@ def audit_node(conn: sqlite3.Connection, cfg: Config, node_id: str, root: Path,
                 elif entry.is_dir(follow_symlinks=False):
                     if name == MARKER_DIR:
                         continue
-                    if ignorer.hidden_dirs and name.startswith("."):
+                    if vpath in reserved:
+                        classify_tree(entry.path, vpath, "the fetch folder (downloads; not part "
+                                                         "of the virtual tree)")
+                    elif ignorer.hidden_dirs and name.startswith("."):
                         classify_tree(entry.path, vpath, "inside a hidden directory (name starts "
                                                          "with '.')")
                     elif ignorer.ignored(name, vpath, is_dir=True):

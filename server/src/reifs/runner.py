@@ -24,7 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import db, fsops, index, jobs, paths, peers, transfer
+import uuid
+
+from . import db, fsops, index, jobs, paths, peers, relay, transfer
 from .config import Config
 from .control import StopFn, check
 from .hashing import hash_file
@@ -65,6 +67,7 @@ class Prepared:
     size: int
     src_stat: tuple[int, int] | None
     remote: peers.RemoteSource | peers.SshSource | None = None  # on a paired server
+    relayed: tuple[str, str] | None = None   # (server, request id) of a staged file to release
 
 
 def run_jobs(conn: sqlite3.Connection, cfg: Config, job_ids: list[int] | None = None,
@@ -168,7 +171,9 @@ class _Runner:
                 prep = self._prepare(item, rep)
                 if prep is None:
                     continue
-                batch = batches.setdefault((prep.src_node, item["dst_node"]), [])
+                key = (prep.src_node, item["dst_node"], str(prep.dst_root),
+                       getattr(prep.remote, "subpath", ""))
+                batch = batches.setdefault(key, [])
                 batch.append(prep)
                 if len(batch) >= max_files or sum(p.size for p in batch) >= max_bytes:
                     self._flush(batch, rep)
@@ -204,9 +209,14 @@ class _Runner:
             if root is None:
                 continue  # not attached here: its owner is the one who can look
             fid = index.file_id(conn, item["vpath"])
-            row = conn.execute("SELECT size FROM copies WHERE file_id = ? AND node_id = ?"
-                               " AND state = 'present'", (fid, item["dst_node"])).fetchone() \
-                if fid is not None else None
+            row = None
+            if item["fetch"] == 1:      # a download: it lives in the fetch folder, not in the index
+                root = root / self.cfg.storage.fetch_dir.strip("/")
+            elif item["fetch"] == 2:
+                continue                # scratch for another server, removed on its own
+            elif fid is not None:
+                row = conn.execute("SELECT size FROM copies WHERE file_id = ? AND node_id = ?"
+                                   " AND state = 'present'", (fid, item["dst_node"])).fetchone()
             try:
                 st = os.stat(paths.to_physical(root, item["vpath"]))
                 ok = row is None or st.st_size == row["size"]
@@ -233,6 +243,8 @@ class _Runner:
     def _skip(self, item, rep: JobReport, msg: str) -> None:
         with db.transaction(self.conn):
             self._set(item, "skipped", msg)
+            if item["fetch"] == 2:
+                relay.set_state(self.conn, item["serves"], "failed", msg)
         rep.skipped += 1
         rep.note(item["vpath"], f"skipped: {msg}")
 
@@ -246,6 +258,8 @@ class _Runner:
         final = attempts >= self.cfg.transfers.max_attempts
         with db.transaction(self.conn):
             self._set(item, "failed" if final else "pending", msg, attempt=True)
+            if final and item["fetch"] == 2:
+                relay.set_state(self.conn, item["serves"], "failed", msg)
         if final:
             rep.failed += 1
             rep.note(item["vpath"], f"failed after {attempts} attempts: {msg}")
@@ -257,11 +271,13 @@ class _Runner:
                 msg: str | None = None, expected_hash: str | None = None) -> None:
         """Mark an item done (caller holds a transaction)."""
         fid = index.file_id(self.conn, item["vpath"])
-        if item["mark_source"] and src_node and fid is not None:
+        if item["mark_source"] and src_node and fid is not None and not item["fetch"]:
             # Only the verified content may be marked: if the source changed
             # meanwhile, its owner refuses.
             index.mark_copy(self.conn, fid, src_node, True, expect_hash=expected_hash)
         self._set(item, "done", msg)
+        if item["fetch"] == 2:
+            relay.set_state(self.conn, item["serves"], "ready")
         if item["wanted_id"]:
             self.conn.execute("UPDATE wanted SET status = 'done' WHERE id = ?",
                               (item["wanted_id"],))
@@ -274,8 +290,12 @@ class _Runner:
 
     # --- legality ---------------------------------------------------------------
 
-    def _illegal(self, vpath: str, node_id: str) -> str | None:
+    def _illegal(self, vpath: str, node_id: str, fetch: int = 0) -> str | None:
         node = self.nodes[node_id]
+        if fetch == 2:
+            return None   # staging on our own disk, for another server
+        if fetch:   # nothing is indexed: no collision to fear
+            node = {**{k: node[k] for k in node.keys()}, "case_sensitive": 1}
         if node["restricted_names"]:
             bad = paths.portability_issues(vpath) & paths.RESTRICTED_NAME_ISSUES
             if bad:
@@ -302,10 +322,15 @@ class _Runner:
         if dst_root is None:
             self._wait(item, rep, f"node {self._name(dst)} is offline")
             return None
+        fetch = item["fetch"]
+        if fetch == 1:      # a plain download: <node root>/fetch/<path>, nothing indexed
+            dst_root = dst_root / self.cfg.storage.fetch_dir.strip("/")
+        elif fetch == 2:    # staged for another server, in our relay scratch area
+            dst_root = relay.staging_root(self.cfg) / item["serves"]
         if dst in self.full:
             self._wait(item, rep, f"not enough free space on {self._name(dst)}")
             return None
-        reason = self._illegal(vpath, dst)
+        reason = self._illegal(vpath, dst, fetch)
         if reason:
             self._skip(item, rep, reason)
             return None
@@ -316,8 +341,12 @@ class _Runner:
 
         # Source: the given node, or any online node with the current version.
         copies = conn.execute(
-            "SELECT * FROM copies WHERE file_id = ? AND state = 'present' AND node_id != ?",
-            (fid, dst)).fetchall()
+            "SELECT * FROM copies WHERE file_id = ? AND state = 'present'"
+            + ("" if fetch else " AND node_id != ?"), (fid,) if fetch else (fid, dst)).fetchall()
+        if fetch == 2 and version.hash != item["allow_hash"]:
+            self._skip(item, rep, "the file changed since it was asked for")
+            return None
+        relayed = None
         if item["src_node"]:
             source = next((c for c in copies if c["node_id"] == item["src_node"]), None)
             if source is None:
@@ -328,31 +357,32 @@ class _Runner:
                                       " is no longer the current version")
                 return None
             if source["node_id"] not in self.roots and source["node_id"] not in self.remote:
-                self._wait(item, rep, self.remote_why.get(
-                    source["node_id"], f"node {self._name(source['node_id'])} is not reachable"))
-                return None
+                relayed = self._relay_source(item, rep, source)
+                if relayed is None:
+                    return None
         else:
             current = [c for c in copies if c["hash"] == version.hash]
             # Local sources first, then nodes of reachable paired servers.
             online = [c for c in current if c["node_id"] in self.roots] + \
                      [c for c in current if c["node_id"] in self.remote]
             if not online:
-                if current:
-                    why = []
-                    for c in current:
-                        nid = c["node_id"]
-                        why.append(self.remote_why.get(nid) or (
-                            f"node {self._name(nid)} is not attached to this server"))
-                    self._wait(item, rep, "no node holding the current version can be read now: "
-                                          + "; ".join(dict.fromkeys(why)))
-                else:
+                if not current:
                     self._skip(item, rep, "no current copy to copy from")
-                return None
-            source = online[0]
+                    return None
+                # Nothing we can read directly: ask a server we are paired with to pass it on.
+                source = current[0]
+                relayed = self._relay_source(item, rep, source)
+                if relayed is None:
+                    return None
+            else:
+                source = online[0]
 
         src_hash, size = source["hash"], source["size"]
         src_root = self.roots.get(source["node_id"])
-        remote = None if src_root is not None else self.remote[source["node_id"]]
+        remote = relayed[0] if relayed else (
+            None if src_root is not None else self.remote[source["node_id"]])
+        if relayed:
+            src_root = None
         src_stat = None
         if src_root is not None:
             src_phys = paths.to_physical(src_root, vpath)
@@ -392,12 +422,20 @@ class _Runner:
                 return None
             if dst_hash == src_hash:
                 with db.transaction(conn):
-                    index.record_copy(conn, fid, dst, dst_st.st_size, dst_st.st_mtime_ns,
-                                      dst_hash)
-                    self._finish(item, source["node_id"], rep, 0, "already present",
+                    if not fetch:
+                        index.record_copy(conn, fid, dst, dst_st.st_size, dst_st.st_mtime_ns,
+                                          dst_hash)
+                    self._finish(item, source["node_id"], rep, 0,
+                                 "already fetched" if fetch else "already present",
                                  expected_hash=src_hash)
                 return None
-            if item["allow_hash"] != dst_hash:
+            if fetch == 1:
+                self._skip(item, rep, "a different file with this name is already in the fetch "
+                                      "folder: remove it to fetch this one")
+                return None
+            if fetch == 2:
+                os.unlink(dst_phys)   # our own scratch copy: replace it
+            elif item["allow_hash"] != dst_hash:
                 with db.transaction(conn):
                     self._set(item, "conflict", "destination holds different content")
                     index.add_decision(conn, "conflict", fid, dst, {
@@ -410,7 +448,10 @@ class _Runner:
                 return None
 
         try:
-            fsops.ensure_dirs(dst_root, paths.parent(vpath), bool(self.nodes[dst]["case_sensitive"]))
+            if fetch:
+                dst_root.mkdir(parents=True, exist_ok=True)
+            fsops.ensure_dirs(dst_root, paths.parent(vpath),
+                              bool(self.nodes[dst]["case_sensitive"]) or bool(fetch))
         except fsops.Refused as e:
             self._skip(item, rep, str(e))
             return None
@@ -431,7 +472,87 @@ class _Runner:
         with db.transaction(conn):
             self._set(item, "running")
         return Prepared(item, fid, source["node_id"], src_root, dst_root, src_hash, size,
-                        src_stat, remote)
+                        src_stat, remote, relayed[1] if relayed else None)
+
+    # --- sources behind another server (relay.py) ------------------------------------
+
+    def _server_name(self, server_id: str) -> str:
+        row = self.conn.execute("SELECT name FROM servers WHERE id = ?", (server_id,)).fetchone()
+        return row[0] if row else server_id[:8]
+
+    def _relay_source(self, item, rep: JobReport, source):
+        """A source we cannot read ourselves: have a server we are paired with fetch it for us
+        and pass it on. Returns ``(RemoteSource of the staged file, (server, request id))``
+        once it is staged; otherwise None and the item waits (or fails) with the reason."""
+        conn = self.conn
+        node = self.nodes[source["node_id"]]
+        owner, me = node["owner_id"], index.self_id(conn)
+        direct = self.remote_why.get(node["id"]) or (
+            f"node {node['name']} is not attached to this server")
+        if owner == me:       # our own drive, not attached
+            self._wait(item, rep, direct)
+            return None
+        via, rid = item["relay_via"], item["relay_id"]
+        if via and rid:
+            return self._relay_poll(item, rep, via, rid)
+        chosen = None
+        for p in peers.paired_peers(conn):
+            if not p["online"] or p["id"] == owner or p["transport"] == "ssh" \
+                    or peers.remote_source(p, "x") is None:
+                continue   # a relay is pulled from the intermediate's rsync daemon
+            try:
+                r = peers.forward(conn, p["id"], "GET",
+                                  f"/api/peer/route?to={owner}&hops={relay.MAX_HOPS - 1}"
+                                  f"&seen={me}", timeout=10)
+            except peers.PeerError:
+                continue
+            if r.get("reachable"):
+                chosen = p
+                break
+        if chosen is None:
+            self._wait(item, rep, f"{direct}; no server paired with this one can reach "
+                                  f"server {self._server_name(owner)} either")
+            return None
+        rid = uuid.uuid4().hex
+        try:
+            peers.forward(conn, chosen["id"], "POST", "/api/peer/relay-request",
+                          {"id": rid, "node_id": node["id"], "vpath": item["vpath"],
+                           "hash": source["hash"], "size": source["size"]}, timeout=15)
+        except peers.PeerError as e:
+            self._wait(item, rep, f"server {chosen['name']} would not relay it: {e}")
+            return None
+        with db.transaction(conn):
+            conn.execute("UPDATE job_items SET relay_via = ?, relay_id = ? WHERE id = ?",
+                         (chosen["id"], rid, item["id"]))
+        self._wait(item, rep, f"asked server {chosen['name']} to fetch it from server "
+                              f"{self._server_name(owner)} and pass it on")
+        return None
+
+    def _relay_poll(self, item, rep: JobReport, via: str, rid: str):
+        conn = self.conn
+        peer = next((p for p in peers.paired_peers(conn) if p["id"] == via), None)
+        name = self._server_name(via)
+        src = peers.remote_source(peer, "x") if peer is not None else None
+        if peer is None or not peer["online"] or src is None:
+            self._wait(item, rep, f"server {name}, which is relaying it, is not reachable")
+            return None
+        try:
+            st = peers.forward(conn, via, "GET", f"/api/peer/relay-status?id={rid}", timeout=10)
+        except peers.PeerError as e:
+            self._wait(item, rep, f"server {name} did not answer about the relayed file: {e}")
+            return None
+        if st.get("state") == "ready":
+            remote = peers.RemoteSource(src.host, src.port, "relay", src.user, src.password, rid)
+            return remote, (via, rid)
+        if st.get("state") in ("failed", "done"):    # start over next time
+            with db.transaction(conn):
+                conn.execute("UPDATE job_items SET relay_via = NULL, relay_id = NULL"
+                             " WHERE id = ?", (item["id"],))
+            self._transient(item, rep, f"server {name} could not pass it on: "
+                                       f"{st.get('message') or st.get('state')}")
+            return None
+        self._wait(item, rep, f"server {name} is fetching it for us ({st.get('state')})")
+        return None
 
     def _dst_hash(self, fid: int, node_id: str, phys: Path, st: os.stat_result) -> str:
         row = self.conn.execute("SELECT size, mtime_ns, hash FROM copies WHERE file_id = ?"
@@ -468,8 +589,17 @@ class _Runner:
                 got = None
             if got == p.src_hash:
                 with db.transaction(self.conn):
-                    index.record_copy(self.conn, p.fid, dst, st.st_size, st.st_mtime_ns, got)
-                    self._finish(p.item, p.src_node, rep, p.size, expected_hash=p.src_hash)
+                    if not p.item["fetch"]:
+                        index.record_copy(self.conn, p.fid, dst, st.st_size, st.st_mtime_ns, got)
+                    self._finish(p.item, p.src_node, rep, p.size,
+                                 f"fetched to {dst_phys}" if p.item["fetch"] == 1 else None,
+                                 expected_hash=p.src_hash)
+                if p.relayed:   # we have it: the server that staged it can drop its copy
+                    try:
+                        peers.forward(self.conn, p.relayed[0], "POST", "/api/peer/relay-done",
+                                      {"id": p.relayed[1]}, timeout=10)
+                    except peers.PeerError:
+                        pass    # it removes unclaimed files by itself after a few hours
                 continue
             if p.remote is not None:
                 changed = False  # its owner rescans it; the sync brings the news

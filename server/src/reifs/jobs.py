@@ -162,6 +162,64 @@ def create_transfer_job(conn: sqlite3.Connection, vpaths: list[str], tag: str | 
     return report
 
 
+def server_node_id(conn: sqlite3.Connection) -> str:
+    """This server's own node (where fetched files are put)."""
+    row = conn.execute("SELECT id FROM nodes WHERE kind = 'server' AND owner_id = ?",
+                       (nodes.self_id(conn),)).fetchone()
+    if row is None:
+        raise JobError("this server has no node of its own to fetch into")
+    return row[0]
+
+
+def create_fetch_job(conn: sqlite3.Connection, vpaths: list[str], tag: str | None) -> CreateReport:
+    """Download files (or everything below a folder) into the ``fetch`` folder at the root of
+    this server's node. A plain download: nothing is indexed there and rei-fs does not
+    touch it otherwise. The source is any node that can be read, possibly through
+    other servers (relay.py)."""
+    if not vpaths and not tag:
+        raise JobError("select files by path and/or --tag")
+    dst = server_node_id(conn)
+    report = CreateReport(None, 0)
+    items, left_out = [], []
+    for fid, vpath in select_files(conn, vpaths, tag):
+        version = index.current_version(conn, fid)
+        if version is None:
+            left_out.append((vpath, "no present copy anywhere"))
+            continue
+        size = conn.execute("SELECT size FROM copies WHERE file_id = ? AND hash = ? LIMIT 1",
+                            (fid, version.hash)).fetchone()[0]
+        items.append((vpath, size))
+    if not items and not left_out:
+        return report
+    with db.transaction(conn):
+        job_id = _new_job(conn, "wanted", f"fetch {describe(vpaths, tag)}")
+        ts = db.now()
+        conn.executemany(
+            "INSERT INTO job_items(job_id, op, vpath, dst_node, size, fetch, updated)"
+            " VALUES (?, 'copy', ?, ?, ?, 1, ?)", [(job_id, v, dst, sz, ts) for v, sz in items])
+        conn.executemany(
+            "INSERT INTO job_items(job_id, op, vpath, dst_node, size, fetch, state, message,"
+            " updated) VALUES (?, 'copy', ?, ?, 0, 1, 'skipped', ?, ?)",
+            [(job_id, v, dst, f"not fetched: {why}", ts) for v, why in left_out])
+        if not items:
+            refresh_status(conn, job_id)
+    report.job_id, report.items = job_id, len(items)
+    return report
+
+
+def create_relay_job(conn: sqlite3.Connection, rid: str, node_id: str, vpath: str, hash_: str,
+                     size: int, requester: str) -> int:
+    """Stage a file for another server (inside the caller's transaction)."""
+    name = (conn.execute("SELECT name FROM servers WHERE id = ?", (requester,)).fetchone()
+            or [requester[:8]])[0]
+    job_id = _new_job(conn, "wanted", f"relay {vpath} for {name}")
+    conn.execute(
+        "INSERT INTO job_items(job_id, op, vpath, src_node, dst_node, size, allow_hash, fetch,"
+        " serves, updated) VALUES (?, 'copy', ?, ?, ?, ?, ?, 2, ?, ?)",
+        (job_id, vpath, node_id, server_node_id(conn), size, hash_, rid, db.now()))
+    return job_id
+
+
 def _new_job(conn: sqlite3.Connection, kind: str, description: str) -> int:
     return conn.execute(
         "INSERT INTO jobs(kind, description, created) VALUES (?, ?, ?)",

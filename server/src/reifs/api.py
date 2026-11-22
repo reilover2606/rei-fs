@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, audit, auth, db, decisions, index, jobs, nodes, paths, peers,
+from . import (__version__, audit, auth, relay, db, decisions, index, jobs, nodes, paths, peers,
                priority, queries, replication, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
@@ -232,6 +232,10 @@ class Api:
         r("POST", r"/api/peer/pair-reject", self.peer_pair_reject, "public")
         r("GET", r"/api/peer/changes", self.peer_changes, "peer")
         r("GET", r"/api/peer/info", self.peer_info, "peer")
+        r("GET", r"/api/peer/route", self.peer_route, "peer")
+        r("POST", r"/api/peer/relay-request", self.peer_relay_request, "peer")
+        r("GET", r"/api/peer/relay-status", self.peer_relay_status, "peer")
+        r("POST", r"/api/peer/relay-done", self.peer_relay_done, "peer")
         r("POST", r"/api/peer/mark", self.peer_mark, "peer")
         r("POST", r"/api/peer/wanted", self.peer_wanted, "peer")
         r("POST", r"/api/peer/poke", self.peer_poke, "peer")
@@ -648,8 +652,16 @@ class Api:
             if rep.job_id is not None and self.worker:
                 self.worker.request_jobs()
             return {"job_id": rep.job_id, "items": rep.items, "excluded": {}}
+        if kind == "fetch":
+            rep = jobs.create_fetch_job(conn, list(body.get("paths", [])), body.get("tag") or None)
+            if rep.job_id is not None and self.worker:
+                self.worker.request_jobs()
+            root = conn.execute("SELECT root_path FROM nodes WHERE id = ?",
+                                (jobs.server_node_id(conn),)).fetchone()[0] or ""
+            return {"job_id": rep.job_id, "items": rep.items, "excluded": {},
+                    "dest": str(Path(root) / self.cfg.storage.fetch_dir) if root else ""}
         if kind not in ("copy", "move"):
-            raise ApiError(400, "kind must be 'copy' or 'move'")
+            raise ApiError(400, "kind must be 'copy', 'move' or 'fetch'")
         try:
             rep = jobs.create_transfer_job(conn, list(body.get("paths", [])),
                                            body.get("tag") or None, str(body.get("to", "")),
@@ -962,6 +974,27 @@ class Api:
                 "SELECT 1 FROM copies WHERE file_id = ? AND node_id = ?", (fid, node_id)).fetchone():
             raise ApiError(404, "no such copy")
         return fid, node_id
+
+    def peer_route(self, conn, q, body, **_):
+        seen = tuple(x for x in q.get("seen", "").split(",") if x)
+        return relay.route(conn, q.get("to", ""), max(1, min(int(q.get("hops", 1)), relay.MAX_HOPS)),
+                           seen)
+
+    def peer_relay_request(self, conn, q, body, caller=None, **_):
+        try:
+            out = relay.request(conn, caller, body)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        if self.worker:
+            self.worker.request_jobs()
+        return out
+
+    def peer_relay_status(self, conn, q, body, **_):
+        return relay.status(conn, q.get("id", ""))
+
+    def peer_relay_done(self, conn, q, body, **_):
+        relay.done(conn, self.cfg, str(body.get("id", "")))
+        return {"ok": True}
 
     def peer_mark(self, conn, q, body, **_):
         with db.transaction(conn):

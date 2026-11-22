@@ -65,6 +65,13 @@ class RsyncDaemon:
                       f"    auth users = {auth}",
                       "    exclude = /.rei-fs/",
                       ""]
+        if users:   # files other servers asked us to stage for them (relay.py)
+            from .relay import staging_root
+
+            staging_root(self.cfg).mkdir(parents=True, exist_ok=True)
+            lines += ["[relay]", "    comment = files passed through this server",
+                      f"    path = {rsync_path(staging_root(self.cfg), style)}",
+                      f"    auth users = {auth}", ""]
         secrets_text = "".join(f"{u}:{p}\n" for u, p in users)
         return "\n".join(lines), secrets_text, bool(users)
 
