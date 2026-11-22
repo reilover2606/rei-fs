@@ -855,7 +855,8 @@ class Api:
                      "ssh_public_key": ssh.ensure_key(self.cfg.home, self.cfg.server.name)},
             "peers": [{"id": r["id"], "name": r["name"], "address": r["address"],
                        "online": bool(r["online"]), "last_sync": r["last_sync"] or "",
-                       "last_error": r["last_error"] or "", "fingerprint": r["fingerprint"],
+                       "last_error": r["last_error"] or "", "sync_note": r["sync_note"] or "",
+                       "fingerprint": r["fingerprint"],
                        "transport": r["transport"], "ssh_offered": bool(r["ssh_enabled"]),
                        "outbox": conn.execute("SELECT COUNT(*) FROM outbox WHERE server_id = ?",
                                               (r["id"],)).fetchone()[0]}
@@ -943,9 +944,14 @@ class Api:
                 "rsync_port": self.cfg.rsync.daemon_port, "ssh": ssh.offer(self.cfg)}
 
     def peer_changes(self, conn, q, body, caller=None, **_):
+        have = {}
+        for part in filter(None, q.get("have", "").split(",")):   # "origin:seq,origin:seq"
+            origin, _, seq = part.rpartition(":")
+            if origin and seq.isdigit():
+                have[origin] = int(seq)
         return sync.export_changes(conn, int(q.get("since", 0)),
                                    min(int(q.get("limit", sync.BATCH)), sync.BATCH),
-                                   exclude_origin=caller)
+                                   exclude_origin=caller, have=have)
 
     def _owned_copy(self, conn, body) -> tuple[int, str]:
         node_id = str(body.get("node_id", ""))
