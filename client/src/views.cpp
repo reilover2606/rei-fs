@@ -221,6 +221,31 @@ void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::str
   });
 }
 
+// Download files (or everything below a folder) to this machine: into the "fetch" folder at the
+// root of the server's own node, where nothing is indexed. The files may be fetched from other
+// servers, through intermediate ones.
+void fetch_paths(Context& ctx, std::vector<std::string> paths, const std::string& tag) {
+  if (paths.empty() && tag.empty()) return;
+  std::string what = !tag.empty() ? "the files tagged '" + tag + "'"
+                     : paths.size() == 1 ? paths[0] : std::to_string(paths.size()) + " items";
+  ctx.dialogs->confirm("Fetch " + what + " (all its files) to this machine?\n"
+                       "It is put in the fetch folder at the root of this server's node, "
+                       "outside the virtual tree.",
+                       [&ctx, paths, tag] {
+    json body = {{"kind", "fetch"}, {"paths", paths}};
+    if (!tag.empty()) body["tag"] = tag;
+    ctx.send("/api/jobs", body, [&ctx](json out) {
+      if (!out["job_id"].is_number()) {
+        ctx.notify("nothing to fetch");
+        return;
+      }
+      ctx.notify("job #" + std::to_string(out["job_id"].get<long>()) + ": fetching " +
+                 std::to_string(out.value("items", 0)) + " file(s) to " +
+                 out.value("dest", "the fetch folder"));
+    });
+  });
+}
+
 // Move items inside the virtual tree: the files are renamed on every node that
 // holds them. When the destination already has something of the same name the
 // user chooses between merging (the default) and keeping both.
@@ -612,7 +637,7 @@ class TreeView : public View {
   std::string title() const override { return "Tree"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  "
+    return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  "
            "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  r: refresh";
   }
   void on_poll() override {
@@ -728,6 +753,7 @@ class TreeView : public View {
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
                       text("x: pick up to move it in the tree  n: rename") | dim,
                       text("u: update priority (how often it is scanned)") | dim,
+                      text("f: fetch it to this machine (the fetch folder)") | dim,
                       text("blue: a copy is on this server's own node") | dim});
       return;
     }
@@ -822,6 +848,10 @@ class TreeView : public View {
     }
     if (key(e, "c") || key(e, "m")) {
       transfer_paths(ctx_, {target}, "", key(e, "m"));
+      return true;
+    }
+    if (key(e, "f")) {   // download to this machine's fetch folder
+      fetch_paths(ctx_, {target}, "");
       return true;
     }
     if (key(e, "x")) {   // pick up / put down this item
@@ -1088,6 +1118,10 @@ class SearchView : public View {
     }
     if (key(e, "c") || key(e, "m")) {
       transfer_paths(ctx_, {path}, "", key(e, "m"));
+      return true;
+    }
+    if (key(e, "f")) {
+      fetch_paths(ctx_, {path}, "");
       return true;
     }
     if (key(e, "C") || key(e, "M")) {

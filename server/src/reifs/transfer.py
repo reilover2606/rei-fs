@@ -83,9 +83,9 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
     if remote is None:
         daemon_opts = []
     elif getattr(remote, "password", None) is None:  # over SSH
-        daemon_opts = ["-e", ssh_command(cfg, remote), "--timeout=300"]
+        daemon_opts = ["-e", ssh_command(cfg, remote), "--timeout=120"]
     else:  # rsync daemon
-        daemon_opts = ["--contimeout=20", "--timeout=300"]
+        daemon_opts = ["--contimeout=20", "--timeout=120"]
     return [
         cfg.rsync.path,
         "--times",
@@ -170,7 +170,11 @@ def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: lis
     list_file = Path(list_name)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(b"\0".join(p.encode("utf-8") for p in rel_paths) + b"\0")
+            # A source inside a module (a staged relay) is named in the list with the "/./" marker:
+            # a folder in the URL itself does not work together with --files-from.
+            sub = getattr(remote, "subpath", "") if remote is not None else ""
+            names = [f"{sub}/./{p}" if sub else p for p in rel_paths]
+            f.write(b"\0".join(n.encode("utf-8") for n in names) + b"\0")
         cmd = build_command(cfg, src_root, dst_root, list_file, remote)
         env = None
         if remote is not None and getattr(remote, "password", None) is not None:

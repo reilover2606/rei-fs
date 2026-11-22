@@ -38,13 +38,31 @@ BIG_FILE = 16 << 20         # announce files from this size on before hashing th
 MAX_STORED_ERRORS = 1000
 
 
+def reserved_dirs(conn: sqlite3.Connection, cfg: Config, node_id: str) -> tuple[str, ...]:
+    """Folders at the root of a node that are not part of the virtual tree: the "fetch"
+    folder of this server's own node, where fetched files are put. Unless the node
+    already tracks files there (a folder of the user's with that name): those stay."""
+    row = conn.execute("SELECT kind FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    name = cfg.storage.fetch_dir.strip("/")
+    if row is None or row["kind"] != "server" or not name:
+        return ()
+    lo, hi = paths.prefix_range("/" + name)
+    if conn.execute("SELECT 1 FROM copies c JOIN files f ON f.id = c.file_id WHERE c.node_id = ?"
+                    " AND f.vpath >= ? AND f.vpath < ? LIMIT 1", (node_id, lo, hi)).fetchone():
+        return ()
+    return ("/" + name,)
+
+
 class Ignorer:
-    def __init__(self, scan: ScanSection):
+    def __init__(self, scan: ScanSection, reserved: tuple[str, ...] = ()):
+        self.reserved = set(reserved)
         self.hidden_dirs = scan.ignore_hidden_dirs
         self.name_patterns = [p.casefold() for p in scan.ignore if "/" not in p]
         self.path_patterns = [p.casefold() for p in scan.ignore if "/" in p]
 
     def ignored(self, name: str, vpath: str, is_dir: bool) -> bool:
+        if is_dir and vpath in self.reserved:
+            return True
         if is_dir and (name == MARKER_DIR or (self.hidden_dirs and name.startswith("."))):
             return True
         n = name.casefold()
@@ -205,7 +223,7 @@ def scan_node(
 
     started_at = time.time()
     stats = ScanStats(node=node["name"])
-    ignorer = Ignorer(cfg.scan)
+    ignorer = Ignorer(cfg.scan, reserved_dirs(conn, cfg, node_id))
     prefs = priority.Prefs(priority.load(conn))
     schedule = priority.Schedule(prefs, classes)
     walker = _Walker(root, ignorer, schedule)

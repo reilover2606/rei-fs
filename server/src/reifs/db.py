@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -385,6 +385,29 @@ CREATE INDEX copies_node ON copies(node_id, size);
     11: """
 -- What a peer's sync is doing right now ("catching up: N entries"), shown next to its state.
 ALTER TABLE servers ADD COLUMN sync_note TEXT;
+""",
+    12: """
+-- Fetching (a plain download into <server node>/fetch, nothing indexed) and relaying
+-- (a file passed through an intermediate server that both are paired with).
+ALTER TABLE job_items ADD COLUMN fetch INTEGER NOT NULL DEFAULT 0;  -- 1 fetch, 2 relay staging
+ALTER TABLE job_items ADD COLUMN relay_via TEXT;                    -- server relaying it for us
+ALTER TABLE job_items ADD COLUMN relay_id TEXT;                     -- our request on that server
+ALTER TABLE job_items ADD COLUMN serves TEXT;                       -- fetch = 2: the request we stage for
+
+-- On the intermediate server: files it fetches from where it can reach them for another.
+CREATE TABLE relay_requests (
+    id        TEXT PRIMARY KEY,
+    requester TEXT NOT NULL,
+    node_id   TEXT NOT NULL,
+    vpath     TEXT NOT NULL,
+    hash      TEXT NOT NULL,
+    size      INTEGER NOT NULL DEFAULT 0,
+    state     TEXT NOT NULL DEFAULT 'queued'
+              CHECK (state IN ('queued', 'ready', 'failed', 'done')),
+    message   TEXT,
+    created   TEXT NOT NULL,
+    updated   TEXT NOT NULL
+);
 """,
 }
 

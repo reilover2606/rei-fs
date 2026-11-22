@@ -59,6 +59,9 @@ class ServerSection:
 @dataclass
 class StorageSection:
     root: str = ""
+    # A folder at the root of this server's own node that rei-fs does not index or
+    # touch except to put files there when you "fetch" them (a plain download).
+    fetch_dir: str = "fetch"
 
 
 @dataclass
@@ -226,6 +229,8 @@ advertise = {s(self.server.advertise)}
 [storage]
 # This server's own node root.
 root = {s(self.storage.root)}
+# Where "fetch" puts downloads, at the root of that node. Never scanned or indexed.
+fetch_dir = {s(self.storage.fetch_dir)}
 
 [scan]
 # Minutes between automatic scans of a directory, by update priority

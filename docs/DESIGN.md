@@ -418,6 +418,34 @@ request must cost what is on screen, not the size of the index:
   a small RAM disk) made "database or disk is full" on servers with plenty of space; they now go
   to `<server home>/tmp` (or `SQLITE_TMPDIR`).
 
+### 5.10 Fetching, and passing files through other servers
+
+**Fetch** (`POST jobs {kind: "fetch", paths|tag}`, `f` in the Tree and Search) downloads files, or
+everything below a folder, to this machine: into `<this server's node>/fetch/<path>` (`[storage]
+fetch_dir`). It is a plain download. Nothing is indexed (the scanner skips that folder, unless
+the node already tracked files of the user's under that name), nothing is marked for deletion,
+and an existing file with other content in the way is never replaced (the item is skipped
+and says so). The source is any node that can be read, including other servers' nodes
+and, below, files passed through other servers.
+
+**Relaying.** A server may only pull from servers it is paired with. If the file lives on a
+node of server C that A is not paired with, but both A and C are paired with B (or a longer
+chain, up to three hops), B passes it on:
+
+1. A asks its paired servers whether they can reach C (`GET peer/route`, which asks onwards
+   with the list of servers already asked, so loops of pairings end).
+2. A sends B a request (`POST peer/relay-request {id, node, path, hash}`). B turns it into an
+   ordinary job item (`fetch = 2`): B pulls the file from C (or asks further) into its scratch
+   area `<home>/relay/<id>/`, verifying the hash, and the request becomes `ready` (or `failed`
+   with the reason).
+3. A polls (`GET peer/relay-status`), and when it is ready pulls from B's read-only `relay`
+   rsync module, verifies the hash again, and tells B (`POST peer/relay-done`), which removes its
+   copy. Unclaimed staged files are removed after six hours.
+
+A relay needs the rsync daemon transport between each pair of servers on the way. While it is
+in progress the item waits with a message saying where the file is. If there is no route, the
+message says so.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

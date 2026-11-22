@@ -418,3 +418,28 @@ def test_a_long_catch_up_is_in_slices_and_the_peer_is_online_meanwhile(cluster, 
     row = peers.peer_row(b.conn, a.id)
     assert a.id not in service.CATCHING_UP and not row["sync_note"]
     assert queries.lookup(b.conn, "/d/f7.txt") is not None          # everything arrived
+
+
+def test_a_job_waiting_for_a_remote_node_says_why(cluster):
+    from reifs import jobs as jobsmod
+    a, b = cluster("alpha"), cluster("beta")
+    pair(a, b)
+    write(b.root / "docs" / "x.txt", "x", mtime=1_000_000)
+    scanner.scan_all(b.conn, b.cfg)
+    for s_, o in ((a, b), (b, a)):
+        sync_peer(s_.conn, o.id)
+    rep = jobsmod.create_transfer_job(a.conn, ["/docs"], None, "alpha", src="beta")
+    # beta is "unreachable" from alpha's point of view
+    a.conn.execute("UPDATE servers SET online = 0, last_error = 'connection refused' WHERE id = ?",
+                   (b.id,))
+    runner.run_jobs(a.conn, a.cfg, [rep.job_id])
+    (item,) = a.conn.execute("SELECT state, message FROM job_items WHERE job_id = ?",
+                             (rep.job_id,)).fetchall()
+    assert item["state"] == "pending"
+    assert "server beta is unreachable (last error: connection refused)" in item["message"]
+    # With no rsync access stored (paired by an old version, for instance) it says that.
+    a.conn.execute("UPDATE servers SET online = 1, rsync_password = NULL WHERE id = ?", (b.id,))
+    runner.run_jobs(a.conn, a.cfg, [rep.job_id])
+    msg = a.conn.execute("SELECT message FROM job_items WHERE job_id = ?", (rep.job_id,)
+                         ).fetchone()[0]
+    assert "no rsync access to server beta" in msg

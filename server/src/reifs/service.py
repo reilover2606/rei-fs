@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import db, index, peers, priority, replication, runner, scanner, sync
+from . import db, index, peers, priority, relay, replication, runner, scanner, sync
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
@@ -32,6 +32,8 @@ log = logging.getLogger("reifs.service")
 DISCOVERY_SECONDS = 30
 SCAN_CHECK_SECONDS = 30   # how often to look for directories due for a scan
 JOBS_SECONDS = 60
+RELAY_POLL_SECONDS = 5
+HOUSEKEEPING_SECONDS = 600
 SYNC_SECONDS = 30
 PLAN_SECONDS = 600     # replication planning, at least this often
 PLAN_CHECK_SECONDS = 60  # ...and when the log changed (local or peer facts)
@@ -135,6 +137,8 @@ class Worker:
         last_scan = never
         last_discovery = never
         last_jobs = never
+        last_relay = never
+        last_housekeeping = never
         last_plan = never
         last_plan_check = never
         planned_at_seq = None
@@ -152,6 +156,16 @@ class Worker:
                     if now - last_discovery >= DISCOVERY_SECONDS:
                         last_discovery = now
                         online = self._watch_drives(conn, online)
+                    # Files being passed through other servers: ask again every few seconds
+                    # instead of waiting for the next minute.
+                    if now - last_relay >= RELAY_POLL_SECONDS:
+                        last_relay = now
+                        if conn.execute("SELECT 1 FROM job_items WHERE state = 'pending' AND"
+                                        " (relay_via IS NOT NULL OR fetch = 2) LIMIT 1").fetchone():
+                            self.request_jobs()
+                    if now - last_housekeeping >= HOUSEKEEPING_SECONDS:
+                        last_housekeeping = now
+                        relay.cleanup(conn, self.cfg)   # staged files nobody collected
                     if now - last_jobs >= JOBS_SECONDS:
                         last_jobs = now
                         if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
