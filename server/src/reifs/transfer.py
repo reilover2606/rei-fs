@@ -83,9 +83,9 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
     if remote is None:
         daemon_opts = []
     elif getattr(remote, "password", None) is None:  # over SSH
-        daemon_opts = ["-e", ssh_command(cfg, remote), "--timeout=300"]
+        daemon_opts = ["-e", ssh_command(cfg, remote), "--timeout=120"]
     else:  # rsync daemon
-        daemon_opts = ["--contimeout=20", "--timeout=300"]
+        daemon_opts = ["--contimeout=20", "--timeout=120"]
     return [
         cfg.rsync.path,
         "--times",

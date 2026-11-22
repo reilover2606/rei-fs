@@ -108,17 +108,35 @@ class _Runner:
         # Nodes of paired servers we can pull from: node announced online and
         # its server reachable at the last sync.
         self.remote = {}
-        reachable = {p["id"]: p for p in peers.paired_peers(conn) if p["online"]}
+        self.remote_why: dict[str, str] = {}   # why a node of another server cannot be pulled from
+        all_peers = {p["id"]: p for p in peers.paired_peers(conn)}
+        me = index.self_id(conn)
         for node in self.nodes.values():
-            peer = reachable.get(node["owner_id"])
-            if peer is not None and node["online"]:
+            if node["owner_id"] == me:
+                continue
+            peer = all_peers.get(node["owner_id"])
+            owner = peer["name"] if peer is not None else node["owner_id"][:8]
+            if peer is None:
+                self.remote_why[node["id"]] = f"server {owner} is not paired with this server"
+            elif not peer["online"]:
+                err = f" (last error: {peer['last_error']})" if peer["last_error"] else ""
+                self.remote_why[node["id"]] = f"server {owner} is unreachable{err}"
+            elif not node["online"]:
+                self.remote_why[node["id"]] = f"node {node['name']} is offline on server {owner}"
+            else:
                 # The transport chosen for that server: its rsync daemon or SSH.
                 if peer["transport"] == "ssh":
                     src = peers.ssh_source(peer, node)
+                    missing = (f"server {owner} does not offer SSH access to {node['name']} "
+                               "(Servers tab: switch the transport, or enable [ssh] there)")
                 else:
                     src = peers.remote_source(peer, node["id"])
+                    missing = (f"no rsync access to server {owner} (its rsync daemon was not "
+                               "set up when pairing: pair the servers again)")
                 if src is not None:
                     self.remote[node["id"]] = src
+                else:
+                    self.remote_why[node["id"]] = missing
         q = "SELECT * FROM jobs WHERE status IN ('pending', 'waiting')"
         args: list = []
         if job_ids:
@@ -310,7 +328,8 @@ class _Runner:
                                       " is no longer the current version")
                 return None
             if source["node_id"] not in self.roots and source["node_id"] not in self.remote:
-                self._wait(item, rep, f"node {self._name(source['node_id'])} is not reachable")
+                self._wait(item, rep, self.remote_why.get(
+                    source["node_id"], f"node {self._name(source['node_id'])} is not reachable"))
                 return None
         else:
             current = [c for c in copies if c["hash"] == version.hash]
@@ -319,9 +338,13 @@ class _Runner:
                      [c for c in current if c["node_id"] in self.remote]
             if not online:
                 if current:
-                    self._wait(item, rep, "no node holding the current version is reachable "
-                                          "(it must be attached here, or on a paired server "
-                                          "that is online)")
+                    why = []
+                    for c in current:
+                        nid = c["node_id"]
+                        why.append(self.remote_why.get(nid) or (
+                            f"node {self._name(nid)} is not attached to this server"))
+                    self._wait(item, rep, "no node holding the current version can be read now: "
+                                          + "; ".join(dict.fromkeys(why)))
                 else:
                     self._skip(item, rep, "no current copy to copy from")
                 return None
