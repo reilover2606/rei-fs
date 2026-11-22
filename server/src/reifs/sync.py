@@ -42,12 +42,24 @@ def export_changes(conn: sqlite3.Connection, since: int, limit: int = BATCH,
     }
 
 
+APPLY_CHUNK = 200   # entries per transaction: the write lock is never held for long
+
+
 def apply_changes(conn: sqlite3.Connection, entries: list[dict]) -> int:
-    """Apply a batch from a peer. Returns how many entries were new."""
+    """Apply a batch from a peer. Returns how many entries were new.
+
+    In small transactions (progress per origin is stored inside each, so a
+    stop halfway just resumes): one big one starved every other writer.
+    """
+    return sum(_apply_chunk(conn, entries[i:i + APPLY_CHUNK])
+               for i in range(0, len(entries), APPLY_CHUNK))
+
+
+def _apply_chunk(conn: sqlite3.Connection, entries: list[dict]) -> int:
     me = index.self_id(conn)
     applied = 0
     touched: set[int] = set()
-    with db.transaction(conn):
+    with db.transaction(conn, "applying changes from a peer"):
         progress = {r[0]: r[1] for r in conn.execute("SELECT * FROM origin_progress")}
         for e in entries:
             origin, seq = e["origin_id"], int(e["origin_seq"])

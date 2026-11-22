@@ -337,3 +337,26 @@ def test_unpair(cluster):
     assert b.conn.execute("SELECT paired FROM servers WHERE id = ?", (a.id,)).fetchone()[0] == 0
     with pytest.raises(peers.PeerError):
         peers.forward(b.conn, a.id, "GET", "/api/status")
+
+
+def test_the_sync_thread_survives_a_failed_round(env, monkeypatch):
+    import sqlite3
+    import threading
+    from reifs.service import Syncer
+
+    syncer = Syncer(env.cfg)
+    calls = {"n": 0}
+
+    def flaky_round(conn, state):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        if calls["n"] == 3:
+            syncer.shutdown.set()
+
+    monkeypatch.setattr(syncer, "_round", flaky_round)
+    monkeypatch.setattr(syncer.wake, "wait", lambda timeout=None: None)   # no real waiting
+    t = threading.Thread(target=syncer._main)
+    t.start()
+    t.join(10)
+    assert not t.is_alive() and calls["n"] == 3      # it went on after both failures

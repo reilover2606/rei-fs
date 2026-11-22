@@ -183,21 +183,31 @@ def _wanted_rows(conn, ids: list[int] | None) -> list[sqlite3.Row]:
     return [found[i] for i in ids]
 
 
+APPROVE_CHUNK = 500   # proposals turned into job items per transaction
+
+
 def approve_wanted(conn: sqlite3.Connection, ids: list[int] | None) -> CreateReport:
-    """Turn open wanted entries (all if ids is None) into one job."""
+    """Turn open wanted entries (all if ids is None) into one job.
+
+    Done in short transactions: with thousands of proposals one big transaction held the
+    database's write lock for so long that everything else (the sync with the other
+    servers, the API) gave up waiting for it. What is looked up for an item is read
+    before the transaction opens, so it only holds the lock to write.
+    """
     report = CreateReport(None, 0)
-    with db.transaction(conn):
-        rows = _wanted_rows(conn, ids)
-        if not rows:
-            return report
-        job_id = _new_job(conn, "wanted", f"{len(rows)} approved proposal(s)")
-        ts = db.now()
-        for w in rows:
+    rows = _wanted_rows(conn, ids)
+    if not rows:
+        return report
+    job_id: int | None = None
+    ts = db.now()
+    for start in range(0, len(rows), APPROVE_CHUNK):
+        inserts, approved, rejected = [], [], []
+        for w in rows[start:start + APPROVE_CHUNK]:
             data = json.loads(w["data"])
             if w["op"] == "rename":
                 vpath, new_vpath, allow = data["from"], data["to"], None
             elif w["vpath"] is None:
-                conn.execute("UPDATE wanted SET status = 'rejected' WHERE id = ?", (w["id"],))
+                rejected.append(w["id"])
                 report.excluded.setdefault("file no longer indexed", []).append(f"#{w['id']}")
                 continue
             else:
@@ -215,19 +225,24 @@ def approve_wanted(conn: sqlite3.Connection, ids: list[int] | None) -> CreateRep
                     "SELECT hash FROM copies WHERE file_id = ? AND node_id = ?",
                     (w["file_id"], w["dst_node"])).fetchone()
                 allow = cur[0] if cur else None
-            conn.execute(
+            inserts.append((w["op"], vpath, new_vpath,
+                            w["src_node"] if w["op"] == "rename" else None,
+                            w["dst_node"], size, allow, w["id"]))
+            approved.append(w["id"])
+        with db.transaction(conn, "approving proposals"):
+            if inserts and job_id is None:
+                job_id = _new_job(conn, "wanted", f"{len(rows)} approved proposal(s)")
+            conn.executemany("UPDATE wanted SET status = 'rejected' WHERE id = ?",
+                             [(i,) for i in rejected])
+            conn.executemany(
                 "INSERT INTO job_items(job_id, op, vpath, new_vpath, src_node, dst_node, size,"
                 " allow_hash, wanted_id, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (job_id, w["op"], vpath, new_vpath,
-                 w["src_node"] if w["op"] == "rename" else None,
-                 w["dst_node"], size, allow, w["id"], ts),
-            )
-            conn.execute("UPDATE wanted SET status = 'approved' WHERE id = ?", (w["id"],))
-            report.items += 1
-        if report.items == 0:
-            conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-        else:
-            report.job_id = job_id
+                [(job_id, op, v, nv, sn, dn, sz, al, wid, ts)
+                 for op, v, nv, sn, dn, sz, al, wid in inserts])
+            conn.executemany("UPDATE wanted SET status = 'approved' WHERE id = ?",
+                             [(i,) for i in approved])
+        report.items += len(approved)
+    report.job_id = job_id
     return report
 
 

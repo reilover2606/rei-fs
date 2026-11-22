@@ -36,10 +36,18 @@ void Dialogs::open(Component content) {
 void Dialogs::finish(std::function<void()> then) {
   shown_ = false;
   if (then) {
+    // What a dialog's answer starts may fail on an odd reply: say so instead of crashing.
+    auto guarded = [then = std::move(then), this] {
+      try {
+        then();
+      } catch (const std::exception& e) {
+        info("Something went wrong", e.what());
+      }
+    };
     if (auto* screen = ScreenInteractive::Active())
-      screen->Post(std::move(then));
+      screen->Post(std::move(guarded));
     else
-      then();
+      guarded();
   }
 }
 
@@ -255,7 +263,13 @@ void Context::run(bool write, std::function<json(Api&)> work, std::function<void
         error(failure);
         if (on_error) on_error();
       } else if (done) {
-        done(result);
+        // A reply the view did not expect (a null where a number was assumed...) must
+        // show a message, not take the whole program down.
+        try {
+          done(result);
+        } catch (const std::exception& e) {
+          error(std::string("unexpected reply from the server: ") + e.what());
+        }
       }
     });
   };

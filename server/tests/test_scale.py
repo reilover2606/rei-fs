@@ -78,3 +78,23 @@ def test_sqlite_temporary_files_go_next_to_the_database(tmp_path, monkeypatch):
     db.create(tmp_path / "home" / "reifs.db") if (tmp_path / "home").mkdir() is None else None
     assert os.environ["SQLITE_TMPDIR"] == str(tmp_path / "home" / "tmp")
     monkeypatch.delenv("SQLITE_TMPDIR")
+
+
+def test_approving_many_proposals_uses_short_transactions(env, monkeypatch):
+    from reifs import jobs
+    env.add_node("ssd")
+    env.conn.execute("UPDATE nodes SET replication_target = 1 WHERE name = 'ssd'")
+    for i in range(7):
+        write(env.root / "d" / f"f{i}.txt", str(i), mtime=1_000_000)
+    env.scan()
+    replication.plan(env.conn, env.cfg)
+    monkeypatch.setattr(jobs, "APPROVE_CHUNK", 3)
+    opened = []
+    real = db.transaction.__enter__
+    monkeypatch.setattr(db.transaction, "__enter__",
+                        lambda self: (opened.append(1), real(self))[1])
+    res = replication.approve(env.conn, None)
+    assert res.items == 7 and len(opened) >= 3                 # 7 proposals, chunks of 3
+    assert env.conn.execute("SELECT COUNT(*) FROM job_items WHERE job_id = ?",
+                            (res.local_job,)).fetchone()[0] == 7
+    assert env.conn.execute("SELECT COUNT(*) FROM wanted WHERE status = 'approved'").fetchone()[0] == 7

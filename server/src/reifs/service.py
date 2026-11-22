@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -140,30 +141,35 @@ class Worker:
         online: set[str] | None = None
         try:
             while not self.shutdown.is_set():
-                now = time.monotonic()
-                # Which directories are due depends on their update priority;
-                # looking is cheap (nothing is read when nothing is due).
-                if self.cfg.scan.interval_minutes > 0 and now - last_scan >= SCAN_CHECK_SECONDS:
-                    last_scan = now
-                    if self._scan_due(conn, online):
-                        self.request_scan(full=False)
-                if now - last_discovery >= DISCOVERY_SECONDS:
-                    last_discovery = now
-                    online = self._watch_drives(conn, online)
-                if now - last_jobs >= JOBS_SECONDS:
-                    last_jobs = now
-                    if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
-                                    " LIMIT 1").fetchone():
-                        self.request_jobs()
-                if now - last_plan_check >= PLAN_CHECK_SECONDS:
-                    last_plan_check = now
-                    seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
-                    # Planning walks the whole index (seconds on a big one): not more often
-                    # than ten times its own duration, however busy the change log is.
-                    spaced = now - last_plan >= max(PLAN_CHECK_SECONDS, 10 * self._plan_seconds)
-                    if spaced and (seq != planned_at_seq or now - last_plan >= PLAN_SECONDS):
-                        planned_at_seq, last_plan = seq, now
-                        self.request_plan()
+                try:
+                    now = time.monotonic()
+                    # Which directories are due depends on their update priority;
+                    # looking is cheap (nothing is read when nothing is due).
+                    if self.cfg.scan.interval_minutes > 0 and now - last_scan >= SCAN_CHECK_SECONDS:
+                        last_scan = now
+                        if self._scan_due(conn, online):
+                            self.request_scan(full=False)
+                    if now - last_discovery >= DISCOVERY_SECONDS:
+                        last_discovery = now
+                        online = self._watch_drives(conn, online)
+                    if now - last_jobs >= JOBS_SECONDS:
+                        last_jobs = now
+                        if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
+                                        " LIMIT 1").fetchone():
+                            self.request_jobs()
+                    if now - last_plan_check >= PLAN_CHECK_SECONDS:
+                        last_plan_check = now
+                        seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+                        # Planning walks the whole index (seconds on a big one): not more often
+                        # than ten times its own duration, however busy the change log is.
+                        spaced = now - last_plan >= max(PLAN_CHECK_SECONDS, 10 * self._plan_seconds)
+                        if spaced and (seq != planned_at_seq or now - last_plan >= PLAN_SECONDS):
+                            planned_at_seq, last_plan = seq, now
+                            self.request_plan()
+                except Exception as e:  # noqa: BLE001
+                    # A failed look at what is due must not end the worker for good.
+                    log.warning("worker scheduling failed, trying again: %s", e)
+                    time.sleep(2)
                 try:
                     task = self.tasks.get(timeout=1)
                 except queue.Empty:
@@ -318,41 +324,61 @@ class Syncer:
     def _main(self) -> None:
         db.set_label("syncing with paired servers")
         conn = db.open_existing(self.cfg.db_path)
-        signature = None
-        last_own = None
-        next_sync = 0.0
+        state = {"signature": None, "last_own": None, "next_sync": 0.0}
+        failures = 0
         try:
             while not self.shutdown.is_set():
-                current = self._pairing_signature(conn)
-                if current != signature:
-                    signature = current
-                    self.request_daemon_update()
-                # New local facts (also from the CLI in another process): tell peers.
-                own = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
-                if last_own is not None and own != last_own:
-                    self.request_poke()
-                last_own = own
-                with self._flags_lock:
-                    dirty, poke = self._daemon_dirty, self._poke_peers
-                    self._daemon_dirty = self._poke_peers = False
-                if dirty:
-                    try:
-                        self.daemon.update(conn)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("rsync daemon update failed: %s", e)
-                    next_sync = 0.0  # pairing or nodes changed: sync now
-                else:
-                    self.daemon.ensure()  # restart it if it died
-                now = time.monotonic()
-                if poke or self.wake.is_set() or now >= next_sync:
-                    self.wake.clear()
-                    self.sync_all(conn, poke)
-                    offline = conn.execute("SELECT 1 FROM servers WHERE paired = 1"
-                                           " AND online = 0 LIMIT 1").fetchone()
-                    next_sync = time.monotonic() + (RETRY_SECONDS if offline else SYNC_SECONDS)
-                self.wake.wait(TICK_SECONDS)
+                try:
+                    self._round(conn, state)
+                    failures = 0
+                except Exception as e:  # noqa: BLE001
+                    # One failed round (the database locked for a while by a long job, a
+                    # peer answering nonsense) must not end syncing for good: the thread
+                    # used to die here and the servers silently stopped syncing.
+                    failures += 1
+                    if conn.in_transaction:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except sqlite3.Error:
+                            pass
+                    if failures in (1, 5) or failures % 20 == 0:
+                        log.warning("sync round failed (%d in a row), trying again: %s",
+                                    failures, e, exc_info=failures == 1 and not isinstance(
+                                        e, sqlite3.OperationalError))
+                    state["next_sync"] = 0.0
+                    self.wake.wait(min(5.0 * failures, 60.0))
         finally:
             conn.close()
+
+    def _round(self, conn, state: dict) -> None:
+        current = self._pairing_signature(conn)
+        if current != state["signature"]:
+            state["signature"] = current
+            self.request_daemon_update()
+        # New local facts (also from the CLI in another process): tell peers.
+        own = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+        if state["last_own"] is not None and own != state["last_own"]:
+            self.request_poke()
+        state["last_own"] = own
+        with self._flags_lock:
+            dirty, poke = self._daemon_dirty, self._poke_peers
+            self._daemon_dirty = self._poke_peers = False
+        if dirty:
+            try:
+                self.daemon.update(conn)
+            except Exception as e:  # noqa: BLE001
+                log.warning("rsync daemon update failed: %s", e)
+            state["next_sync"] = 0.0  # pairing or nodes changed: sync now
+        else:
+            self.daemon.ensure()  # restart it if it died
+        now = time.monotonic()
+        if poke or self.wake.is_set() or now >= state["next_sync"]:
+            self.wake.clear()
+            self.sync_all(conn, poke)
+            offline = conn.execute("SELECT 1 FROM servers WHERE paired = 1"
+                                   " AND online = 0 LIMIT 1").fetchone()
+            state["next_sync"] = time.monotonic() + (RETRY_SECONDS if offline else SYNC_SECONDS)
+        self.wake.wait(TICK_SECONDS)
 
     def sync_all(self, conn, poke: bool = False) -> int:
         total = 0
