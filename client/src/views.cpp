@@ -241,8 +241,11 @@ void virtual_move(Context& ctx, std::vector<std::string> paths, const std::strin
         std::string msg = out.value("files", 0) == 0
                               ? "moved"
                               : std::to_string(out.value("files", 0)) + " file(s) moved";
-        if (!out["job_id"].is_null() || out.value("remote_jobs", 0) > 0)
-          msg += "; renaming on the nodes (job #" + std::to_string(out.value("job_id", 0)) + ")";
+        // job_id is null when only other servers have copies to rename (value() would throw).
+        if (out["job_id"].is_number())
+          msg += "; renaming on the nodes (job #" + std::to_string(out["job_id"].get<long>()) + ")";
+        else if (out["remote_jobs"].is_number() && out["remote_jobs"].get<int>() > 0)
+          msg += "; the other servers are renaming on their nodes";
         if (out.value("merged", 0) > 0)
           msg += ", " + std::to_string(out.value("merged", 0)) + " merged";
         if (out.value("marked", 0) > 0)
