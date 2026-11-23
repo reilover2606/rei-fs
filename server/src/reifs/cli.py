@@ -816,7 +816,7 @@ def cmd_schedule(args) -> None:
             sid = schedules.create(conn, args.target, args.src, args.dst, args.every,
                                    args.name, not args.no_update)
             print(f"Schedule #{sid} added; its first run is due now (the server runs it).")
-        elif act in ("remove", "enable", "disable", "run", "every"):
+        elif act in ("remove", "enable", "disable", "run", "every", "path"):
             if not args.target or not args.target.isdigit():
                 raise CliError(f"usage: reifs schedule {act} ID" + (" INTERVAL" if act == "every" else ""))
             sid = int(args.target)
@@ -826,6 +826,11 @@ def cmd_schedule(args) -> None:
             elif act in ("enable", "disable"):
                 schedules.update(conn, sid, enabled=act == "enable")
                 print(f"Schedule #{sid} {act}d.")
+            elif act == "path":
+                if not args.interval:
+                    raise CliError("usage: reifs schedule path ID NEW-DIRECTORY")
+                schedules.update(conn, sid, path=args.interval)
+                print(f"Schedule #{sid} now syncs {args.interval}.")
             elif act == "every":
                 schedules.update(conn, sid, interval=args.interval or args.every)
                 print(f"Schedule #{sid} now runs every {args.interval or args.every}.")
@@ -1054,7 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("schedule", help="keep a directory synced from one node to another "
                                         "at regular intervals")
     s.add_argument("action", nargs="?", default="list",
-                   choices=["list", "add", "remove", "enable", "disable", "run", "every"])
+                   choices=["list", "add", "remove", "enable", "disable", "run", "every", "path"])
     s.add_argument("target", nargs="?", help="add: the directory; others: the schedule's ID")
     s.add_argument("interval", nargs="?", help="every: the new interval")
     s.add_argument("--from", dest="src", help="source node")

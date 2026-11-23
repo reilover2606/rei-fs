@@ -2635,7 +2635,7 @@ class SchedulesView : public View {
   std::string title() const override { return "Schedules"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "n: new  s: sync now  e: enable/disable  i: interval  u: replace older copies on/off  "
+    return "n: new  s: sync now  e: enable/disable  i: interval  p: directory  u: replace older on/off  "
            "x: delete  r: refresh";
   }
 
@@ -2724,6 +2724,14 @@ class SchedulesView : public View {
       ctx_.dialogs->ask_choice("How often?", opts, [this, r, base](int i) {
         ctx_.send(base, on_server({{"every", interval_choices()[i].second}}, r),
                   [this](json) { refresh(); });
+      });
+      return true;
+    }
+    if (key(e, "p")) {   // the directory it keeps in sync (after it was renamed outside rei-fs)
+      ctx_.dialogs->ask_text("Directory to keep synced:", r.value("path", "/"),
+                             [this, r, base](const std::string& value) {
+        if (value.empty()) return;
+        ctx_.send(base, on_server({{"path", value}}, r), [this](json) { refresh(); });
       });
       return true;
     }

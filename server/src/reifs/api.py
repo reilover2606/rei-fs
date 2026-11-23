@@ -241,6 +241,7 @@ class Api:
         r("POST", r"/api/peer/relay-request", self.peer_relay_request, "peer")
         r("GET", r"/api/peer/relay-status", self.peer_relay_status, "peer")
         r("POST", r"/api/peer/relay-done", self.peer_relay_done, "peer")
+        r("POST", r"/api/peer/dir-moved", self.peer_dir_moved, "peer")
         r("POST", r"/api/peer/mark", self.peer_mark, "peer")
         r("POST", r"/api/peer/wanted", self.peer_wanted, "peer")
         r("POST", r"/api/peer/poke", self.peer_poke, "peer")
@@ -750,7 +751,7 @@ class Api:
     def update_schedule(self, conn, q, body, id, **_):
         try:
             schedules.update(conn, int(id), body.get("enabled"), body.get("every"),
-                             body.get("update_changed"), body.get("name"))
+                             body.get("update_changed"), body.get("name"), body.get("path"))
         except schedules.ScheduleError as e:
             raise ApiError(400, str(e)) from None
         if self.worker:
@@ -1057,6 +1058,14 @@ class Api:
     def peer_relay_done(self, conn, q, body, **_):
         relay.done(conn, self.cfg, str(body.get("id", "")))
         return {"ok": True}
+
+    def peer_dir_moved(self, conn, q, body, **_):
+        """Another server moved a directory: our scheduled syncs of it follow."""
+        try:
+            old, new = paths.normalize(str(body["old"])), paths.normalize(str(body["new"]))
+        except (KeyError, paths.VPathError):
+            raise ApiError(400, "old and new are needed") from None
+        return {"changed": schedules.rewrite_paths(conn, old, new)}
 
     def peer_mark(self, conn, q, body, **_):
         with db.transaction(conn):

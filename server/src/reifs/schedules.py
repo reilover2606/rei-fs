@@ -19,7 +19,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from . import db, index, jobs, nodes, paths, peers
+from . import db, index, jobs, nodes, paths, peers, vdirs
 
 MAX_ITEMS_PER_RUN = 50_000
 ACTIVE_JOB = ("pending", "running", "waiting")
@@ -104,9 +104,17 @@ def listing(conn: sqlite3.Connection) -> list[dict]:
 
 
 def update(conn: sqlite3.Connection, schedule_id: int, enabled=None, interval=None,
-           update_changed=None, name=None) -> None:
+           update_changed=None, name=None, path=None) -> None:
     row = get(conn, schedule_id)
+    if path is not None:
+        try:
+            path = paths.normalize(path or "/")
+        except paths.VPathError as e:
+            raise ScheduleError(str(e)) from None
     with db.transaction(conn):
+        if path is not None:
+            conn.execute("UPDATE schedules SET vpath = ?, next_due = ? WHERE id = ?",
+                         (path, time.time(), schedule_id))
         if enabled is not None:
             conn.execute("UPDATE schedules SET enabled = ? WHERE id = ?", (int(bool(enabled)),
                                                                            schedule_id))
@@ -123,6 +131,20 @@ def update(conn: sqlite3.Connection, schedule_id: int, enabled=None, interval=No
                          (int(bool(update_changed)), schedule_id))
         if name:
             conn.execute("UPDATE schedules SET name = ? WHERE id = ?", (name.strip(), schedule_id))
+
+
+def rewrite_paths(conn: sqlite3.Connection, old: str, new: str) -> int:
+    """A directory was renamed or moved in the virtual tree: schedules for it (or for a
+    directory inside it) follow it. Returns how many were changed."""
+    n = 0
+    with db.transaction(conn):
+        for r in conn.execute("SELECT id, vpath FROM schedules").fetchall():
+            v = r["vpath"]
+            if v == old or v.startswith(old.rstrip("/") + "/"):
+                conn.execute("UPDATE schedules SET vpath = ?, last_note = ? WHERE id = ?",
+                             (new + v[len(old):], f"followed {old} to {new}", r["id"]))
+                n += 1
+    return n
 
 
 def remove(conn: sqlite3.Connection, schedule_id: int) -> None:
@@ -209,6 +231,13 @@ def run(conn: sqlite3.Connection, schedule_id: int, force: bool = False) -> RunR
     if why:       # stays due: it runs as soon as everything is back
         _set_note(conn, schedule_id, f"waiting: {why}")
         return RunResult(False, note=why)
+    if sch["vpath"] != "/" and not vdirs.exists(conn, sch["vpath"]):
+        # Nothing at all under that path: it was probably renamed or moved outside rei-fs.
+        _set_note(conn, schedule_id,
+                  f"there is nothing under {sch['vpath']} (renamed or moved? change the "
+                  "schedule's directory)", next_due=now + sch["interval_minutes"] * 60,
+                  last_run=now)
+        return RunResult(True, note="the directory does not exist")
     items, copies, updates, truncated, newer = build_items(conn, sch)
     names = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM nodes")}
     nxt = now + sch["interval_minutes"] * 60

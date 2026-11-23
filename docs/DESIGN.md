@@ -466,7 +466,15 @@ the last run). The worker looks every 15 seconds, and at once when a node comes 
 cannot be used at that moment (a drive unplugged, a computer asleep, the other server unreachable)
 no job is created, the schedule says what it waits for, and it stays due: it runs as soon as both
 nodes are back, **once**, however many intervals were missed. A new run is not started while the
-previous job is still going. A very large directory is synced in pieces of 50,000 files, the next
+previous job is still going.
+
+**Renames.** A schedule names its directory by path. When a directory is renamed or moved in the
+virtual tree (5.5) the schedules for it, and for directories inside it, follow it, and the
+servers paired with this one are told (`POST peer/dir-moved`), because a schedule lives on the
+server owning the backup node, which may not be the one doing the move. A directory renamed
+*outside* rei-fs (on a disk) is not noticed: its next run finds nothing under the path and says so
+in the schedule's note, and `p` in the Schedules tab (`reifs schedule path ID DIR`) points it at the
+new place. A very large directory is synced in pieces of 50,000 files, the next
 piece a minute later.
 
 ### 5.12 Network figures in the client
