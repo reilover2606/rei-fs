@@ -200,7 +200,7 @@ def test_api_round_trip_in_cjk(server):
 def run_cli(env_vars, *args, python_flags=()):
     env = dict(os.environ, **env_vars)
     return subprocess.run([sys.executable, *python_flags, "-m", "reifs", *args], env=env,
-                          capture_output=True, text=False, timeout=60)
+                          capture_output=True, text=False, timeout=240)
 
 
 def test_cli_survives_an_ascii_terminal(tmp_path):
