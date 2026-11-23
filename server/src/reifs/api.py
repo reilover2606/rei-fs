@@ -214,6 +214,7 @@ class Api:
         r("POST", r"/api/jobs/run", self.run_jobs)
         r("GET", r"/api/jobs/(?P<id>\d+)", self.show_job)
         r("POST", r"/api/jobs/(?P<id>\d+)/(?P<action>cancel|retry)", self.job_action)
+        r("GET", r"/api/network", self.network)
         r("GET", r"/api/replication", self.replication_status)
         r("POST", r"/api/replication", self.replication_settings)
         r("POST", r"/api/replication/plan", self.replication_plan)
@@ -348,6 +349,7 @@ class Api:
                 "id": r["id"], "name": r["name"], "kind": r["kind"], "online": bool(r["online"]),
                 "owner": "self" if r["owner_id"] == me else r["owner"],
                 "owner_id": r["owner_id"],
+                "owner_online": r["owner_id"] == me or bool(r["owner_online"]),
                 "reachable": bool(r["online"]) and (r["owner_id"] == me or bool(r["owner_online"])),
                 "files": cov.node_files.get(r["id"], 0), "bytes": cov.node_bytes.get(r["id"], 0),
                 "case_sensitive": bool(r["case_sensitive"]),
@@ -808,6 +810,21 @@ class Api:
         return {"ok": True, "items": n}
 
     # --- replication ----------------------------------------------------------------
+
+    def network(self, conn, q, body, **_):
+        """Figures for the whole network: where the copies are, and how well files are covered."""
+        pol = replication.policy(self.cfg)
+        cov, stale = queries.coverage_stats(conn, pol)
+        me = nodes.self_id(conn)
+        node_rows = [{
+            "name": r["name"], "kind": r["kind"], "online": bool(r["online"]),
+            "owner": "self" if r["owner_id"] == me else r["owner"],
+            "files": cov.node_files.get(r["id"], 0), "bytes": cov.node_bytes.get(r["id"], 0)}
+            for r in conn.execute("SELECT n.*, s.name AS owner FROM nodes n JOIN servers s"
+                                  " ON s.id = n.owner_id ORDER BY n.name")]
+        return {"goal": pol.copies, "tag_goals": dict(pol.tag_copies), "files": cov.files,
+                "bytes": cov.bytes, "satisfied": cov.satisfied, "under": cov.under_replicated,
+                "single": cov.single_copy, "hist": cov.hist, "stale": stale, "nodes": node_rows}
 
     def replication_status(self, conn, q, body, **_):
         s = queries.status(conn, replication.policy(self.cfg))

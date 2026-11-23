@@ -402,7 +402,10 @@ std::string duration_text(double seconds) {
 class OverviewView : public View {
  public:
   explicit OverviewView(Context& ctx) : ctx_(ctx) {
-    root_ = Renderer([this] { return render(); });
+    // The Overview is taller than many terminals: it scrolls (arrows, PageUp/PageDown, Home/End).
+    root_ = Renderer([this] {
+      return render() | focusPositionRelative(0.f, scroll_) | vscroll_indicator | yframe;
+    });
     root_ |= CatchEvent([this](Event e) { return on_event(e); });
   }
   std::string title() const override { return "Overview"; }
@@ -410,16 +413,24 @@ class OverviewView : public View {
   void refresh() override {
     ctx_.get("/api/replication", [this](json out) { replication_ = std::move(out); },
              "overview-replication");
+    ctx_.get("/api/network", [this](json out) { network_ = std::move(out); }, "overview-network");
   }
   void on_poll() override {
     if (++polls_ % 15 == 0) refresh();  // the backup plan changes rarely (~30 s)
   }
   std::string help() const override {
-    return "s: scan all  w: new files only  j: run jobs  p: plan backups  g: copy goal  a: auto-approve  x: stop";
+    return "↑/↓/PgUp/PgDn: scroll  s: scan all  w: new files only  j: run jobs  p: plan backups  "
+           "g: copy goal  a: auto-approve  x: stop";
   }
 
  private:
   bool on_event(const Event& e) {
+    if (e == Event::ArrowDown) return scroll_ = std::min(1.f, scroll_ + 0.1f), true;
+    if (e == Event::ArrowUp) return scroll_ = std::max(0.f, scroll_ - 0.1f), true;
+    if (e == Event::PageDown) return scroll_ = std::min(1.f, scroll_ + 0.5f), true;
+    if (e == Event::PageUp) return scroll_ = std::max(0.f, scroll_ - 0.5f), true;
+    if (e == Event::Home) return scroll_ = 0.f, true;
+    if (e == Event::End) return scroll_ = 1.f, true;
     if (key(e, "s")) {
       ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan queued"); });
       return true;
@@ -632,10 +643,107 @@ class OverviewView : public View {
       backup.push_back(text("not planned yet (p: plan now)") | dim);
     }
     return vbox({hbox({vbox(left) | flex | border, vbox(right) | flex | border}),
-                 vbox(work) | border, vbox(backup) | border});
+                 vbox(work) | border, vbox(backup) | border, network_panel()});
+  }
+
+  // --- the whole network: where the copies are, and how well files are covered -------------
+
+  static Color node_color(size_t i) {
+    static const Color palette[] = {Color::Cyan,  Color::Green,       Color::Yellow, Color::Magenta,
+                                    Color::Blue,  Color::GreenLight,  Color::Red,    Color::CyanLight,
+                                    Color::YellowLight, Color::MagentaLight};
+    return palette[i % (sizeof palette / sizeof palette[0])];
+  }
+
+  // A bar split into coloured segments, one per node, in proportion to `values`.
+  static Element stacked_bar(const std::vector<double>& values, int width) {
+    double total = 0;
+    for (double v : values) total += v;
+    Elements segs;
+    int used = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+      int w = total > 0 ? static_cast<int>(values[i] / total * width + 0.5) : 0;
+      if (i + 1 == values.size()) w = std::max(0, width - used);   // the rounding remainder
+      if (w <= 0) continue;
+      used += w;
+      segs.push_back(text(std::string(w, ' ')) | bgcolor(node_color(i)));
+    }
+    if (segs.empty()) segs.push_back(text(std::string(width, ' ')) | bgcolor(Color::GrayDark));
+    return hbox(segs);
+  }
+
+  static std::string percent(double part, double whole) {
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%5.1f%%", whole > 0 ? part * 100.0 / whole : 0.0);
+    return buf;
+  }
+
+  Element network_panel() const {
+    if (!network_.is_object() || !network_.contains("nodes"))
+      return vbox({text("Network") | bold, text("loading...") | dim}) | border;
+    int goal = network_.value("goal", 2);
+    double files = network_.value("files", 0), satisfied = network_.value("satisfied", 0);
+    int under = network_.value("under", 0), single = network_.value("single", 0);
+    Elements rows = {hbox({text("Network") | bold,
+                           text(network_.value("stale", false) ? "  (figures a few seconds old)" : "") | dim}),
+                     separator()};
+
+    // 1. How many files meet their replication goal.
+    double frac = files > 0 ? satisfied / files : 1.0;
+    Color goal_color = frac >= 0.999 ? Color::Green : frac >= 0.75 ? Color::Yellow : Color::Red;
+    rows.push_back(hbox({text("replication goal (" + std::to_string(goal) + " copies)  "),
+                         gauge(static_cast<float>(frac)) | color(goal_color) | flex,
+                         text("  " + percent(satisfied, files) + " meet it") | bold | color(goal_color)}));
+    rows.push_back(text("  " + std::to_string(static_cast<long>(satisfied)) + " of " +
+                        std::to_string(static_cast<long>(files)) + " files meet their goal, " +
+                        std::to_string(under) + " below it (" + std::to_string(single) +
+                        " with a single copy)") | dim);
+    // Files by number of good copies.
+    const json& hist = network_["hist"];
+    double peak = 1;
+    for (const auto& h : hist) peak = std::max(peak, h.get<double>());
+    static const char* names[] = {"no good copy", "1 copy", "2 copies", "3 copies", "4+ copies"};
+    for (size_t i = 0; i < hist.size() && i < 5; ++i) {
+      Color c = i == 0 ? Color::Red : (static_cast<int>(i) < goal ? Color::Yellow : Color::Green);
+      rows.push_back(hbox({text("  " + fit(names[i], 14)), gauge(static_cast<float>(hist[i].get<double>() / peak)) |
+                                                               color(c) | size(WIDTH, EQUAL, 36),
+                           text("  " + std::to_string(hist[i].get<long>()) + " files")}));
+    }
+    rows.push_back(separator());
+
+    // 2. Where the copies are: by number of files and, in proportion, by size.
+    std::vector<double> nfiles, nbytes;
+    double tfiles = 0, tbytes = 0;
+    for (const auto& n : network_["nodes"]) {
+      nfiles.push_back(n.value("files", 0));
+      nbytes.push_back(static_cast<double>(n.value("bytes", std::int64_t{0})));
+      tfiles += nfiles.back();
+      tbytes += nbytes.back();
+    }
+    rows.push_back(text("where the copies are (a file on two nodes counts on both)") | dim);
+    rows.push_back(hbox({text(fit("  by files", 11)), stacked_bar(nfiles, 60)}));
+    rows.push_back(hbox({text(fit("  by size", 11)), stacked_bar(nbytes, 60)}));
+    size_t i = 0;
+    for (const auto& n : network_["nodes"]) {
+      Color c = node_color(i);
+      double f = nfiles[i], b = nbytes[i];
+      rows.push_back(hbox({text("  ■ ") | color(c), text(fit(n.value("name", ""), 16)),
+                           text(fit(std::to_string(static_cast<long>(f)) + " files", 13)),
+                           gauge(static_cast<float>(tfiles > 0 ? f / tfiles : 0)) | color(c) |
+                               size(WIDTH, EQUAL, 14),
+                           text(" " + percent(f, tfiles) + "  "), text(fit(human_size(static_cast<std::int64_t>(b)), 10)),
+                           gauge(static_cast<float>(tbytes > 0 ? b / tbytes : 0)) | color(c) |
+                               size(WIDTH, EQUAL, 14),
+                           text(" " + percent(b, tbytes)),
+                           text(n.value("online", false) ? "" : "  offline") | dim}));
+      ++i;
+    }
+    return vbox(rows) | border;
   }
 
   Context& ctx_;
+  float scroll_ = 0.f;   // 0 = top, 1 = bottom
+  json network_ = json::object();
   json replication_ = json::object();
   int polls_ = 0;
   Component root_;
@@ -1745,9 +1853,23 @@ class JobsView : public View {
 class NodesView : public View {
  public:
   explicit NodesView(Context& ctx) : ctx_(ctx) {
-    menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
+    MenuOption opt = MenuOption::Vertical();
+    // The servers are the trunks of the tree: bold, and not dimmed like the branches.
+    opt.entries_option.transform = [this](const EntryState& st) {
+      Element e = text((st.active ? "> " : "  ") + st.label);
+      bool header = st.index >= 0 && st.index < static_cast<int>(rows_.size()) &&
+                    rows_[st.index].kind != Row::Node && rows_[st.index].kind != Row::Foreign;
+      if (header) e = e | bold;
+      if (st.focused) e = e | inverted;
+      if (st.active) e = e | bold;
+      if (!st.focused && !st.active && !header) e = e | dim;
+      return e;
+    };
+    menu_ = Menu(&labels_, &selected_, opt);
     root_ = Renderer(menu_, [this] {
-      return with_detail(list_panel("nodes", menu_, labels_.size(), "no nodes"), detail());
+      return with_detail(list_panel("servers and the nodes they own", menu_, labels_.size(),
+                                    "no nodes"),
+                         detail());
     });
     root_ |= CatchEvent([this](Event e) { return on_event(e); });
   }
@@ -1760,41 +1882,134 @@ class NodesView : public View {
 
   void refresh() override {
     ctx_.get("/api/nodes", [this](json out) {
-      std::string keep = current_name();
+      std::string keep = current_key();
       items_ = out["nodes"];
       foreign_ = out.value("foreign", json::array());
       rebuild_labels();
-      selected_ = reselect(items_, keep, [](const json& n) { return n.value("name", ""); },
-                           selected_);
+      selected_ = reselect_row(keep);
     }, "nodes");
   }
 
  private:
+  // One row of the list: a server (the trunk), a node it owns (a branch), or a foreign drive.
+  struct Row {
+    enum Kind { Server, Node, Foreign, ForeignHeader } kind = Node;
+    int idx = -1;           // items_ / foreign_ index (Node, Foreign)
+    std::string owner_id;   // Server: whose; Node: whose it is
+  };
+
+  std::string state_of(const json& n) const {
+    return n.value("online", false) ? (n.value("reachable", true) ? "online" : "unreachable")
+                                    : "offline";
+  }
+
+  // The servers with the nodes they own, drawn as a tree:
+  //   ▾ this server
+  //      ├─ node
+  //      └─ node
   // "»" marks the nodes chosen for a scan (Space).
   void rebuild_labels() {
     labels_.clear();
-    for (const auto& n : items_) {
-      std::string state = n.value("online", false)
-                              ? (n.value("reachable", true) ? "online" : "unreachable")
-                              : "offline";
-      labels_.push_back(std::string(marked_.count(n.value("name", "")) ? "» " : "  ") +
-                        fit(n.value("name", ""), 16) + fit(n.value("kind", ""), 9) +
-                        fit(state, 12) + fit(n.value("owner", ""), 12) +
-                        fit(std::to_string(n.value("files", 0)) + " files", 14) +
-                        human_size(n.value("bytes", std::int64_t{0})));
+    rows_.clear();
+    std::vector<std::string> order;                       // owner ids, this server first
+    std::map<std::string, std::vector<int>> owned;
+    std::map<std::string, json> server_info;
+    for (size_t i = 0; i < items_.size(); ++i) {
+      const json& n = items_[i];
+      std::string id = n.value("owner_id", "");
+      if (!owned.count(id)) {
+        order.push_back(id);
+        server_info[id] = {{"name", n.value("owner", "") == "self" ? ctx_.api->server_name()
+                                                                   : n.value("owner", "")},
+                           {"self", n.value("owner", "") == "self"},
+                           {"online", n.value("owner", "") == "self" || n.value("owner_online", true)}};
+      }
+      owned[id].push_back(static_cast<int>(i));
     }
-    for (const auto& f : foreign_)
-      labels_.push_back("  " + fit(f.value("name", ""), 16) + fit("foreign", 9) +
-                        fit("attached", 12) + fit(f.value("owner", ""), 12) +
-                        "press o to adopt");
+    std::stable_sort(order.begin(), order.end(), [&](const std::string& a, const std::string& b) {
+      bool sa = server_info[a].value("self", false), sb = server_info[b].value("self", false);
+      if (sa != sb) return sa;
+      return server_info[a].value("name", "") < server_info[b].value("name", "");
+    });
+    for (const auto& id : order) {
+      const json& info = server_info[id];
+      std::int64_t bytes = 0;
+      int files = 0;
+      for (int i : owned[id]) {
+        files += items_[i].value("files", 0);
+        bytes += items_[i].value("bytes", std::int64_t{0});
+      }
+      std::string tag = info.value("self", false)       ? "this server"
+                        : info.value("online", true) ? "online" : "UNREACHABLE";
+      labels_.push_back("▾ " + info.value("name", "") + "  (" + tag + ")  " +
+                        std::to_string(owned[id].size()) + " node(s), " + std::to_string(files) +
+                        " files, " + human_size(bytes));
+      rows_.push_back({Row::Server, -1, id});
+      for (size_t k = 0; k < owned[id].size(); ++k) {
+        const json& n = items_[owned[id][k]];
+        bool last = k + 1 == owned[id].size();
+        labels_.push_back(std::string(marked_.count(n.value("name", "")) ? "»" : " ") + " " +
+                          (last ? "└─ " : "├─ ") + fit(n.value("name", ""), 16) +
+                          fit(n.value("kind", ""), 9) + fit(state_of(n), 12) +
+                          fit(std::to_string(n.value("files", 0)) + " files", 14) +
+                          human_size(n.value("bytes", std::int64_t{0})));
+        rows_.push_back({Row::Node, owned[id][k], id});
+      }
+    }
+    if (!foreign_.empty()) {
+      labels_.push_back("▾ attached here, owned by other servers (press o to adopt)");
+      rows_.push_back({Row::ForeignHeader, -1, ""});
+      for (size_t k = 0; k < foreign_.size(); ++k) {
+        const json& f = foreign_[k];
+        labels_.push_back(std::string("  ") + (k + 1 == foreign_.size() ? "└─ " : "├─ ") +
+                          fit(f.value("name", ""), 16) + fit("foreign", 9) + fit("attached", 12) +
+                          "owned by " + f.value("owner", ""));
+        rows_.push_back({Row::Foreign, static_cast<int>(k), ""});
+      }
+    }
   }
 
-  // The nodes to scan: the ones marked with Space, else the selected one.
+  const Row* row() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(rows_.size())) return nullptr;
+    return &rows_[selected_];
+  }
+  // Which row is "the same" after a refresh: a node or foreign drive by name, a server by id.
+  std::string current_key() const {
+    const Row* r = row();
+    if (!r) return "";
+    if (r->kind == Row::Node) return "n:" + items_[r->idx].value("name", "");
+    if (r->kind == Row::Foreign) return "f:" + foreign_[r->idx].value("name", "");
+    return "s:" + r->owner_id;
+  }
+  int reselect_row(const std::string& keep) const {
+    for (size_t i = 0; i < rows_.size(); ++i) {
+      const Row& r = rows_[i];
+      std::string k = r.kind == Row::Node ? "n:" + items_[r.idx].value("name", "")
+                      : r.kind == Row::Foreign ? "f:" + foreign_[r.idx].value("name", "")
+                                               : "s:" + r.owner_id;
+      if (k == keep) return static_cast<int>(i);
+    }
+    return std::clamp(selected_, 0, std::max(0, static_cast<int>(rows_.size()) - 1));
+  }
+  // Names of the nodes a server owns (what a scan on its row covers).
+  std::vector<std::string> nodes_of(const std::string& owner_id) const {
+    std::vector<std::string> out;
+    for (const auto& n : items_)
+      if (n.value("owner_id", "") == owner_id) out.push_back(n.value("name", ""));
+    return out;
+  }
+
+  // The nodes to scan: the ones marked with Space, else the selected node (or, on a
+  // server's row, all the nodes it owns).
   std::vector<std::string> scan_targets(const std::string& selected) {
     std::vector<std::string> out;
     for (const auto& n : items_)
       if (marked_.count(n.value("name", ""))) out.push_back(n.value("name", ""));
-    if (out.empty()) out.push_back(selected);
+    if (out.empty()) {
+      const Row* r = row();
+      if (r && r->kind == Row::Server) return nodes_of(r->owner_id);
+      out.push_back(selected);
+    }
     return out;
   }
   static std::string joined(const std::vector<std::string>& names) {
@@ -1803,15 +2018,41 @@ class NodesView : public View {
     return out;
   }
 
-  bool on_foreign() const { return selected_ >= static_cast<int>(items_.size()); }
+  bool on_foreign() const { return row() && row()->kind == Row::Foreign; }
   std::string current_name() const {
-    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
-    return items_[selected_].value("name", "");
+    const Row* r = row();
+    if (!r || r->kind != Row::Node) return "";
+    return items_[r->idx].value("name", "");
   }
+  int node_index() const { return row() && row()->kind == Row::Node ? row()->idx : 0; }
 
   Element detail() {
-    if (on_foreign() && selected_ - items_.size() < foreign_.size()) {
-      const json& f = foreign_[selected_ - items_.size()];
+    const Row* r = row();
+    if (r && r->kind == Row::Server) {
+      auto names = nodes_of(r->owner_id);
+      std::int64_t bytes = 0;
+      int files = 0;
+      bool self = false;
+      std::string name, state = "online";
+      for (const auto& n : items_) {
+        if (n.value("owner_id", "") != r->owner_id) continue;
+        files += n.value("files", 0);
+        bytes += n.value("bytes", std::int64_t{0});
+        self = n.value("owner", "") == "self";
+        name = self ? ctx_.api->server_name() : n.value("owner", "");
+        if (!self && !n.value("owner_online", true)) state = "UNREACHABLE";
+      }
+      return vbox({text(name) | bold, separator(),
+                   label_value("server", self ? "this server" : state),
+                   label_value("nodes", joined(names)),
+                   label_value("files", std::to_string(files) + " (" + human_size(bytes) + ")"),
+                   text(""), text("s/w/v: scan (all its nodes)  Space: choose them all") | dim});
+    }
+    if (r && r->kind == Row::ForeignHeader)
+      return paragraph("Drives of other servers that are attached to this machine. Select one and "
+                       "press o to make this server its owner.") | dim;
+    if (on_foreign()) {
+      const json& f = foreign_[r->idx];
       return vbox({text(f.value("name", "")) | bold, separator(),
                    label_value("owner", f.value("owner", "")),
                    label_path("path", f.value("path", "")),
@@ -1819,8 +2060,8 @@ class NodesView : public View {
                    paragraph("This drive belongs to another server and is attached here. "
                              "Press o to make this server its owner.") | dim});
     }
-    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return text("");
-    const json& n = items_[selected_];
+    if (!r || r->kind != Row::Node) return text("");
+    const json& n = items_[r->idx];
     auto yes = [](bool b) { return std::string(b ? "yes" : "no"); };
     return vbox({
         text(n.value("name", "")) | bold,
@@ -1876,7 +2117,7 @@ class NodesView : public View {
         ctx_.error("select a foreign drive (listed after the nodes) to adopt it");
         return true;
       }
-      json f = foreign_[selected_ - items_.size()];
+      json f = foreign_[row()->idx];
       ctx_.dialogs->confirm("Make this server the owner of '" + f.value("name", "") +
                                 "' (owned by " + f.value("owner", "") + ")?",
                             [this, f] {
@@ -1891,7 +2132,17 @@ class NodesView : public View {
       return true;
     }
     std::string name = current_name();
-    if (name.empty()) return false;
+    const Row* sel = row();
+    bool on_server = sel && sel->kind == Row::Server;
+    if (name.empty() && !on_server) return false;
+    // Scanning keys also work on a server's row (all the nodes it owns); the rest need one node.
+    if (name.empty() && !(key(e, " ") || key(e, "s") || key(e, "w") || key(e, "v"))) {
+      if (key(e, "R") || key(e, "c") || key(e, "m") || key(e, "p") || key(e, "t")) {
+        ctx_.error("select a node (a branch), not a server");
+        return true;
+      }
+      return false;
+    }
     if (key(e, "R")) {
       ctx_.dialogs->ask_text("New name for node " + name, name,
                              [this, name](const std::string& value) {
@@ -1904,8 +2155,13 @@ class NodesView : public View {
                              });
       return true;
     }
-    if (key(e, " ")) {   // choose nodes to scan together
-      if (!marked_.erase(name)) marked_.insert(name);
+    if (key(e, " ")) {   // choose nodes to scan together (on a server: all of its nodes)
+      auto names = on_server ? nodes_of(sel->owner_id) : std::vector<std::string>{name};
+      bool all_marked = std::all_of(names.begin(), names.end(),
+                                    [this](const std::string& n) { return marked_.count(n) > 0; });
+      for (const auto& n : names) {
+        if (all_marked) marked_.erase(n); else marked_.insert(n);
+      }
       rebuild_labels();
       return true;
     }
@@ -1956,7 +2212,7 @@ class NodesView : public View {
       return true;
     }
     if (key(e, "m")) {   // change where the node's folder is
-      std::string root = items_[selected_].value("root", "");
+      std::string root = items_[node_index()].value("root", "");
       ctx_.dialogs->ask_text(
           "New place of the folder of " + name + " (a path ON THE SERVER'S MACHINE):", root,
           [this, name, root](const std::string& path) {
@@ -2002,7 +2258,7 @@ class NodesView : public View {
       return true;
     }
     if (key(e, "p")) {
-      std::string current = std::to_string(items_[selected_].value("priority", 0));
+      std::string current = std::to_string(items_[node_index()].value("priority", 0));
       ctx_.dialogs->ask_text("Priority of " + name + " (higher = preferred backup target)",
                              current, [this, name](const std::string& value) {
                                int n = 0;
@@ -2018,7 +2274,7 @@ class NodesView : public View {
       return true;
     }
     if (key(e, "t")) {
-      bool target = items_[selected_].value("replication_target", true);
+      bool target = items_[node_index()].value("replication_target", true);
       ctx_.send("/api/nodes/" + url_encode(name), {{"replication_target", !target}},
                 [this](json) { refresh(); });
       return true;
@@ -2028,6 +2284,7 @@ class NodesView : public View {
 
   Context& ctx_;
   std::set<std::string> marked_;   // nodes chosen with Space for the next scan
+  std::vector<Row> rows_;          // what each line of the list stands for
   json items_ = json::array();
   json foreign_ = json::array();
   std::vector<std::string> labels_;

@@ -447,3 +447,13 @@ def test_routine_connection_endings_are_not_logged_or_counted(caplog):
         apimod._connection_problem("dropped", "10.0.0.5", OSError("again"))
     assert apimod.CONNECTION_STATS["dropped"] == before["dropped"] + 2
     assert len(caplog.records) == 1      # at most one summary a minute
+
+
+def test_network_figures_and_the_node_tree_data(server):
+    env, client, _ = server
+    login(client)
+    net = client.get("/api/network")
+    assert net["goal"] == 2 and net["files"] == 3 and sum(net["hist"]) == 3
+    assert {n["name"] for n in net["nodes"]} == {"srv", "ssd"}
+    nodes_ = client.get("/api/nodes")["nodes"]
+    assert all("owner_id" in n and n["owner_online"] is True for n in nodes_)     # for the tree

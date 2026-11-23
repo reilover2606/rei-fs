@@ -98,3 +98,17 @@ def test_approving_many_proposals_uses_short_transactions(env, monkeypatch):
     assert env.conn.execute("SELECT COUNT(*) FROM job_items WHERE job_id = ?",
                             (res.local_job,)).fetchone()[0] == 7
     assert env.conn.execute("SELECT COUNT(*) FROM wanted WHERE status = 'approved'").fetchone()[0] == 7
+
+
+def test_network_figures(env):
+    env.add_node("ssd")
+    env.conn.execute("UPDATE nodes SET replication_target = 1 WHERE name = 'ssd'")
+    for i in range(3):
+        write(env.root / "d" / f"f{i}.txt", "x" * (i + 1), mtime=1_000_000)
+    env.scan()
+    from reifs import jobs, runner
+    rep = jobs.create_transfer_job(env.conn, ["/d/f0.txt"], None, "ssd")     # one file twice
+    runner.run_jobs(env.conn, env.cfg, [rep.job_id])
+    cov, _ = queries.coverage_stats(env.conn, queries.GoalPolicy())
+    assert cov.hist == [0, 2, 1, 0, 0] and (cov.satisfied, cov.under_replicated) == (1, 2)
+    assert sum(cov.node_files.values()) == 4

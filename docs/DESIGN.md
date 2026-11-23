@@ -469,6 +469,16 @@ nodes are back, **once**, however many intervals were missed. A new run is not s
 previous job is still going. A very large directory is synced in pieces of 50,000 files, the next
 piece a minute later.
 
+### 5.12 Network figures in the client
+
+The Overview ends with a **Network** section (the Overview scrolls with the arrow keys). It shows how
+many files meet their replication goal as a gauge and a percentage, the files by number of good
+copies (0, 1, 2, 3, 4+) as bars, and where the copies are: for each node its share of all
+copies by file count and, in proportion, by size, as two stacked bars (one colour per node) and per-node
+gauges. The figures are the cached coverage figures of §5.9 (`GET network`). The Nodes tab
+lists each server (this one first) with the nodes it owns branching beneath it; a scan key on a
+server's row covers all its nodes.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies
