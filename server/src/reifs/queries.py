@@ -209,11 +209,16 @@ def _filters(tag: str | None, node: str | None, issues_only: bool, under: bool,
         where.append("f.id IN (SELECT file_id FROM temp.under_ids)")
     if pattern is not None:
         # SQLite cuts the candidates down with the longest literal part of the pattern
-        # (vkey is the casefolded path); the exact match is checked on those few.
+        # the exact match is checked on those few.
+        # An ASCII literal is looked for in the lower-cased path (SQLite's lower() is ASCII
+        # only), and every path with a non-ASCII character stays a candidate whatever the
+        # literal: its case folding may differ (the Kelvin sign is a k, a long s is an s).
         literal = _longest_literal(pattern)
-        if literal:
-            where.append("instr(f.vkey, ?) > 0")
+        if literal and literal.isascii():
+            where.append("(instr(lower(f.vpath), ?) > 0 OR f.vpath GLOB '*[^ -~]*')")
             args.append(literal)
+        elif literal:
+            where.append("f.vpath GLOB '*[^ -~]*'")
     if where:
         q += " WHERE " + " AND ".join(where)
     return q, args
@@ -410,7 +415,7 @@ def _compute_stats(conn: sqlite3.Connection, policy: GoalPolicy, seq: int) -> Co
     hist = [0] * 5
     for kind, a, b, c, d, e in conn.execute("""
         WITH g AS MATERIALIZED (
-            SELECT file_id, MIN(hash) = MAX(hash) AS one, SUM(marked_delete = 0) AS good,
+            SELECT file_id, MIN(hash_b) = MAX(hash_b) AS one, SUM(marked_delete = 0) AS good,
                    MAX(size) AS sz
             FROM copies WHERE state = 'present' GROUP BY file_id)
         SELECT 1, COUNT(*), IFNULL(SUM(sz), 0),
@@ -519,12 +524,12 @@ def fill_under_ids(conn: sqlite3.Connection, policy: GoalPolicy) -> None:
     conn.execute("""
         INSERT OR IGNORE INTO temp.under_ids
         SELECT g.file_id FROM (
-            SELECT file_id, MIN(hash) = MAX(hash) AS one, SUM(marked_delete = 0) AS good
+            SELECT file_id, MIN(hash_b) = MAX(hash_b) AS one, SUM(marked_delete = 0) AS good
             FROM copies WHERE state = 'present' GROUP BY file_id) g
         LEFT JOIN temp.goal_override o ON o.file_id = g.file_id
         WHERE g.one AND g.good < COALESCE(o.goal, ?)""", (policy.copies,))
     for (fid,) in conn.execute("SELECT file_id FROM copies WHERE state = 'present'"
-                               " GROUP BY file_id HAVING MIN(hash) != MAX(hash)").fetchall():
+                               " GROUP BY file_id HAVING MIN(hash_b) != MAX(hash_b)").fetchall():
         multi.append(fid)
     for fid in multi:
         got = exact_good(conn, fid)

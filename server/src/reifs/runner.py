@@ -302,12 +302,13 @@ class _Runner:
                 return (f"name not allowed on {node['name']} "
                         f"(restricted filesystem: {', '.join(sorted(bad))})")
         if not node["case_sensitive"]:
-            clash = self.conn.execute(
+            key = paths.key(vpath)
+            clash = next((r[0] for r in self.conn.execute(
                 "SELECT f.vpath FROM copies c JOIN files f ON f.id = c.file_id"
-                " WHERE c.node_id = ? AND f.vkey = ? AND f.vpath != ?",
-                (node_id, paths.key(vpath), vpath)).fetchone()
+                " WHERE c.node_id = ? AND f.vhash = ? AND f.vpath != ?",
+                (node_id, db.key_hash(vpath), vpath)) if paths.key(r[0]) == key), None)
             if clash:
-                return f"case collision with {clash[0]} on {node['name']}"
+                return f"case collision with {clash} on {node['name']}"
         return None
 
     # --- copy / overwrite ---------------------------------------------------------

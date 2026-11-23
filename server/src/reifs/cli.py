@@ -804,6 +804,28 @@ def cmd_ssh(args) -> None:
             print(line)
 
 
+def cmd_db(args) -> None:
+    cfg, conn = open_server(args.home)
+    if args.action == "stats":
+        sizes = db.table_sizes(conn)
+        total = sum(s for _, s in sizes) if sizes else 0
+        print(f"{cfg.db_path}: {cfg.db_path.stat().st_size / 2**20:.0f} MiB, "
+              f"{db.free_space_ratio(conn) * 100:.1f}% of it free pages")
+        if sizes is None:
+            print("(this SQLite has no dbstat: no breakdown)")
+            return
+        for name, size in sizes[:15]:
+            print(f"  {name:34}{size / 2**20:9.0f} MiB  {size * 100 / max(total, 1):5.1f}%")
+        return
+    holders = db.holders_of(cfg.db_path)
+    if holders and not args.force:
+        listing = "\n".join(f"  pid {pid}: {cmd}" for pid, cmd in holders)
+        raise CliError("other processes have the database open (a running server would be "
+                       f"unusable while it is compacted):\n{listing}\nStop them, or use --force.")
+    before, after = db.vacuum(conn, cfg.db_path)
+    print(f"database: {before / 2**20:.0f} MiB -> {after / 2**20:.0f} MiB")
+
+
 def cmd_schedule(args) -> None:
     from . import schedules
 
@@ -1055,6 +1077,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--due", action="store_true",
                    help="only directories due for an automatic scan (by update priority)")
     s.set_defaults(func=cmd_scan)
+
+    s = sub.add_parser("db", help="the database: its size (stats) and compacting it (vacuum)")
+    s.add_argument("action", choices=["stats", "vacuum"])
+    s.add_argument("--force", action="store_true",
+                   help="vacuum even though other processes have the database open")
+    s.set_defaults(func=cmd_db)
 
     s = sub.add_parser("schedule", help="keep a directory synced from one node to another "
                                         "at regular intervals")

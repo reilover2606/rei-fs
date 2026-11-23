@@ -99,13 +99,14 @@ def good_nodes_of(conn: sqlite3.Connection, fid: int) -> tuple[list[str], str, i
 def under_file(conn: sqlite3.Connection, fid: int, pol: GoalPolicy) -> UnderFile | None:
     """The file if it has a good copy but fewer than its goal (looked at on its own)."""
     got = good_nodes_of(conn, fid)
-    f = conn.execute("SELECT vpath, vkey, issues FROM files WHERE id = ?", (fid,)).fetchone()
+    f = conn.execute("SELECT vpath, issues FROM files WHERE id = ?", (fid,)).fetchone()
     if got is None or f is None or not got[0]:
         return None
     goal = pol.goal(tags_of(conn, fid))
     if len(got[0]) >= goal:
         return None
-    return UnderFile(fid, f["vpath"], f["vkey"], f["issues"], got[1], got[2], got[0], goal)
+    return UnderFile(fid, f["vpath"], paths.key(f["vpath"]), f["issues"], got[1], got[2], got[0],
+                     goal)
 
 
 class _Planner:
@@ -134,10 +135,10 @@ class _Planner:
             "SELECT node_id FROM copies WHERE file_id = ?", (fid,))}
 
     def _case_clash(self, node_id: str, f: UnderFile) -> bool:
-        return self.conn.execute(
-            "SELECT 1 FROM files x JOIN copies c ON c.file_id = x.id WHERE x.vkey = ?"
-            " AND c.node_id = ? AND x.vpath != ? LIMIT 1", (f.vkey, node_id, f.vpath)
-        ).fetchone() is not None
+        # Found by the (indexed) number of the casefolded path, then compared for real.
+        return any(paths.key(r[0]) == f.vkey for r in self.conn.execute(
+            "SELECT x.vpath FROM files x JOIN copies c ON c.file_id = x.id WHERE x.vhash = ?"
+            " AND c.node_id = ? AND x.vpath != ?", (db.key_hash(f.vpath), node_id, f.vpath)))
 
     def choose(self, f: UnderFile, exclude: set[str]) -> tuple[str | None, str]:
         holding = self._holding(f.file_id) | exclude

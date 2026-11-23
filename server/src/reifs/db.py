@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import os
+import re
+import shutil
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -427,6 +431,37 @@ CREATE TABLE schedules (
     last_note        TEXT
 );
 """,
+    14: """
+-- A smaller database (design 5.13).
+-- (1) The change log keeps no copy of what the tables hold: an entry about a copy only
+--     points at it (file, node), and the current state is read when it is sent. At most one
+--     entry per copy is kept.
+ALTER TABLE changes ADD COLUMN ref_file INTEGER;
+ALTER TABLE changes ADD COLUMN ref_node TEXT;
+UPDATE changes SET
+    ref_file = (SELECT id FROM files WHERE vpath = json_extract(changes.data, '$.vpath')),
+    ref_node = json_extract(data, '$.node_id')
+  WHERE kind = 'copy' AND json_extract(data, '$.op') IN ('upsert', 'missing');
+DELETE FROM changes WHERE ref_node IS NOT NULL AND ref_file IS NULL;
+UPDATE changes SET data = '' WHERE ref_file IS NOT NULL;
+CREATE INDEX changes_ref ON changes(ref_node, ref_file) WHERE ref_file IS NOT NULL;
+DELETE FROM changes WHERE ref_file IS NOT NULL AND seq < (
+    SELECT MAX(c2.seq) FROM changes c2
+    WHERE c2.ref_node = changes.ref_node AND c2.ref_file = changes.ref_file);
+-- (2) Hashes are stored as 32 bytes; the 'hash' column is computed from them for reading.
+ALTER TABLE copies ADD COLUMN hash_b BLOB;
+UPDATE copies SET hash_b = hb(hash);
+DROP INDEX copies_hash;
+ALTER TABLE copies DROP COLUMN hash;
+ALTER TABLE copies ADD COLUMN hash TEXT GENERATED ALWAYS AS (hx(hash_b)) VIRTUAL;
+CREATE INDEX copies_hash ON copies(hash_b, size);
+-- (3) Instead of the casefolded path (and its index), a 64-bit number of it.
+ALTER TABLE files ADD COLUMN vhash INTEGER;
+UPDATE files SET vhash = vh(vpath);
+DROP INDEX files_vkey;
+ALTER TABLE files DROP COLUMN vkey;
+CREATE INDEX files_vhash ON files(vhash);
+""",
 }
 
 
@@ -449,10 +484,49 @@ def _use_a_roomy_temp_dir(path: Path | str) -> None:
         pass
 
 
+_HASH_RE = re.compile(r"^blake2b:[0-9a-f]{64}$")
+
+
+def hash_to_blob(text: str | None) -> bytes | None:
+    """``blake2b:<64 hex>`` -> its 32 bytes (what the database stores). Anything else is kept
+    as it is, after a zero byte."""
+    if text is None:
+        return None
+    if _HASH_RE.match(text):
+        return bytes.fromhex(text[8:])
+    return b"\x00" + text.encode("utf-8", "surrogatepass")
+
+
+def blob_to_hash(blob: bytes | None) -> str | None:
+    if blob is None:
+        return None
+    blob = bytes(blob)
+    if len(blob) == 32:
+        return "blake2b:" + blob.hex()
+    return blob[1:].decode("utf-8", "surrogatepass") if blob[:1] == b"\x00" else blob.hex()
+
+
+def key_hash(vpath: str) -> int:
+    """A 64-bit number for the casefolded path: a small, indexable stand-in for it. Two paths
+    that differ only in case have the same number (so do, rarely, others: callers check)."""
+    digest = hashlib.blake2b(vpath.casefold().encode("utf-8", "surrogatepass"),
+                             digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def register_functions(conn: sqlite3.Connection) -> None:
+    """The SQL functions the schema uses: ``hx`` (the hash column is computed from the
+    stored 32 bytes), ``hb`` and ``vh`` (to write them)."""
+    conn.create_function("hx", 1, blob_to_hash, deterministic=True)
+    conn.create_function("hb", 1, hash_to_blob, deterministic=True)
+    conn.create_function("vh", 1, key_hash, deterministic=True)
+
+
 def connect(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
     _use_a_roomy_temp_dir(path)
     conn = sqlite3.connect(path, isolation_level=None, timeout=timeout)
     conn.row_factory = sqlite3.Row
+    register_functions(conn)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
@@ -522,6 +596,40 @@ def migrate(conn: sqlite3.Connection) -> None:
             raise
 
 
+def table_sizes(conn: sqlite3.Connection) -> list[tuple[str, int]] | None:
+    """(table or index, bytes) largest first, or None when SQLite was built without dbstat."""
+    try:
+        return [(r[0], r[1]) for r in conn.execute(
+            "SELECT name, SUM(pgsize) AS s FROM dbstat GROUP BY name ORDER BY s DESC")]
+    except sqlite3.OperationalError:
+        return None
+
+
+def free_space_ratio(conn: sqlite3.Connection) -> float:
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    return conn.execute("PRAGMA freelist_count").fetchone()[0] / pages if pages else 0.0
+
+
+def vacuum(conn: sqlite3.Connection, path: Path | str) -> tuple[int, int]:
+    """Rebuild the file so that free pages are given back to the disk (needs about the size of
+    the database in free space, and exclusive use of it for the time it takes).
+    Returns (bytes before, bytes after)."""
+    path = Path(path)
+
+    def size() -> int:
+        return sum(p.stat().st_size for p in (path, Path(str(path) + "-wal")) if p.exists())
+
+    before = size()
+    free = shutil.disk_usage(path.parent).free
+    if free < before * 1.1:
+        raise DatabaseLocked(f"not enough free disk space to compact the database: it takes "
+                             f"about {before // 2**20} MiB and {free // 2**20} MiB are free")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("VACUUM")
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return before, size()
+
+
 def open_existing(path: Path | str, timeout: float = 30,
                   migration_wait: float = 120) -> sqlite3.Connection:
     conn = connect(path, timeout)
@@ -532,6 +640,18 @@ def open_existing(path: Path | str, timeout: float = 30,
             # that is still running may be writing: be patient.
             conn.execute(f"PRAGMA busy_timeout = {int(migration_wait * 1000)}")
             migrate(conn)
+            if version < 14 and Path(path).stat().st_size > 32 * 2**20:
+                # The upgrade rewrote the tables in place, leaving slack in every page: rebuild
+                # the file so the space goes back (once; can take minutes on a big database).
+                msg = "rei-fs: the database was made smaller; compacting the file (a few minutes)"
+                print(msg, file=sys.stderr, flush=True)
+                try:
+                    b, a = vacuum(conn, path)
+                    print(f"rei-fs: database {b // 2**20} MiB -> {a // 2**20} MiB",
+                          file=sys.stderr, flush=True)
+                except (DatabaseLocked, sqlite3.Error) as e:
+                    print(f"rei-fs: could not compact it now ({e}); 'reifs db vacuum' does it",
+                          file=sys.stderr, flush=True)
             conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
         elif version != SCHEMA_VERSION:
             conn.close()

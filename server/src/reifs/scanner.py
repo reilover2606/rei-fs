@@ -347,7 +347,8 @@ def _process_file(conn, node_id, scan_id, vpath, size, mtime_ns, row, h, stats, 
             "UPDATE copies SET state = 'present' WHERE file_id = ? AND node_id = ?",
             (row["file_id"], node_id),
         )
-        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, row["hash"])
+        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, row["hash"],
+                         fid=row["file_id"])
         index.obsolete_decisions(conn, row["file_id"], ("missing",), node_id)
         stats.reappeared += 1
         touched.add(row["file_id"])
@@ -357,11 +358,11 @@ def _process_file(conn, node_id, scan_id, vpath, size, mtime_ns, row, h, stats, 
     if row is None:
         fid = index.ensure_file(conn, vpath)
         conn.execute(
-            "INSERT INTO copies(file_id, node_id, size, mtime_ns, hash, first_seen,"
-            " first_scan, hashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO copies(file_id, node_id, size, mtime_ns, hash_b, first_seen,"
+            " first_scan, hashed_at) VALUES (?, ?, ?, ?, hb(?), ?, ?, ?)",
             (fid, node_id, size, mtime_ns, h, ts, scan_id, ts),
         )
-        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, h)
+        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, h, fid=fid)
         stats.added += 1
         touched.add(fid)
         return
@@ -376,7 +377,7 @@ def _process_file(conn, node_id, scan_id, vpath, size, mtime_ns, row, h, stats, 
         stats.reappeared += 1
         index.obsolete_decisions(conn, fid, ("missing",), node_id)
     conn.execute(
-        "UPDATE copies SET size = ?, mtime_ns = ?, hash = ?, state = 'present',"
+        "UPDATE copies SET size = ?, mtime_ns = ?, hash_b = hb(?), state = 'present',"
         # A changed copy is no longer the verified duplicate a move left
         # behind, so deleting it could lose data: drop the deletion mark.
         " marked_delete = CASE WHEN ? THEN 0 ELSE marked_delete END,"
@@ -384,7 +385,7 @@ def _process_file(conn, node_id, scan_id, vpath, size, mtime_ns, row, h, stats, 
         (size, mtime_ns, h, int(content_changed), ts, fid, node_id),
     )
     if content_changed or row["state"] == "missing" or (row["size"], row["mtime_ns"]) != (size, mtime_ns):
-        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, h)
+        index.log_change(conn, node_id, vpath, "upsert", size, mtime_ns, h, fid=fid)
         touched.add(fid)
 
 
@@ -483,7 +484,7 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
             "UPDATE copies SET state = 'missing' WHERE file_id = ? AND node_id = ?",
             (fid, node_id),
         )
-        index.log_change(conn, node_id, vpath, "missing")
+        index.log_change(conn, node_id, vpath, "missing", fid=fid)
         others = conn.execute(
             "SELECT COUNT(*) FROM copies WHERE file_id = ? AND node_id != ? AND state = 'present'",
             (fid, node_id),
