@@ -446,6 +446,29 @@ A relay needs the rsync daemon transport between each pair of servers on the way
 in progress the item waits with a message saying where the file is. If there is no route, the
 message says so.
 
+### 5.11 Scheduled syncs
+
+A **schedule** (`POST schedules`, `reifs schedule`, the Schedules tab, `S` on a directory in the
+Tree) says: every N minutes make the files under a directory of node A also be on node B, to keep
+backups up to date. It is run by the server that owns the destination node (a request for another
+server's node is forwarded there), which pulls as for any transfer. Each run creates an ordinary
+job:
+
+* files the destination lacks (or whose copy is gone) are **copied**;
+* files whose destination copy is an *older version* of the source's current one are
+  **replaced** (`update_changed`, on by default), only the exact content seen at planning;
+* a destination copy that is newer than the source's, or that cannot be judged, is left alone and
+  counted in the note ("N left alone");
+* nothing is ever deleted at the destination, and deletions at the source are not propagated.
+
+A run is due when its `next_due` time has passed (the first one at once, then every interval after
+the last run). The worker looks every 15 seconds, and at once when a node comes online. If a node
+cannot be used at that moment (a drive unplugged, a computer asleep, the other server unreachable)
+no job is created, the schedule says what it waits for, and it stays due: it runs as soon as both
+nodes are back, **once**, however many intervals were missed. A new run is not started while the
+previous job is still going. A very large directory is synced in pieces of 50,000 files, the next
+piece a minute later.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

@@ -246,6 +246,52 @@ void fetch_paths(Context& ctx, std::vector<std::string> paths, const std::string
   });
 }
 
+// --- Scheduled syncs ----------------------------------------------------------------
+
+const std::vector<std::pair<std::string, std::string>>& interval_choices() {
+  static const std::vector<std::pair<std::string, std::string>> v = {
+      {"every 15 minutes", "15m"}, {"every hour", "1h"}, {"every 6 hours", "6h"},
+      {"every day", "1d"},         {"every week", "1w"}};
+  return v;
+}
+
+// Define a scheduled sync of `path` (asks the nodes and the interval).
+void schedule_dialog(Context& ctx, std::string path, std::function<void()> done) {
+  ctx.get("/api/nodes", [&ctx, path, done](json out) {
+    std::vector<std::string> names, labels;
+    for (const auto& n : out["nodes"]) {
+      names.push_back(n.value("name", ""));
+      labels.push_back(n.value("name", "") +
+                       (n.value("online", false) ? "" : " (offline)") +
+                       (n.value("owner", "") == "self" ? "" : "  [server " + n.value("owner", "") + "]"));
+    }
+    if (names.size() < 2) {
+      ctx.error("a sync needs two nodes");
+      return;
+    }
+    ctx.dialogs->ask_choice(
+        "Keep " + path + " synced FROM which node (the source)?", labels,
+        [&ctx, path, done, names, labels](int s) {
+          ctx.dialogs->ask_choice(
+              "...TO which node (the backup)? Its server runs the sync.", labels,
+              [&ctx, path, done, names, s](int d) {
+                std::vector<std::string> opts;
+                for (const auto& [label, _] : interval_choices()) opts.push_back(label);
+                ctx.dialogs->ask_choice(
+                    "How often? (If a node is asleep when it is due, it runs when it is back.)",
+                    opts, [&ctx, path, done, names, s, d](int i) {
+                      json body = {{"path", path}, {"from", names[s]}, {"to", names[d]},
+                                   {"every", interval_choices()[i].second}};
+                      ctx.send("/api/schedules", body, [&ctx, done](json) {
+                        ctx.notify("scheduled; the first run starts now");
+                        if (done) done();
+                      });
+                    });
+              });
+        });
+  });
+}
+
 // Move items inside the virtual tree: the files are renamed on every node that
 // holds them. When the destination already has something of the same name the
 // user chooses between merging (the default) and keeping both.
@@ -637,7 +683,7 @@ class TreeView : public View {
   std::string title() const override { return "Tree"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  "
+    return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  S: schedule sync  "
            "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  r: refresh";
   }
   void on_poll() override {
@@ -848,6 +894,10 @@ class TreeView : public View {
     }
     if (key(e, "c") || key(e, "m")) {
       transfer_paths(ctx_, {target}, "", key(e, "m"));
+      return true;
+    }
+    if (key(e, "S")) {   // keep this directory synced to another node, regularly
+      schedule_dialog(ctx_, dir ? target : path_, nullptr);
       return true;
     }
     if (key(e, "f")) {   // download to this machine's fetch folder
@@ -2278,6 +2328,167 @@ class MarkedView : public View {
   Component menu_, root_;
 };
 
+
+// --- Schedules ----------------------------------------------------------------------
+
+// A number from a reply that may hold null (value() with a number default throws on a null).
+double jdouble(const json& j, const char* key, double fallback = 0.0) {
+  auto it = j.find(key);
+  return it != j.end() && it->is_number() ? it->get<double>() : fallback;
+}
+
+std::string when_text(double epoch) {
+  if (epoch <= 0) return "";
+  std::time_t t = static_cast<std::time_t>(epoch);
+  char buf[32];
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", &tm);
+  return buf;
+}
+
+std::string due_text(double next_due) {
+  double secs = next_due - static_cast<double>(std::time(nullptr));
+  if (secs <= 0) return "now";
+  if (secs < 5400) return "in " + std::to_string(static_cast<int>(secs / 60) + 1) + " min";
+  if (secs < 172800) return "in " + std::to_string(static_cast<int>(secs / 3600)) + " h";
+  return "in " + std::to_string(static_cast<int>(secs / 86400)) + " days";
+}
+
+class SchedulesView : public View {
+ public:
+  explicit SchedulesView(Context& ctx) : ctx_(ctx) {
+    menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
+    root_ = Renderer(menu_, [this] {
+      return vbox({paragraph(" A schedule keeps a directory of one node copied to another at regular "
+                             "intervals. Missing files are copied, older copies are replaced by "
+                             "newer ones, nothing is ever deleted. A node that is asleep when it is "
+                             "due is caught up when it is back.") | dim,
+                   with_detail(list_panel(std::to_string(items_.size()) + " schedule(s)" + note_,
+                                          menu_, labels_.size(),
+                                          "none yet: n adds one (or S on a directory in the Tree)"),
+                               detail()) | flex});
+    });
+    root_ |= CatchEvent([this](Event e) { return on_event(e); });
+  }
+  std::string title() const override { return "Schedules"; }
+  Component component() override { return root_; }
+  std::string help() const override {
+    return "n: new  s: sync now  e: enable/disable  i: interval  u: replace older copies on/off  "
+           "x: delete  r: refresh";
+  }
+
+  void refresh() override {
+    ctx_.get("/api/schedules?everywhere=1", [this](json out) {
+      std::string keep = current_key();
+      items_ = out["schedules"];
+      note_ = unreachable_note(out);
+      labels_.clear();
+      for (const auto& r : items_) {
+        std::string state = !r.value("enabled", false) ? "off"
+                            : !r.value("waiting", "").empty() ? "WAITING"
+                                                             : "on";
+        labels_.push_back(fit("#" + std::to_string(r.value("id", 0)), 5) +
+                          fit(r.value("name", ""), 26) + fit(r.value("every", ""), 5) +
+                          fit(state, 9) + fit(due_text(jdouble(r, "next_due")), 11) +
+                          r.value("note", "") + where_suffix(ctx_, r));
+      }
+      selected_ = reselect(items_, keep, key_of, selected_);
+    }, "schedules");
+  }
+  void on_poll() override {
+    if (++polls_ % 5 == 0) refresh();
+  }
+
+ private:
+  static std::string key_of(const json& r) { return r.value("server", "") + r["id"].dump(); }
+  std::string current_key() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return "";
+    return key_of(items_[selected_]);
+  }
+
+  Element detail() {
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return text("");
+    const json& r = items_[selected_];
+    Elements rows = {paragraph(r.value("name", "")) | bold, separator(),
+                     label_value("directory", r.value("path", "")),
+                     label_value("from", r.value("from", "")),
+                     label_value("to", r.value("to", "")),
+                     label_value("every", r.value("every", "")),
+                     label_value("replaces older", r.value("update_changed", true) ? "yes" : "no"),
+                     label_value("state", r.value("enabled", false) ? "on" : "off"),
+                     label_value("next run", r.value("enabled", false)
+                                                 ? due_text(jdouble(r, "next_due"))
+                                                 : "(off)"),
+                     label_value("last run", when_text(jdouble(r, "last_run")))};
+    if (r["last_job"].is_number())
+      rows.push_back(label_value("last job", "#" + std::to_string(r["last_job"].get<long>()) + " " +
+                                                 r.value("last_job_status", "")));
+    if (!r.value("waiting", "").empty())
+      rows.push_back(paragraph("waiting: " + r.value("waiting", "")) | color(Color::Yellow) | bold);
+    else if (!r.value("note", "").empty())
+      rows.push_back(paragraph(r.value("note", "")) | dim);
+    return vbox(rows);
+  }
+
+  bool on_event(const Event& e) {
+    if (key(e, "r")) return refresh(), true;
+    if (key(e, "n")) {
+      schedule_dialog(ctx_, "/", [this] { refresh(); });
+      return true;
+    }
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return false;
+    json r = items_[selected_];
+    std::string base = "/api/schedules/" + std::to_string(r.value("id", 0));
+    if (key(e, "s")) {
+      ctx_.send(base + "/run", on_server(json::object(), r), [this](json out) {
+        ctx_.notify(out.value("note", "done"));
+        refresh();
+      });
+      return true;
+    }
+    if (key(e, "e")) {
+      ctx_.send(base, on_server({{"enabled", !r.value("enabled", false)}}, r),
+                [this](json) { refresh(); });
+      return true;
+    }
+    if (key(e, "u")) {
+      ctx_.send(base, on_server({{"update_changed", !r.value("update_changed", true)}}, r),
+                [this](json) { refresh(); });
+      return true;
+    }
+    if (key(e, "i")) {
+      std::vector<std::string> opts;
+      for (const auto& [label, _] : interval_choices()) opts.push_back(label);
+      ctx_.dialogs->ask_choice("How often?", opts, [this, r, base](int i) {
+        ctx_.send(base, on_server({{"every", interval_choices()[i].second}}, r),
+                  [this](json) { refresh(); });
+      });
+      return true;
+    }
+    if (key(e, "x")) {
+      ctx_.dialogs->confirm("Delete the schedule '" + r.value("name", "") +
+                                "'? (Files already copied stay.)", [this, r, base] {
+        ctx_.send(base + "/delete", on_server(json::object(), r), [this](json) { refresh(); });
+      });
+      return true;
+    }
+    return false;
+  }
+
+  Context& ctx_;
+  json items_ = json::array();
+  std::string note_;
+  int polls_ = 0;
+  std::vector<std::string> labels_;
+  int selected_ = 0;
+  Component menu_, root_;
+};
+
 }  // namespace
 
 std::vector<std::shared_ptr<View>> make_views(Context& ctx) {
@@ -2286,7 +2497,7 @@ std::vector<std::shared_ptr<View>> make_views(Context& ctx) {
       std::make_shared<SearchView>(ctx),    std::make_shared<DecisionsView>(ctx),
       std::make_shared<WantedView>(ctx),    std::make_shared<JobsView>(ctx),
       std::make_shared<NodesView>(ctx),     std::make_shared<MarkedView>(ctx),
-      std::make_shared<ServersView>(ctx),
+      std::make_shared<ServersView>(ctx),   std::make_shared<SchedulesView>(ctx),
   };
 }
 

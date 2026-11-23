@@ -351,7 +351,17 @@ class App {
     // vbox and the page would not fill the screen).
     main_holder_ = Container::Tab({}, &holder_index_);
     auto pages = Container::Tab({login, main_holder_}, &page_);
-    auto root = dialogs_.wrap(pages);
+    auto inner = dialogs_.wrap(pages);
+    // A reply with a field the display did not expect (null where a number was assumed) must
+    // not end the program: show what went wrong and carry on drawing.
+    auto root = Renderer(inner, [inner] {
+      try {
+        return inner->Render();
+      } catch (const std::exception& e) {
+        return vbox({text(" display error: " + std::string(e.what())) | color(Color::Red) | bold,
+                     text(" (press r to refresh, or switch tab)") | dim});
+      }
+    });
     screen_.Loop(root);
     // Quitting never waits for the server: interrupt whatever is in flight.
     poller_running_ = false;
@@ -521,8 +531,9 @@ class App {
     if (views_[tab_]->typing()) return false;
     if (e.is_character()) {
       const std::string& c = e.character();
-      if (c.size() == 1 && c[0] >= '1' && c[0] <= '9') {
-        switch_to(c[0] - '1');
+      if (c.size() == 1 && c[0] >= '0' && c[0] <= '9') {
+        int tab = c[0] == '0' ? 9 : c[0] - '1';   // 0 is the tenth tab
+        if (tab < static_cast<int>(views_.size())) switch_to(tab);
         return true;
       }
       if (c == "q") {
@@ -531,7 +542,7 @@ class App {
       }
       if (c == "?") {
         dialogs_.info("Keys",
-                      "1-9 / F1-F9   switch tab\n"
+                      "1-9, 0        switch tab\n"
                       "arrows        move, Enter opens / chooses\n"
                       "r             refresh the current tab\n"
                       "q             quit\n\n"
@@ -545,7 +556,7 @@ class App {
   Element render_main(Component tabs) {
     Elements header;
     for (size_t i = 0; i < views_.size(); ++i) {
-      auto label = text(" " + std::to_string(i + 1) + " " + views_[i]->title() + " ");
+      auto label = text(" " + std::to_string((i + 1) % 10) + " " + views_[i]->title() + " ");
       header.push_back(static_cast<int>(i) == tab_ ? label | inverted | bold : label);
     }
     json st = ctx_.status();
