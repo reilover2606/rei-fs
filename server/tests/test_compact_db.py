@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import sys
 
 import pytest
 
@@ -82,6 +83,8 @@ def test_a_peers_entries_are_forwarded_as_pointers_to_what_we_hold(env):
     assert sent[0]["data"] == d | {"op": "upsert"} and sent[0]["origin_id"] == "peer"
 
 
+@pytest.mark.skipif(sys.platform in ("win32", "darwin"),
+                    reason="the file system is not case-sensitive: the two files cannot coexist")
 def test_case_collisions_are_still_found(env):
     write(env.root / "Photos" / "A.txt", "1", mtime=1_000_000)
     write(env.root / "photos" / "a.txt", "2", mtime=1_000_000)
