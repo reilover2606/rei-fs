@@ -359,6 +359,7 @@ class CoverageStats:
     single_copy: int
     node_files: dict[str, int]  # copies per node (any state)
     node_bytes: dict[str, int]
+    hist: list[int]             # files with 0, 1, 2, 3 and 4+ good copies
     seq: int
     policy: GoalPolicy
     seconds: float              # how long it took to compute
@@ -406,6 +407,7 @@ def _compute_stats(conn: sqlite3.Connection, policy: GoalPolicy, seq: int) -> Co
     prepare_goal_overrides(conn, policy)
     files = nbytes = satisfied = under = single = 0
     multi: list[int] = []
+    hist = [0] * 5
     for kind, a, b, c, d, e in conn.execute("""
         WITH g AS MATERIALIZED (
             SELECT file_id, MIN(hash) = MAX(hash) AS one, SUM(marked_delete = 0) AS good,
@@ -417,9 +419,14 @@ def _compute_stats(conn: sqlite3.Connection, policy: GoalPolicy, seq: int) -> Co
                IFNULL(SUM(good = 1 AND COALESCE(o.goal, ?1) > 1), 0)
         FROM g LEFT JOIN temp.goal_override o ON o.file_id = g.file_id WHERE g.one
         UNION ALL
-        SELECT 0, file_id, 0, 0, 0, 0 FROM g WHERE NOT g.one""", (policy.copies,)):
+        SELECT 0, file_id, 0, 0, 0, 0 FROM g WHERE NOT g.one
+        UNION ALL
+        SELECT 2, MIN(good, 4), COUNT(*), 0, 0, 0 FROM g WHERE g.one GROUP BY MIN(good, 4)""",
+            (policy.copies,)):
         if kind == 1:
             files, nbytes, satisfied, under, single = a, b, c, d, e
+        elif kind == 2:
+            hist[a] += b
         else:
             multi.append(a)
     for fid in multi:   # files with several versions: the exact (and slower) way, few of them
@@ -432,6 +439,7 @@ def _compute_stats(conn: sqlite3.Connection, policy: GoalPolicy, seq: int) -> Co
         goal = goal[0] if goal else policy.copies
         files += 1
         nbytes += size
+        hist[min(good, 4)] += 1
         if good >= goal:
             satisfied += 1
         else:
@@ -442,8 +450,8 @@ def _compute_stats(conn: sqlite3.Connection, policy: GoalPolicy, seq: int) -> Co
     for node_id, n, size in conn.execute(
             "SELECT node_id, COUNT(*), IFNULL(SUM(size), 0) FROM copies GROUP BY node_id"):
         node_files[node_id], node_bytes[node_id] = n, size
-    return CoverageStats(files, nbytes, satisfied, under, single, node_files, node_bytes, seq,
-                         policy, time.monotonic() - started, time.monotonic())
+    return CoverageStats(files, nbytes, satisfied, under, single, node_files, node_bytes, hist,
+                         seq, policy, time.monotonic() - started, time.monotonic())
 
 
 def _db_file(conn: sqlite3.Connection) -> str:
