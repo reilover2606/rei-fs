@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import db, index, peers, priority, relay, replication, runner, scanner, sync
+from . import db, index, peers, priority, relay, replication, runner, scanner, schedules, sync
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
@@ -33,6 +33,7 @@ DISCOVERY_SECONDS = 30
 SCAN_CHECK_SECONDS = 30   # how often to look for directories due for a scan
 JOBS_SECONDS = 60
 RELAY_POLL_SECONDS = 5
+SCHEDULE_CHECK_SECONDS = 15   # how often scheduled syncs are looked at (a late node is caught up)
 HOUSEKEEPING_SECONDS = 600
 SYNC_SECONDS = 30
 PLAN_SECONDS = 600     # replication planning, at least this often
@@ -56,6 +57,7 @@ class Worker:
         self.syncer = syncer
         self.tasks: queue.Queue = queue.Queue()
         self._plan_seconds = 0.0   # how long the last planning took
+        self._schedule_now = False  # a node came back: look at the schedules at once
         self.stop_requested = threading.Event()
         self.shutdown = threading.Event()
         self._lock = threading.Lock()
@@ -86,6 +88,10 @@ class Worker:
         """Scan (full: everything, as asked by the user; otherwise only what is due).
         ``new_only``: just discover files not indexed yet."""
         self._enqueue(("scan", tuple(sorted(nodes or [])), verify, full, new_only))
+
+    def schedule_soon(self) -> None:
+        """Look at the schedules at the next turn of the loop (one was added or changed)."""
+        self._schedule_now = True
 
     def request_jobs(self) -> None:
         self._enqueue(("jobs",))
@@ -138,6 +144,7 @@ class Worker:
         last_discovery = never
         last_jobs = never
         last_relay = never
+        last_schedules = never
         last_housekeeping = never
         last_plan = never
         last_plan_check = never
@@ -158,6 +165,11 @@ class Worker:
                         online = self._watch_drives(conn, online)
                     # Files being passed through other servers: ask again every few seconds
                     # instead of waiting for the next minute.
+                    # Scheduled syncs that are due (or that were waiting for a node that is back).
+                    if now - last_schedules >= SCHEDULE_CHECK_SECONDS or self._schedule_now:
+                        last_schedules, self._schedule_now = now, False
+                        if schedules.run_due(conn):
+                            self.request_jobs()
                     if now - last_relay >= RELAY_POLL_SECONDS:
                         last_relay = now
                         if conn.execute("SELECT 1 FROM job_items WHERE state = 'pending' AND"
@@ -220,6 +232,7 @@ class Worker:
                 log.info("node %s came online; scanning it", node_id)
                 self.request_scan([node_id], full=False)
                 self.request_jobs()
+                self._schedule_now = True
         if self.syncer is not None and current != previous:
             self.syncer.request_daemon_update()
             self.syncer.request_poke()  # node online/offline announcements

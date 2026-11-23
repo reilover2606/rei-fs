@@ -50,7 +50,7 @@ done
 screen | grep -q "files  " || fail "the Overview never showed the status"
 
 # Every tab, a few dialogs.
-for key in 2 3 4 5 6 7 8 9 1; do send "$key"; done
+for key in 2 3 4 5 6 7 8 9 0 1; do send "$key"; done
 send 2; send Enter; send Left
 send 9; send k; send Escape
 send '?'; send Escape

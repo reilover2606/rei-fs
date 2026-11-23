@@ -67,6 +67,7 @@ tab, press `/` to type a search (`Esc` leaves the fields).
 | Jobs | Job progress and failures | `j` run, `c` cancel, `y` retry, `h` history |
 | Nodes | Nodes of all servers, foreign drives | `n` add a drive, `R` rename, `Space` choose nodes, `s` scan the chosen (or the selected) node, `S` scan all, `w` discover new files only, `c` check that the index accounts for everything on the disk, `m` move the node's root folder, `v` verify the same, `p` priority, `t` backup target, `o` adopt |
 | Marked | Copies waiting for you to delete them | `u`/`U` keep (unmark) |
+| Schedules | Keep a directory of one node synced to another at regular intervals; a node that is asleep is caught up when it is back | `n` new, `s` sync now, `e` on/off, `i` interval, `u` replace older copies, `x` delete (`0` key; `S` on a Tree directory) |
 | Servers | This server's fingerprint, paired servers, pairing requests | `p` pair, `a`/`x` accept/reject, `d` unpair, `t` transport (daemon/SSH), `k` SSH key and authorize peers, `s` sync now |
 
 `n` registers a drive: type the path of its folder *on the server's machine*

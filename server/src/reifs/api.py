@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 from . import (__version__, audit, auth, relay, db, decisions, index, jobs, nodes, paths, peers,
-               priority, queries, replication, ssh, sync, tags, tls, vdirs, vmove)
+               priority, queries, replication, schedules, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
 from .paths import to_physical
@@ -203,6 +203,10 @@ class Api:
         r("GET", r"/api/jobs", self.list_jobs)
         r("POST", r"/api/jobs", self.create_job)
         r("POST", r"/api/vmove", self.vmove)
+        r("GET", r"/api/schedules", self.list_schedules)
+        r("POST", r"/api/schedules", self.create_schedule)
+        r("POST", r"/api/schedules/(?P<id>\d+)/(?P<action>run|delete)", self.schedule_action)
+        r("POST", r"/api/schedules/(?P<id>\d+)", self.update_schedule)
         r("GET", r"/api/priority", self.get_priority)
         r("POST", r"/api/priority", self.set_priority)
         r("POST", r"/api/mkdir", self.mkdir)
@@ -721,6 +725,47 @@ class Api:
             return {"removed": vdirs.remove(conn, str(body.get("path", "")))}
         except vdirs.VDirError as e:
             raise ApiError(409, str(e)) from None
+
+    def list_schedules(self, conn, q, body, caller=None, **_):
+        items = schedules.listing(conn)
+        return self._everywhere(conn, q, caller, "/api/schedules", "schedules", items)
+
+    def create_schedule(self, conn, q, body, **_):
+        try:
+            sid = schedules.create(conn, str(body.get("path", "/")), str(body.get("from", "")),
+                                   str(body.get("to", "")), body.get("every", "1d"),
+                                   body.get("name") or None, bool(body.get("update_changed", True)))
+        except jobs.RemoteDestination as e:        # the destination's owner runs the schedule
+            out = peers.forward(conn, e.owner_id, "POST", "/api/schedules", body)
+            out["server"] = e.owner_id
+            return out
+        except (schedules.ScheduleError, nodes.NodeError) as e:
+            raise ApiError(400, str(e)) from None
+        if self.worker:
+            self.worker.schedule_soon()
+        return {"id": sid}
+
+    def update_schedule(self, conn, q, body, id, **_):
+        try:
+            schedules.update(conn, int(id), body.get("enabled"), body.get("every"),
+                             body.get("update_changed"), body.get("name"))
+        except schedules.ScheduleError as e:
+            raise ApiError(400, str(e)) from None
+        if self.worker:
+            self.worker.schedule_soon()
+        return {"ok": True}
+
+    def schedule_action(self, conn, q, body, id, action, **_):
+        try:
+            if action == "delete":
+                schedules.remove(conn, int(id))
+                return {"ok": True}
+            res = schedules.run(conn, int(id), force=True)
+        except schedules.ScheduleError as e:
+            raise ApiError(400, str(e)) from None
+        if res.job_id is not None and self.worker:
+            self.worker.request_jobs()
+        return {"ran": res.ran, "job_id": res.job_id, "items": res.items, "note": res.note}
 
     def vmove(self, conn, q, body, **_):
         """Move files/directories within the virtual tree (renames on every node).

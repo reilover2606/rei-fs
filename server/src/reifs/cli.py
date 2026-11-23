@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -803,6 +804,54 @@ def cmd_ssh(args) -> None:
             print(line)
 
 
+def cmd_schedule(args) -> None:
+    from . import schedules
+
+    cfg, conn = open_server(args.home)
+    act = args.action
+    try:
+        if act == "add":
+            if not (args.target and args.src and args.dst and args.every):
+                raise CliError("usage: reifs schedule add PATH --from NODE --to NODE --every 6h")
+            sid = schedules.create(conn, args.target, args.src, args.dst, args.every,
+                                   args.name, not args.no_update)
+            print(f"Schedule #{sid} added; its first run is due now (the server runs it).")
+        elif act in ("remove", "enable", "disable", "run", "every"):
+            if not args.target or not args.target.isdigit():
+                raise CliError(f"usage: reifs schedule {act} ID" + (" INTERVAL" if act == "every" else ""))
+            sid = int(args.target)
+            if act == "remove":
+                schedules.remove(conn, sid)
+                print(f"Schedule #{sid} removed.")
+            elif act in ("enable", "disable"):
+                schedules.update(conn, sid, enabled=act == "enable")
+                print(f"Schedule #{sid} {act}d.")
+            elif act == "every":
+                schedules.update(conn, sid, interval=args.interval or args.every)
+                print(f"Schedule #{sid} now runs every {args.interval or args.every}.")
+            else:
+                res = schedules.run(conn, sid, force=True)
+                print(res.note or ("nothing to do" if not res.ran else "done"))
+                if res.job_id is not None:
+                    print(f"Run it with 'reifs jobs run {res.job_id}' (or let the server do it).")
+        else:
+            rows = schedules.listing(conn)
+            if not rows:
+                print("No schedules. Add one with 'reifs schedule add PATH --from A --to B --every 6h'.")
+                return
+            out = []
+            for r in rows:
+                due = "now" if r["next_due"] <= time.time() else \
+                    f"in {int((r['next_due'] - time.time()) // 60)} min"
+                out.append([str(r["id"]), r["name"], r["path"], f"{r['from']} -> {r['to']}",
+                            r["every"], "on" if r["enabled"] else "off", due,
+                            r["waiting"] or r["note"]])
+            print(table(out, ["ID", "NAME", "DIRECTORY", "NODES", "EVERY", "", "NEXT", "LAST RESULT"]))
+    except (schedules.ScheduleError, jobs.RemoteDestination) as e:
+        raise CliError(str(e) if not isinstance(e, jobs.RemoteDestination) else
+                       "the destination node belongs to another server: run this there") from None
+
+
 def cmd_node_audit(args) -> None:
     from . import audit
 
@@ -1001,6 +1050,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--due", action="store_true",
                    help="only directories due for an automatic scan (by update priority)")
     s.set_defaults(func=cmd_scan)
+
+    s = sub.add_parser("schedule", help="keep a directory synced from one node to another "
+                                        "at regular intervals")
+    s.add_argument("action", nargs="?", default="list",
+                   choices=["list", "add", "remove", "enable", "disable", "run", "every"])
+    s.add_argument("target", nargs="?", help="add: the directory; others: the schedule's ID")
+    s.add_argument("interval", nargs="?", help="every: the new interval")
+    s.add_argument("--from", dest="src", help="source node")
+    s.add_argument("--to", dest="dst", help="destination node (of this server)")
+    s.add_argument("--every", help="interval, e.g. 30m, 6h, 1d, 1w")
+    s.add_argument("--name")
+    s.add_argument("--no-update", action="store_true",
+                   help="only copy missing files; do not replace older copies with newer ones")
+    s.set_defaults(func=cmd_schedule)
 
     s = sub.add_parser("priority", help="show or set the update priority of a directory")
     s.add_argument("vdir", nargs="?", default="/")

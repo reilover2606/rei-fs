@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -407,6 +407,24 @@ CREATE TABLE relay_requests (
     message   TEXT,
     created   TEXT NOT NULL,
     updated   TEXT NOT NULL
+);
+""",
+    13: """
+-- Scheduled syncs: keep a directory of one node copied to another at regular intervals.
+CREATE TABLE schedules (
+    id               INTEGER PRIMARY KEY,
+    name             TEXT NOT NULL UNIQUE,
+    vpath            TEXT NOT NULL,                 -- the directory ('/' for everything)
+    src_node         TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    dst_node         TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    interval_minutes INTEGER NOT NULL CHECK (interval_minutes >= 1),
+    update_changed   INTEGER NOT NULL DEFAULT 1,    -- also replace older copies with newer ones
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created          TEXT NOT NULL,
+    next_due         REAL NOT NULL,                 -- epoch seconds; in the past = run when possible
+    last_run         REAL,
+    last_job_id      INTEGER,
+    last_note        TEXT
 );
 """,
 }
