@@ -89,7 +89,7 @@ def test_case_collisions_are_still_found(env):
     write(env.root / "Photos" / "A.txt", "1", mtime=1_000_000)
     write(env.root / "photos" / "a.txt", "2", mtime=1_000_000)
     env.scan()
-    flagged = {r["vpath"] for r in env.conn.execute("SELECT vpath FROM files WHERE issues LIKE '%case%'")}
+    flagged = {r["vpath"] for r in env.conn.execute("SELECT vpath FROM vfiles WHERE issues LIKE '%case%'")}
     assert flagged == {"/Photos/A.txt", "/photos/a.txt"}
 
 
@@ -145,6 +145,27 @@ def test_the_upgrade_converts_an_old_database(tmp_path, monkeypatch):
     assert [(c["data"]["op"], c["data"]["vpath"]) for c in sent] == [
         ("upsert", "/Docs/A.txt"), ("upsert", "/docs/b.txt"), ("remove", "/old.txt")]
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    # directories became rows; the file is (dir, name)
+    assert sorted(r["path"] for r in conn.execute("SELECT path FROM dirs")) == ["", "/Docs", "/docs"]
+    assert sorted(r[0] for r in conn.execute("SELECT vpath FROM vfiles")) == ["/Docs/A.txt", "/docs/b.txt"]
+    assert "vpath" not in [r[1] for r in conn.execute("PRAGMA table_info(files)")]
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_directory_rows_follow_the_files(env):
+    from reifs import index
+    write(env.root / "a" / "b" / "c.txt", "1", mtime=1_000_000)
+    write(env.root / "a" / "d.txt", "2", mtime=1_000_000)
+    env.scan()
+    paths_ = lambda: sorted(r[0] for r in env.conn.execute("SELECT path FROM dirs"))
+    assert paths_() == ["", "/a", "/a/b"]
+    fid = index.file_id(env.conn, "/a/b/c.txt")
+    with db.transaction(env.conn):
+        env.conn.execute("DELETE FROM copies WHERE file_id = ?", (fid,))
+        assert index.drop_file_if_orphan(env.conn, fid)
+    assert paths_() == ["", "/a"]          # the emptied folder is gone, its parent stays
+    assert index.file_id(env.conn, "/a/d.txt") is not None
 
 
 def test_vacuum_reports_sizes(tmp_path):

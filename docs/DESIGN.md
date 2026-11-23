@@ -515,6 +515,24 @@ which is about 2.8 GB instead of 5.5 GB at four million files.
 The SQL functions the schema uses (`hx`, `hb`, `vh`) are registered by rei-fs on every connection:
 the `sqlite3` command-line tool alone cannot read the `hash` column.
 
+### 5.14 Directories are rows
+
+A file's path used to be stored whole, in its row and again in an index. Now a directory is a row of
+`dirs(id, parent_id, name, path)` (the root is `path = ''`) and a file is `files(dir_id, name)`, unique
+together. The view `vfiles` joins them back into `vpath`, for reads that want the whole path.
+
+* Only directories that hold files (or directories) have rows: `index.ensure_dir` creates them with
+  their ancestors when a file is added, and removing the last file of a folder prunes it (and
+  then its emptied parents). Folders made on purpose are still `vdirs`.
+* "At or below a directory" is `dirs.path = D OR dirs.path >= 'D/' AND dirs.path < 'D0'`, a range on the
+  unique `dirs.path` index (`paths.subtree_sql`). Listing a directory is one lookup of its child rows
+  plus a count per child, instead of walking the index by jumps.
+* Results that used to be in plain path order are in (directory, name) order; the two differ only in
+  corner cases (a name containing a character that sorts before `/`).
+* The upgrade (version 15) builds `dirs` from the existing paths, swaps the `files` table with
+  foreign keys off, checks them afterwards, and then the file is compacted as for 5.13.
+  At 400,000 files (7,800 folders): 280 MB to 237 MB, the upgrade with compaction taking 13 s.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

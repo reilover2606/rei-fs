@@ -21,7 +21,7 @@ def move(env, sources, dest, name=None, mode="merge"):
 
 
 def vpaths(env):
-    return sorted(r[0] for r in env.conn.execute("SELECT vpath FROM files"))
+    return sorted(r[0] for r in env.conn.execute("SELECT vpath FROM vfiles"))
 
 
 def on_disk(root):

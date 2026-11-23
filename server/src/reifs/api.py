@@ -592,7 +592,7 @@ class Api:
         out = []
         for r in conn.execute(
             "SELECT w.*, f.vpath, s.name AS src, d.name AS dst FROM wanted w"
-            " LEFT JOIN files f ON f.id = w.file_id LEFT JOIN nodes s ON s.id = w.src_node"
+            " LEFT JOIN vfiles f ON f.id = w.file_id LEFT JOIN nodes s ON s.id = w.src_node"
             " LEFT JOIN nodes d ON d.id = w.dst_node WHERE w.status = 'open' ORDER BY w.id"
             " LIMIT ?", (limit,)
         ):

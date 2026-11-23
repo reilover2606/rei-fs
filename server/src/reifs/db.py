@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -465,6 +465,58 @@ CREATE INDEX files_vhash ON files(vhash);
 }
 
 
+def _migration_15(conn: sqlite3.Connection) -> None:
+    """Directories become rows: ``dirs(id, parent_id, name, path)``, and a file is
+    ``(dir_id, name)`` instead of a full path string (design 5.14). ``vfiles`` is the view
+    that gives the full path back. The directory part of a path used to be stored again in
+    every file's row and in two indexes."""
+    conn.execute("""CREATE TABLE dirs (
+        id        INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES dirs(id),
+        name      TEXT NOT NULL,
+        path      TEXT NOT NULL UNIQUE,      -- '/a/b'; the root is ''
+        UNIQUE (parent_id, name))""")
+    conn.execute("INSERT INTO dirs(id, parent_id, name, path) VALUES (1, NULL, '', '')")
+    found: set[str] = set()
+    for (vpath,) in conn.execute("SELECT vpath FROM files"):
+        d = vpath.rpartition("/")[0]
+        while d and d not in found:
+            found.add(d)
+            d = d.rpartition("/")[0]
+    ids = {"": 1}
+    for d in sorted(found, key=lambda x: (x.count("/"), x)):
+        parent, _, name = d.rpartition("/")
+        cur = conn.execute("INSERT INTO dirs(parent_id, name, path) VALUES (?, ?, ?)",
+                           (ids[parent], name, d))
+        ids[d] = cur.lastrowid
+    conn.create_function("dirid", 1, lambda vp: ids[vp.rpartition("/")[0]], deterministic=True)
+    conn.create_function("basename", 1, lambda vp: vp.rpartition("/")[2], deterministic=True)
+    conn.execute("""CREATE TABLE files_new (
+        id      INTEGER PRIMARY KEY,
+        dir_id  INTEGER NOT NULL REFERENCES dirs(id),
+        name    TEXT NOT NULL,
+        vhash   INTEGER,
+        issues  TEXT NOT NULL DEFAULT '',
+        created TEXT NOT NULL)""")
+    conn.execute("INSERT INTO files_new(id, dir_id, name, vhash, issues, created)"
+                 " SELECT id, dirid(vpath), basename(vpath), vhash, issues, created FROM files")
+    conn.execute("DROP TABLE files")
+    conn.execute("ALTER TABLE files_new RENAME TO files")
+    conn.execute("CREATE UNIQUE INDEX files_dirname ON files(dir_id, name)")
+    conn.execute("CREATE INDEX files_vhash ON files(vhash)")
+    conn.execute("CREATE INDEX files_issues ON files(id) WHERE issues != ''")
+    conn.execute(VFILES_VIEW)
+
+
+VFILES_VIEW = """CREATE VIEW vfiles AS
+    SELECT f.id AS id, f.dir_id AS dir_id, f.name AS name, d.path AS dir_path,
+           d.path || '/' || f.name AS vpath, f.vhash AS vhash, f.issues AS issues,
+           f.created AS created
+    FROM files f JOIN dirs d ON d.id = f.dir_id"""
+
+MIGRATIONS[15] = _migration_15
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -580,12 +632,39 @@ def locked_message(path: Path | str) -> str:
     return text
 
 
+def _run_python_migration(conn: sqlite3.Connection, target: int, step) -> None:
+    """A migration written in Python. A table is swapped, so foreign keys are off meanwhile
+    (dropping a table would otherwise delete the rows that reference it) and checked after."""
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= target:
+            conn.execute("ROLLBACK")      # another process did it while we waited
+            return
+        step(conn)
+        bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if bad:
+            raise sqlite3.IntegrityError(f"the upgrade left {len(bad)} broken references")
+        conn.execute(f"PRAGMA user_version = {target}")
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     for target in range(version + 1, SCHEMA_VERSION + 1):
         try:
+            step = MIGRATIONS[target]
+            if callable(step):
+                _run_python_migration(conn, target, step)
+                continue
             conn.executescript(
-                f"BEGIN;\n{MIGRATIONS[target]}\nPRAGMA user_version = {target};\nCOMMIT;"
+                f"BEGIN;\n{step}\nPRAGMA user_version = {target};\nCOMMIT;"
             )
         except sqlite3.OperationalError:
             # Another process migrated while we waited for the write lock: fine.
@@ -640,7 +719,7 @@ def open_existing(path: Path | str, timeout: float = 30,
             # that is still running may be writing: be patient.
             conn.execute(f"PRAGMA busy_timeout = {int(migration_wait * 1000)}")
             migrate(conn)
-            if version < 14 and Path(path).stat().st_size > 32 * 2**20:
+            if version < 15 and Path(path).stat().st_size > 32 * 2**20:
                 # The upgrade rewrote the tables in place, leaving slack in every page: rebuild
                 # the file so the space goes back (once; can take minutes on a big database).
                 msg = "rei-fs: the database was made smaller; compacting the file (a few minutes)"

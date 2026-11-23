@@ -82,7 +82,7 @@ class Plan:
 
 
 def _is_file(conn: sqlite3.Connection, vpath: str) -> bool:
-    return conn.execute("SELECT 1 FROM files WHERE vpath = ?", (vpath,)).fetchone() is not None
+    return index.file_id(conn, vpath) is not None
 
 
 def _is_dir(conn: sqlite3.Connection, vpath: str) -> bool:
@@ -90,9 +90,9 @@ def _is_dir(conn: sqlite3.Connection, vpath: str) -> bool:
 
 
 def _files_under(conn: sqlite3.Connection, vdir: str) -> list[tuple[int, str]]:
-    lo, hi = paths.prefix_range(vdir)
+    cond, args = paths.subtree_sql(vdir)
     return [(r[0], r[1]) for r in conn.execute(
-        "SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ? ORDER BY vpath", (lo, hi))]
+        f"SELECT f.id, f.vpath FROM vfiles f WHERE {cond} ORDER BY f.vpath", args)]
 
 
 def _present(conn: sqlite3.Connection, fid: int) -> dict[str, sqlite3.Row]:

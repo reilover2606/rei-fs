@@ -46,9 +46,9 @@ def reserved_dirs(conn: sqlite3.Connection, cfg: Config, node_id: str) -> tuple[
     name = cfg.storage.fetch_dir.strip("/")
     if row is None or row["kind"] != "server" or not name:
         return ()
-    lo, hi = paths.prefix_range("/" + name)
-    if conn.execute("SELECT 1 FROM copies c JOIN files f ON f.id = c.file_id WHERE c.node_id = ?"
-                    " AND f.vpath >= ? AND f.vpath < ? LIMIT 1", (node_id, lo, hi)).fetchone():
+    cond, args = paths.subtree_sql("/" + name, "f.dir_path")
+    if conn.execute("SELECT 1 FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?"
+                    f" AND {cond} LIMIT 1", (node_id, *args)).fetchone():
         return ()
     return ("/" + name,)
 
@@ -231,7 +231,7 @@ def scan_node(
         r["vpath"]: r
         for r in conn.execute(
             "SELECT f.vpath, c.file_id, c.size, c.mtime_ns, c.hash, c.state, c.marked_delete"
-            " FROM copies c JOIN files f ON f.id = c.file_id WHERE c.node_id = ?",
+            " FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?",
             (node_id,),
         )
         if classes is None or schedule.covers_file(r["vpath"])   # only what this scan visits
@@ -451,7 +451,7 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
     # Rename candidates: copies that appeared since the last completed scan.
     pool: dict[tuple[str, int], list[tuple[str, int]]] = {}
     for r in conn.execute(
-        "SELECT f.vpath, c.file_id, c.hash, c.size FROM copies c JOIN files f"
+        "SELECT f.vpath, c.file_id, c.hash, c.size FROM copies c JOIN vfiles f"
         " ON f.id = c.file_id WHERE c.node_id = ? AND c.first_scan > ? AND c.state = 'present'",
         (node_id, node["last_scan_id"] or 0),
     ):

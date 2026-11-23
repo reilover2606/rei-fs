@@ -304,7 +304,7 @@ class _Runner:
         if not node["case_sensitive"]:
             key = paths.key(vpath)
             clash = next((r[0] for r in self.conn.execute(
-                "SELECT f.vpath FROM copies c JOIN files f ON f.id = c.file_id"
+                "SELECT f.vpath FROM copies c JOIN vfiles f ON f.id = c.file_id"
                 " WHERE c.node_id = ? AND f.vhash = ? AND f.vpath != ?",
                 (node_id, db.key_hash(vpath), vpath)) if paths.key(r[0]) == key), None)
             if clash:

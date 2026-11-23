@@ -71,7 +71,7 @@ class FileInfo:
 
 def file_info(conn: sqlite3.Connection, fid: int,
               policy: GoalPolicy = DEFAULT_POLICY) -> FileInfo:
-    f = conn.execute("SELECT * FROM files WHERE id = ?", (fid,)).fetchone()
+    f = conn.execute("SELECT * FROM vfiles WHERE id = ?", (fid,)).fetchone()
     version = index.current_version(conn, fid)
     file_tags = tags_of(conn, fid)
     info = FileInfo(fid, f["vpath"], paths.decode_issues(f["issues"]), file_tags,
@@ -117,47 +117,39 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
              policy: GoalPolicy = DEFAULT_POLICY) -> Entries | None:
     """Immediate children of a virtual directory. None if it does not exist.
 
-    The index is walked by jumping: after the first file of a subdirectory, its files are
-    counted with one range query and the walk continues behind it. The cost is the number
-    of entries listed, not the number of files below them (a directory holding millions of
-    files is listed in milliseconds). ``here`` says how many files below an entry have a copy
+    Directories are rows (``dirs``), so the children are one lookup and the files below each
+    are counted with a range on the directory path: the cost is the number of entries listed,
+    not the number of files below them. ``here`` says how many files below an entry have a copy
     on this server's own node, counted up to HERE_CAP.
     """
     vdir = paths.normalize(vdir)
-    lo, hi = paths.prefix_range(vdir) if vdir != "/" else ("/", "0")
+    lo = vdir.rstrip("/") + "/"
     me = index.self_id(conn)
     dirs: dict[str, tuple[int, int]] = {}
     files: list[tuple[int, str]] = []
     more = 0
-    cur = lo
-    while True:
-        jumped = False
-        for fid, vpath in conn.execute(
-                "SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ? ORDER BY vpath",
-                (cur, hi)):
-            rest = vpath[len(lo):]
-            head, sep, _ = rest.partition("/")
-            if not sep:
-                if len(files) < MAX_FILES_LISTED:
-                    files.append((fid, rest))
-                else:
-                    more += 1
+    did = index.dir_id(conn, paths.dir_key(vdir))
+    if did is not None:
+        for cid, name, cpath in conn.execute(
+                "SELECT id, name, path FROM dirs WHERE parent_id = ?", (did,)).fetchall():
+            cond, cargs = paths.subtree_sql(cpath, "d.path")
+            n = conn.execute("SELECT COUNT(*) FROM files f JOIN dirs d ON d.id = f.dir_id"
+                             f" WHERE {cond}", cargs).fetchone()[0]
+            if not n:
                 continue
-            clo, chi = paths.prefix_range(lo + head)
-            n = conn.execute("SELECT COUNT(*) FROM files WHERE vpath >= ? AND vpath < ?",
-                             (clo, chi)).fetchone()[0]
             here = conn.execute(
                 # CROSS JOIN fixes the order: walk the files of this folder and look each up, never
                 # the other way round (that reads every copy of the node for each folder).
-                "SELECT COUNT(*) FROM (SELECT 1 FROM files f CROSS JOIN copies c"
-                " ON c.file_id = f.id AND c.node_id = ? AND c.state = 'present'"
-                " WHERE f.vpath >= ? AND f.vpath < ? LIMIT ?)",
-                (me, clo, chi, HERE_CAP)).fetchone()[0]
-            dirs[head] = (n, here)
-            cur, jumped = chi, True
-            break
-        if not jumped:
-            break
+                "SELECT COUNT(*) FROM (SELECT 1 FROM dirs d JOIN files f ON f.dir_id = d.id"
+                " CROSS JOIN copies c ON c.file_id = f.id AND c.node_id = ? AND c.state = 'present'"
+                f" WHERE {cond} LIMIT ?)", (me, *cargs, HERE_CAP)).fetchone()[0]
+            dirs[name] = (n, here)
+        files = [(r[0], r[1]) for r in conn.execute(
+            "SELECT id, name FROM files WHERE dir_id = ? ORDER BY name LIMIT ?",
+            (did, MAX_FILES_LISTED))]
+        if len(files) == MAX_FILES_LISTED:
+            more = conn.execute("SELECT COUNT(*) FROM files WHERE dir_id = ?",
+                                (did,)).fetchone()[0] - MAX_FILES_LISTED
     # Directories made by the user show even when empty.
     for d in vdirs.under(conn, vdir, include_self=False):
         head = d[len(lo):].partition("/")[0]
@@ -193,7 +185,7 @@ def name_pattern(pattern: str | None) -> str | None:
 def _filters(tag: str | None, node: str | None, issues_only: bool, under: bool,
              pattern: str | None = None) -> tuple[str, list]:
     """FROM/WHERE of the files passing the filters (and, with a pattern, whose name matches)."""
-    q = " FROM files f"
+    q = " FROM vfiles f"
     where, args = [], []
     if tag:
         q += " JOIN tags t ON t.file_id = f.id AND t.present = 1"
@@ -253,8 +245,7 @@ def _leaf_dir_counts(conn: sqlite3.Connection, tag, node, issues_only, under) ->
     (a search by name only) it is cached: on a big index it takes seconds and the answer
     only changes as files come and go."""
     plain, pargs = _filters(tag, node, issues_only, under)
-    dir_expr = ("substr(f.vpath, 1, length(f.vpath) - length(substr(f.vpath, "
-                "length(rtrim(f.vpath, replace(f.vpath, '/', ''))) + 1)) - 1)")
+    dir_expr = "f.dir_path"
     unfiltered = not (tag or node or issues_only or under)
     seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0] or 0
     key = _db_file(conn)

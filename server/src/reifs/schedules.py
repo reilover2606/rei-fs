@@ -191,15 +191,16 @@ def _set_note(conn, sid: int, note: str, **cols) -> None:
 def build_items(conn: sqlite3.Connection, sch) -> tuple[list[tuple], int, int, bool, int]:
     """(items, to copy, to update, truncated, left alone): items are ``(op, vpath, size,
     allow_hash)``; left alone = destination copies that are newer than the source's."""
-    lo, hi = paths.prefix_range(sch["vpath"]) if sch["vpath"] != "/" else ("/", "0")
+    cond, cargs = paths.subtree_sql(sch["vpath"], "d.path")
     items, newer, truncated = [], 0, False
     for r in conn.execute(
-            "SELECT f.id, f.vpath, sc.size, sc.hash AS shash, dc.hash AS dhash, dc.state AS dstate"
-            " FROM files f CROSS JOIN copies sc ON sc.file_id = f.id AND sc.node_id = ?1"
-            " AND sc.state = 'present' LEFT JOIN copies dc ON dc.file_id = f.id AND dc.node_id = ?2"
-            " WHERE f.vpath >= ?3 AND f.vpath < ?4 AND (dc.file_id IS NULL OR dc.state != 'present'"
-            " OR dc.hash != sc.hash) ORDER BY f.vpath",
-            (sch["src_node"], sch["dst_node"], lo, hi)):
+            "SELECT f.id, d.path || '/' || f.name AS vpath, sc.size, sc.hash AS shash, dc.hash AS dhash, dc.state AS dstate"
+            " FROM dirs d JOIN files f ON f.dir_id = d.id"
+            " CROSS JOIN copies sc ON sc.file_id = f.id AND sc.node_id = ?"
+            " AND sc.state = 'present' LEFT JOIN copies dc ON dc.file_id = f.id AND dc.node_id = ?"
+            f" WHERE {cond} AND (dc.file_id IS NULL OR dc.state != 'present'"
+            " OR dc.hash != sc.hash) ORDER BY d.path, f.name",
+            (sch["src_node"], sch["dst_node"], *cargs)):
         if len(items) >= MAX_ITEMS_PER_RUN:
             truncated = True
             break

@@ -30,7 +30,7 @@ class Decision:
 def _row(conn: sqlite3.Connection, decision_id: int) -> sqlite3.Row:
     row = conn.execute(
         "SELECT d.*, f.vpath, n.name AS node_name FROM decisions d"
-        " LEFT JOIN files f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
+        " LEFT JOIN vfiles f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
         " WHERE d.id = ?",
         (decision_id,),
     ).fetchone()
@@ -135,7 +135,7 @@ def group_members(conn: sqlite3.Connection, group_id: int, limit: int = 50) -> l
     """Paths of some of the open members, for showing what a group is made of."""
     out = []
     for r in conn.execute(
-            "SELECT f.vpath, d.data FROM decisions d LEFT JOIN files f ON f.id = d.file_id"
+            "SELECT f.vpath, d.data FROM decisions d LEFT JOIN vfiles f ON f.id = d.file_id"
             " WHERE d.parent_id = ? AND d.status = 'open' ORDER BY d.id LIMIT ?",
             (group_id, limit)):
         out.append(r["vpath"] or json.loads(r["data"]).get("vpath") or "?")
@@ -147,7 +147,7 @@ def list_decisions(conn: sqlite3.Connection, status: str = "open",
     """The oldest decisions first; ``limit`` keeps a huge pile from being sent at once."""
     rows = conn.execute(
         "SELECT d.*, f.vpath, n.name AS node_name FROM decisions d"
-        " LEFT JOIN files f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
+        " LEFT JOIN vfiles f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
         f" WHERE d.status = ? AND {VISIBLE} ORDER BY d.id" + (" LIMIT ?" if limit else ""),
         (status, limit) if limit else (status,),
     ).fetchall()
@@ -175,7 +175,7 @@ def _resolve_group(conn: sqlite3.Connection, row: sqlite3.Row, option: str) -> s
         with db.transaction(conn, "resolving a group"):
             members = conn.execute(
                 "SELECT d.*, f.vpath, n.name AS node_name FROM decisions d"
-                " LEFT JOIN files f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
+                " LEFT JOIN vfiles f ON f.id = d.file_id LEFT JOIN nodes n ON n.id = d.node_id"
                 " WHERE d.parent_id = ? AND d.status = 'open' ORDER BY d.id LIMIT ?",
                 (row["id"], GROUP_CHUNK)).fetchall()
             if not members:

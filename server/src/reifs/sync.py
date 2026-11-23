@@ -68,7 +68,7 @@ def export_changes(conn: sqlite3.Connection, since: int, limit: int = BATCH,
 def _copy_state(conn: sqlite3.Connection, fid: int, node_id: str) -> dict | None:
     """What a log entry that points at a copy says: its state now."""
     r = conn.execute(
-        "SELECT f.vpath, c.size, c.mtime_ns, c.hash, c.state FROM copies c JOIN files f"
+        "SELECT f.vpath, c.size, c.mtime_ns, c.hash, c.state FROM copies c JOIN vfiles f"
         " ON f.id = c.file_id WHERE c.file_id = ? AND c.node_id = ?", (fid, node_id)).fetchone()
     if r is None:
         return None

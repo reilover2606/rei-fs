@@ -14,8 +14,40 @@ from . import db, paths
 # --- files -------------------------------------------------------------------
 
 
+def dir_id(conn: sqlite3.Connection, dir_path: str) -> int | None:
+    """The id of a directory row (``""`` is the root), or None when no file lives there."""
+    row = conn.execute("SELECT id FROM dirs WHERE path = ?", (dir_path,)).fetchone()
+    return row[0] if row else None
+
+
+def ensure_dir(conn: sqlite3.Connection, dir_path: str) -> int:
+    """The id of a directory row, creating it and its ancestors as needed."""
+    found = dir_id(conn, dir_path)
+    if found is not None:
+        return found
+    parent, _, name = dir_path.rpartition("/")
+    cur = conn.execute("INSERT INTO dirs(parent_id, name, path) VALUES (?, ?, ?)",
+                       (ensure_dir(conn, parent), name, dir_path))
+    return cur.lastrowid
+
+
+def prune_dirs(conn: sqlite3.Connection, did: int) -> None:
+    """Drop a directory row that holds nothing any more, and then its parents likewise."""
+    while did != 1:
+        if conn.execute("SELECT 1 FROM files WHERE dir_id = ? LIMIT 1", (did,)).fetchone() \
+                or conn.execute("SELECT 1 FROM dirs WHERE parent_id = ? LIMIT 1", (did,)).fetchone():
+            return
+        row = conn.execute("SELECT parent_id FROM dirs WHERE id = ?", (did,)).fetchone()
+        conn.execute("DELETE FROM dirs WHERE id = ?", (did,))
+        if row is None:
+            return
+        did = row[0]
+
+
 def file_id(conn: sqlite3.Connection, vpath: str) -> int | None:
-    row = conn.execute("SELECT id FROM files WHERE vpath = ?", (vpath,)).fetchone()
+    d, name = paths.split_path(vpath)
+    row = conn.execute("SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id"
+                       " WHERE d.path = ? AND f.name = ?", (d, name)).fetchone()
     return row[0] if row else None
 
 
@@ -23,10 +55,11 @@ def ensure_file(conn: sqlite3.Connection, vpath: str) -> int:
     fid = file_id(conn, vpath)
     if fid is not None:
         return fid
+    d, name = paths.split_path(vpath)
     cur = conn.execute(
-        "INSERT INTO files(vpath, vhash, issues, created) VALUES (?, ?, ?, ?)",
-        (vpath, db.key_hash(vpath), paths.encode_issues(paths.portability_issues(vpath)),
-         db.now()),
+        "INSERT INTO files(dir_id, name, vhash, issues, created) VALUES (?, ?, ?, ?, ?)",
+        (ensure_dir(conn, d), name, db.key_hash(vpath),
+         paths.encode_issues(paths.portability_issues(vpath)), db.now()),
     )
     refresh_case_flags(conn, vpath)
     fid = cur.lastrowid
@@ -43,7 +76,7 @@ def refresh_case_flags(conn: sqlite3.Connection, vpath: str) -> None:
     """Flag the files whose path differs from another's only in case. They are found by the
     number of the casefolded path (indexed) and then compared for real."""
     key = paths.key(vpath)
-    rows = [r for r in conn.execute("SELECT id, vpath, issues FROM files WHERE vhash = ?",
+    rows = [r for r in conn.execute("SELECT id, vpath, issues FROM vfiles WHERE vhash = ?",
                                     (db.key_hash(vpath),)).fetchall() if paths.key(r["vpath"]) == key]
     collide = len(rows) > 1
     for r in rows:
@@ -59,10 +92,11 @@ def drop_file_if_orphan(conn: sqlite3.Connection, fid: int) -> bool:
     """Forget a file once no copy of it is tracked anywhere."""
     if conn.execute("SELECT 1 FROM copies WHERE file_id = ?", (fid,)).fetchone():
         return False
-    row = conn.execute("SELECT vpath FROM files WHERE id = ?", (fid,)).fetchone()
+    row = conn.execute("SELECT vpath, dir_id FROM vfiles WHERE id = ?", (fid,)).fetchone()
     if row is None:
         return False
     conn.execute("DELETE FROM files WHERE id = ?", (fid,))
+    prune_dirs(conn, row["dir_id"])
     refresh_case_flags(conn, row["vpath"])
     return True
 
@@ -152,7 +186,7 @@ def log_node(conn: sqlite3.Connection, node_id: str) -> None:
 def log_tag(conn: sqlite3.Connection, fid: int, tag: str) -> None:
     r = conn.execute(
         "SELECT f.vpath, t.present, t.updated, t.updated_by FROM tags t"
-        " JOIN files f ON f.id = t.file_id WHERE t.file_id = ? AND t.tag = ?",
+        " JOIN vfiles f ON f.id = t.file_id WHERE t.file_id = ? AND t.tag = ?",
         (fid, tag)).fetchone()
     if r:
         append_change(conn, "tag", {"vpath": r["vpath"], "tag": tag, "present": r["present"],
@@ -225,7 +259,7 @@ def owned_node_ids(conn: sqlite3.Connection) -> set[str]:
 
 
 def vpath_of(conn: sqlite3.Connection, fid: int) -> str:
-    return conn.execute("SELECT vpath FROM files WHERE id = ?", (fid,)).fetchone()[0]
+    return conn.execute("SELECT vpath FROM vfiles WHERE id = ?", (fid,)).fetchone()[0]
 
 
 def forget_copy(conn: sqlite3.Connection, fid: int, node_id: str) -> None:

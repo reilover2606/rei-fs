@@ -78,7 +78,7 @@ def set_priority(conn: sqlite3.Connection, vpath: str, priority: int | None) -> 
         vpath = paths.normalize(vpath)
     except paths.VPathError as e:
         raise PriorityError(str(e)) from None
-    if conn.execute("SELECT 1 FROM files WHERE vpath = ?", (vpath,)).fetchone():
+    if index.file_id(conn, vpath) is not None:
         raise PriorityError(f"{vpath} is a file; the priority belongs to a directory")
     with db.transaction(conn):
         conn.execute(
