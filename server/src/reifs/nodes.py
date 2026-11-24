@@ -264,7 +264,7 @@ def register_node(
     node_id = node_id or str(uuid.uuid4())
     case_sensitive, restricted = probe_capabilities(root)
     ts = db.now()
-    marker = Marker(node_id=node_id, name=name, kind=kind, owner_id=owner, created=ts)
+    marker = Marker(node_id=node_id, name=name, kind=kind, owner_id=owner, created=db.to_iso(ts))
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO nodes(id, name, kind, owner_id, root_path, case_sensitive,"

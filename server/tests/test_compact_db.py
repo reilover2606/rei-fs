@@ -151,6 +151,9 @@ def test_the_upgrade_converts_an_old_database(tmp_path, monkeypatch):
     assert "vpath" not in [r[1] for r in conn.execute("PRAGMA table_info(files)")]
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    # times are numbers now (microseconds); text that is no time is kept as 0
+    assert conn.execute("SELECT typeof(created), typeof(ts) FROM files, changes LIMIT 1").fetchone()[:] == ("integer", "integer")
+    assert conn.execute("SELECT typeof(first_seen) FROM copies LIMIT 1").fetchone()[0] == "integer"
 
 
 def test_directory_rows_follow_the_files(env):
@@ -180,3 +183,17 @@ def test_vacuum_reports_sizes(tmp_path):
     before, after = db.vacuum(conn, path)
     assert after < before and db.free_space_ratio(conn) < 0.05
     assert db.table_sizes(conn) is None or db.table_sizes(conn)[0][1] > 0
+
+
+def test_times_are_numbers_and_round_trip_as_text():
+    us = db.now()
+    assert isinstance(us, int) and us > 10 ** 15
+    assert db.from_iso(db.to_iso(us)) == us
+    assert db.to_iso(1_700_000_000_123_456) == "2023-11-14T22:13:20.123456+00:00"
+    assert db.from_iso("2023-11-14T22:13:20.123+00:00") == 1_700_000_000_123_000
+    assert db.from_iso("") == 0 and db.from_iso(None) is None
+    body = {"ts": us, "data": {"updated": us, "owner_since": 0, "size": 5}, "mtime_ns": 7 * 10 ** 17}
+    wire = db.times_to_iso(body)
+    assert wire["ts"] == db.to_iso(us) and wire["data"]["owner_since"] == ""
+    assert wire["mtime_ns"] == 7 * 10 ** 17 and wire["data"]["size"] == 5       # not times
+    assert db.times_from_iso(wire) == body

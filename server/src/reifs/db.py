@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -151,7 +151,7 @@ CREATE TABLE foreign_sightings (
 """
 
 
-MIGRATIONS: dict[int, str] = {
+MIGRATIONS: dict[int, "str | Callable"] = {
     2: """
 -- Transfer jobs (milestone 2). Items refer to files by vpath so they survive
 -- re-keying of files.
@@ -516,9 +516,125 @@ VFILES_VIEW = """CREATE VIEW vfiles AS
 
 MIGRATIONS[15] = _migration_15
 
+# Columns that held a time as text and now hold microseconds since the epoch (design 5.15).
+TIME_COLUMNS = {
+    "servers": ("last_seen", "last_sync"),
+    "nodes": ("last_seen", "last_scan", "owner_since"),
+    "copies": ("first_seen", "hashed_at"),
+    "tags": ("updated",),
+    "decisions": ("created", "resolved"),
+    "wanted": ("created",),
+    "scans": ("started", "finished"),
+    "foreign_sightings": ("seen",),
+    "jobs": ("created", "started", "finished"),
+    "job_items": ("updated",),
+    "pair_requests": ("created",),
+    "outbox": ("created",),
+    "orphan_tags": ("updated",),
+    "vdirs": ("updated",),
+    "dirprefs": ("updated",),
+    "changes": ("ts",),
+    "relay_requests": ("created", "updated"),
+    "schedules": ("created",),
+    "files": ("created",),
+}
 
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+def _migration_16(conn: sqlite3.Connection) -> None:
+    def lenient(text):
+        try:
+            return from_iso(text)
+        except ValueError:
+            return 0       # not a time at all: keep the row, forget the value
+    conn.create_function("us", 1, lenient, deterministic=True)
+    conn.execute("DROP VIEW IF EXISTS vfiles")
+    for table, cols in TIME_COLUMNS.items():
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                           (table,)).fetchone()[0]
+        indexes = [r[0] for r in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
+            " AND sql IS NOT NULL", (table,))]
+        names = [r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})") if r[6] == 0]
+        sql = re.sub(r'^CREATE TABLE\s+("?)\w+\1', f"CREATE TABLE {table}_t16", sql, count=1)
+        for c in cols:
+            sql, n = re.subn(rf"(\b{c}\s+)TEXT\b( NOT NULL)?( DEFAULT '')?",
+                             lambda m: m.group(1) + "INTEGER" + (m.group(2) or "")
+                             + (" DEFAULT 0" if m.group(3) else ""), sql, count=1)
+            assert n == 1, (table, c)
+        conn.execute(sql)
+        sel = ", ".join(f"us({n})" if n in cols else n for n in names)
+        conn.execute(f"INSERT INTO {table}_t16({', '.join(names)}) SELECT {sel} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {table}_t16 RENAME TO {table}")
+        for ix in indexes:
+            conn.execute(ix)
+    conn.execute(VFILES_VIEW)
+
+
+MIGRATIONS[16] = _migration_16
+
+
+def now() -> int:
+    """The current time as the database keeps it: microseconds since the Unix epoch (UTC)."""
+    return time.time_ns() // 1000
+
+
+def to_iso(us: int) -> str:
+    """Microseconds since the epoch as ``2026-11-23T23:04:08.123456+00:00`` (what peers and the
+    clients see; 0 is "never" and gives an empty text)."""
+    if not us:
+        return ""
+    return (datetime.fromtimestamp(us // 1_000_000, timezone.utc)
+            .replace(microsecond=us % 1_000_000).isoformat(timespec="microseconds"))
+
+
+def from_iso(text) -> int | None:
+    """The reverse of ``to_iso``; numbers pass through, empty text is 0, None stays None."""
+    if text is None or isinstance(text, int):
+        return text
+    if not text:
+        return 0
+    d = datetime.fromisoformat(text)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    delta = d - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+# Names of the fields that hold such a time in what goes over the API and the wire.
+TIME_KEYS = frozenset({"created", "updated", "last_seen", "last_sync", "last_scan", "owner_since",
+                       "started", "finished", "seen", "since", "resolved", "first_seen",
+                       "hashed_at", "ts"})
+_MIN_TIME = 10 ** 14        # in microseconds: 1973; no other number in those fields is this big
+
+
+def times_to_iso(obj):
+    """A copy of ``obj`` (JSON-like) with the time fields as text."""
+    if isinstance(obj, dict):
+        return {k: (to_iso(v) if k in TIME_KEYS and isinstance(v, int) and not isinstance(v, bool)
+                    and (v >= _MIN_TIME or (v == 0 and k == "owner_since"))
+                    else times_to_iso(v)) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [times_to_iso(v) for v in obj]
+    return obj
+
+
+def times_from_iso(obj):
+    """The reverse, for what arrives from a peer."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in TIME_KEYS and isinstance(v, str):
+                try:
+                    out[k] = from_iso(v)
+                    continue
+                except ValueError:
+                    pass
+            out[k] = times_from_iso(v)
+        return out
+    if isinstance(obj, list):
+        return [times_from_iso(v) for v in obj]
+    return obj
 
 
 def _use_a_roomy_temp_dir(path: Path | str) -> None:
@@ -719,7 +835,7 @@ def open_existing(path: Path | str, timeout: float = 30,
             # that is still running may be writing: be patient.
             conn.execute(f"PRAGMA busy_timeout = {int(migration_wait * 1000)}")
             migrate(conn)
-            if version < 15 and Path(path).stat().st_size > 32 * 2**20:
+            if version < 16 and Path(path).stat().st_size > 32 * 2**20:
                 # The upgrade rewrote the tables in place, leaving slack in every page: rebuild
                 # the file so the space goes back (once; can take minutes on a big database).
                 msg = "rei-fs: the database was made smaller; compacting the file (a few minutes)"

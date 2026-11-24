@@ -451,8 +451,9 @@ def cmd_jobs(args) -> None:
 def _show_job(conn, job_id: int, show_all: bool) -> None:
     j = jobs.get_job(conn, job_id)
     print(f"job #{j['id']} [{j['status']}] {j['description']}")
-    print(f"  created {j['created']}" + (f", started {j['started']}" if j["started"] else "")
-          + (f", finished {j['finished']}" if j["finished"] else ""))
+    print(f"  created {db.to_iso(j['created'])}"
+          + (f", started {db.to_iso(j['started'])}" if j["started"] else "")
+          + (f", finished {db.to_iso(j['finished'])}" if j["finished"] else ""))
     c = jobs.item_counts(conn, job_id)
     print("  items: " + ", ".join(f"{v} {k}" for k, v in sorted(c.items())))
     q = ("SELECT i.*, s.name AS src, d.name AS dst FROM job_items i"
@@ -762,7 +763,7 @@ def cmd_peer(args) -> None:
     rows = [[p["name"], p["address"], "online" if p["online"] else "offline",
              p["transport"] + ("" if p["transport"] == "ssh" or not p["ssh_enabled"]
                                else " (ssh offered)"),
-             (p["last_sync"] or "")[:19], p["last_error"] or ""] for p in peers.paired_peers(conn)]
+             db.to_iso(p["last_sync"] or 0)[:19], p["last_error"] or ""] for p in peers.paired_peers(conn)]
     print(table(rows, ["SERVER", "ADDRESS", "STATE", "TRANSPORT", "LAST SYNC", "LAST ERROR"])
           if rows else "Not paired with any server.")
     reqs = conn.execute("SELECT * FROM pair_requests WHERE status = 'pending' ORDER BY id"
@@ -961,7 +962,7 @@ def cmd_replication(args) -> None:
     if report is None:
         print("No plan yet: run 'reifs replication plan'.")
         return
-    print(f"last plan ({report.finished[:19]}):")
+    print(f"last plan ({db.to_iso(report.finished)[:19]}):")
     print(f"  files below their goal:         {report.under_replicated}"
           f" ({report.responsible} planned by this server; others by the server holding them)")
     print(f"  copies proposed now:            {report.proposed}")

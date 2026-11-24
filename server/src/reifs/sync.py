@@ -106,6 +106,7 @@ def _apply_chunk(conn: sqlite3.Connection, entries: list[dict]) -> int:
     with db.transaction(conn, "applying changes from a peer"):
         progress = {r[0]: r[1] for r in conn.execute("SELECT * FROM origin_progress")}
         for e in entries:
+            e = db.times_from_iso(e)       # peers send times as text; here they are numbers
             origin, seq = e["origin_id"], int(e["origin_seq"])
             if origin == me or seq <= progress.get(origin, 0):
                 continue
@@ -172,7 +173,7 @@ def _ensure_node(conn, node_id: str, owner: str) -> sqlite3.Row:
         # A copy arrived before the node's announcement: placeholder until then.
         _ensure_server(conn, owner, None)
         conn.execute(
-            "INSERT INTO nodes(id, name, kind, owner_id, owner_since) VALUES (?, ?, 'storage', ?, '')",
+            "INSERT INTO nodes(id, name, kind, owner_id, owner_since) VALUES (?, ?, 'storage', ?, 0)",
             (node_id, _unique_name(conn, f"node-{node_id[:8]}", node_id, None), owner))
         row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     return row
@@ -184,7 +185,7 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
     _ensure_server(conn, origin, d.get("owner_name"))
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (d["id"],)).fetchone()
     name = _unique_name(conn, d["name"], d["id"], d.get("owner_name"))
-    fields = (name, d.get("kind", "storage"), d["owner_id"], d.get("owner_since") or "",
+    fields = (name, d.get("kind", "storage"), d["owner_id"], d.get("owner_since") or 0,
               d.get("case_sensitive"), d.get("restricted_names"), int(d.get("priority") or 0),
               int(d.get("replication_target", 1)), int(d.get("online") or 0),
               d.get("free_bytes"), d.get("total_bytes"), d.get("ssh_root"))
@@ -194,7 +195,7 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
             " restricted_names, priority, replication_target, online, free_bytes, total_bytes,"
             " ssh_root, id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*fields, d["id"]))
         return
-    if row["owner_id"] != origin and (d.get("owner_since") or "") <= (row["owner_since"] or ""):
+    if row["owner_id"] != origin and (d.get("owner_since") or 0) <= (row["owner_since"] or 0):
         return  # stale announcement from a former owner
     if row["owner_id"] == me and origin != me:
         # Another server adopted our node (newer ownership): we stop managing it.
