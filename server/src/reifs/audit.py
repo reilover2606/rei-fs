@@ -43,7 +43,7 @@ def audit_node(conn: sqlite3.Connection, cfg: Config, node_id: str, root: Path,
     reserved = reserved_dirs(conn, cfg, node_id)
     ignorer = Ignorer(cfg.scan, reserved)
     indexed = {r["vpath"]: r for r in conn.execute(
-        "SELECT f.vpath, c.size, c.state FROM copies c JOIN files f ON f.id = c.file_id"
+        "SELECT f.vpath, c.size, c.state FROM copies c JOIN vfiles f ON f.id = c.file_id"
         " WHERE c.node_id = ?", (node_id,))}
     seen: set[str] = set()
     not_indexed, odd = _Tally(), _Tally()

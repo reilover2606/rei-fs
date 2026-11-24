@@ -29,7 +29,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, index, jobs, nodes, paths, priority, vdirs
+from . import db, index, jobs, nodes, paths, peers, priority, schedules, vdirs
 
 MODES = ("merge", "preserve")
 
@@ -82,7 +82,7 @@ class Plan:
 
 
 def _is_file(conn: sqlite3.Connection, vpath: str) -> bool:
-    return conn.execute("SELECT 1 FROM files WHERE vpath = ?", (vpath,)).fetchone() is not None
+    return index.file_id(conn, vpath) is not None
 
 
 def _is_dir(conn: sqlite3.Connection, vpath: str) -> bool:
@@ -90,9 +90,9 @@ def _is_dir(conn: sqlite3.Connection, vpath: str) -> bool:
 
 
 def _files_under(conn: sqlite3.Connection, vdir: str) -> list[tuple[int, str]]:
-    lo, hi = paths.prefix_range(vdir)
+    cond, args = paths.subtree_sql(vdir)
     return [(r[0], r[1]) for r in conn.execute(
-        "SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ? ORDER BY vpath", (lo, hi))]
+        f"SELECT f.id, f.vpath FROM vfiles f WHERE {cond} ORDER BY f.vpath", args)]
 
 
 def _present(conn: sqlite3.Connection, fid: int) -> dict[str, sqlite3.Row]:
@@ -282,6 +282,10 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
         for old, new in plan.dir_moves:   # directories made by the user move at once
             vdirs.move(conn, old, new)
             priority.move(conn, old, new)   # and their update priority
+            schedules.rewrite_paths(conn, old, new)   # and the scheduled syncs of it
+            for peer in peers.paired_peers(conn):     # schedules live on the server owning the backup
+                index.queue_peer_call(conn, peer["id"], "/api/peer/dir-moved",
+                                      {"old": old, "new": new})
         for fid, node_id, _ in marks:
             hash_ = conn.execute("SELECT hash FROM copies WHERE file_id = ? AND node_id = ?",
                                  (fid, node_id)).fetchone()
@@ -290,7 +294,6 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
     for (owner, node_id), pairs in remote.items():
         label = (conn.execute("SELECT name FROM servers WHERE id = ?", (owner,)).fetchone()
                  or [owner[:8]])[0]
-        from . import peers
         try:
             out = peers.forward(conn, owner, "POST", "/api/jobs",
                                 {"kind": "rename", "node": node_id, "renames": pairs,

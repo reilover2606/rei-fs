@@ -19,7 +19,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-from . import db, index, jobs, nodes, paths, peers
+from . import db, index, jobs, nodes, paths, peers, vdirs
 
 MAX_ITEMS_PER_RUN = 50_000
 ACTIVE_JOB = ("pending", "running", "waiting")
@@ -104,9 +104,17 @@ def listing(conn: sqlite3.Connection) -> list[dict]:
 
 
 def update(conn: sqlite3.Connection, schedule_id: int, enabled=None, interval=None,
-           update_changed=None, name=None) -> None:
+           update_changed=None, name=None, path=None) -> None:
     row = get(conn, schedule_id)
+    if path is not None:
+        try:
+            path = paths.normalize(path or "/")
+        except paths.VPathError as e:
+            raise ScheduleError(str(e)) from None
     with db.transaction(conn):
+        if path is not None:
+            conn.execute("UPDATE schedules SET vpath = ?, next_due = ? WHERE id = ?",
+                         (path, time.time(), schedule_id))
         if enabled is not None:
             conn.execute("UPDATE schedules SET enabled = ? WHERE id = ?", (int(bool(enabled)),
                                                                            schedule_id))
@@ -123,6 +131,20 @@ def update(conn: sqlite3.Connection, schedule_id: int, enabled=None, interval=No
                          (int(bool(update_changed)), schedule_id))
         if name:
             conn.execute("UPDATE schedules SET name = ? WHERE id = ?", (name.strip(), schedule_id))
+
+
+def rewrite_paths(conn: sqlite3.Connection, old: str, new: str) -> int:
+    """A directory was renamed or moved in the virtual tree: schedules for it (or for a
+    directory inside it) follow it. Returns how many were changed."""
+    n = 0
+    with db.transaction(conn):
+        for r in conn.execute("SELECT id, vpath FROM schedules").fetchall():
+            v = r["vpath"]
+            if v == old or v.startswith(old.rstrip("/") + "/"):
+                conn.execute("UPDATE schedules SET vpath = ?, last_note = ? WHERE id = ?",
+                             (new + v[len(old):], f"followed {old} to {new}", r["id"]))
+                n += 1
+    return n
 
 
 def remove(conn: sqlite3.Connection, schedule_id: int) -> None:
@@ -169,15 +191,16 @@ def _set_note(conn, sid: int, note: str, **cols) -> None:
 def build_items(conn: sqlite3.Connection, sch) -> tuple[list[tuple], int, int, bool, int]:
     """(items, to copy, to update, truncated, left alone): items are ``(op, vpath, size,
     allow_hash)``; left alone = destination copies that are newer than the source's."""
-    lo, hi = paths.prefix_range(sch["vpath"]) if sch["vpath"] != "/" else ("/", "0")
+    cond, cargs = paths.subtree_sql(sch["vpath"], "d.path")
     items, newer, truncated = [], 0, False
     for r in conn.execute(
-            "SELECT f.id, f.vpath, sc.size, sc.hash AS shash, dc.hash AS dhash, dc.state AS dstate"
-            " FROM files f CROSS JOIN copies sc ON sc.file_id = f.id AND sc.node_id = ?1"
-            " AND sc.state = 'present' LEFT JOIN copies dc ON dc.file_id = f.id AND dc.node_id = ?2"
-            " WHERE f.vpath >= ?3 AND f.vpath < ?4 AND (dc.file_id IS NULL OR dc.state != 'present'"
-            " OR dc.hash != sc.hash) ORDER BY f.vpath",
-            (sch["src_node"], sch["dst_node"], lo, hi)):
+            "SELECT f.id, d.path || '/' || f.name AS vpath, sc.size, sc.hash AS shash, dc.hash AS dhash, dc.state AS dstate"
+            " FROM dirs d JOIN files f ON f.dir_id = d.id"
+            " CROSS JOIN copies sc ON sc.file_id = f.id AND sc.node_id = ?"
+            " AND sc.state = 'present' LEFT JOIN copies dc ON dc.file_id = f.id AND dc.node_id = ?"
+            f" WHERE {cond} AND (dc.file_id IS NULL OR dc.state != 'present'"
+            " OR dc.hash != sc.hash) ORDER BY d.path, f.name",
+            (sch["src_node"], sch["dst_node"], *cargs)):
         if len(items) >= MAX_ITEMS_PER_RUN:
             truncated = True
             break
@@ -209,6 +232,13 @@ def run(conn: sqlite3.Connection, schedule_id: int, force: bool = False) -> RunR
     if why:       # stays due: it runs as soon as everything is back
         _set_note(conn, schedule_id, f"waiting: {why}")
         return RunResult(False, note=why)
+    if sch["vpath"] != "/" and not vdirs.exists(conn, sch["vpath"]):
+        # Nothing at all under that path: it was probably renamed or moved outside rei-fs.
+        _set_note(conn, schedule_id,
+                  f"there is nothing under {sch['vpath']} (renamed or moved? change the "
+                  "schedule's directory)", next_due=now + sch["interval_minutes"] * 60,
+                  last_run=now)
+        return RunResult(True, note="the directory does not exist")
     items, copies, updates, truncated, newer = build_items(conn, sch)
     names = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM nodes")}
     nxt = now + sch["interval_minutes"] * 60

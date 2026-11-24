@@ -8,6 +8,7 @@ import pytest
 from reifs import jobs, queries, runner, schedules
 
 from conftest import write
+from test_peers import cluster  # noqa: F401  (the fixture)
 
 pytestmark = pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
 
@@ -111,3 +112,48 @@ def test_disabled_schedules_do_not_run_and_the_destination_must_be_ours(two):
         schedules.create(two.conn, "/", "srv", "ssd", "1h", name="all")      # name taken
     schedules.remove(two.conn, sid)
     assert schedules.listing(two.conn) == []
+
+
+def test_a_schedule_follows_its_directory_when_it_is_renamed_or_moved(two):
+    from reifs import vmove
+    sid = schedules.create(two.conn, "/docs", "srv", "ssd", "1h")
+    deep = schedules.create(two.conn, "/docs/deep", "srv", "ssd", "1h", name="deep")
+    other = schedules.create(two.conn, "/other", "srv", "ssd", "1h", name="other")
+    plan = vmove.plan_move(two.conn, ["/docs"], "/", name="papers")
+    vmove.apply_plan(two.conn, plan, "rename")
+    assert schedules.get(two.conn, sid)["vpath"] == "/papers"
+    assert schedules.get(two.conn, deep)["vpath"] == "/papers/deep"      # inside it: follows too
+    assert schedules.get(two.conn, other)["vpath"] == "/other"           # unrelated: untouched
+    assert "followed /docs to /papers" in schedules.get(two.conn, sid)["last_note"]
+    runner.run_jobs(two.conn, two.cfg)
+    two.scan()
+    res = schedules.run(two.conn, sid, force=True)                       # it keeps working
+    assert res.note.startswith("job #") or res.note.startswith("up to date")
+    assert queries.lookup(two.conn, "/papers/a.txt") is not None
+
+
+def test_a_directory_renamed_outside_rei_fs_is_reported_and_can_be_repointed(two):
+    sid = schedules.create(two.conn, "/gone", "srv", "ssd", "1h")
+    res = schedules.run(two.conn, sid, force=True)
+    assert res.job_id is None and "nothing under /gone" in schedules.get(two.conn, sid)["last_note"]
+    schedules.update(two.conn, sid, path="/docs")
+    res = schedules.run(two.conn, sid, force=True)
+    assert res.items == 2
+
+
+def test_a_move_on_another_server_updates_this_servers_schedule(cluster):
+    from reifs import vmove
+    from reifs.service import sync_peer
+    from test_peers import pair
+    a, b = cluster("alpha"), cluster("beta")
+    pair(a, b)
+    write(a.root / "docs" / "x.txt", "x", mtime=1_000_000)
+    from reifs import scanner
+    scanner.scan_all(a.conn, a.cfg)
+    for s_, o in ((b, a), (a, b), (b, a)):
+        sync_peer(s_.conn, o.id)
+    sid = schedules.create(b.conn, "/docs", "alpha", "beta", "1h")       # beta backs up alpha
+    plan = vmove.plan_move(a.conn, ["/docs"], "/", name="papers")        # moved on alpha
+    vmove.apply_plan(a.conn, plan, "rename")
+    sync_peer(a.conn, b.id)                                              # delivers the notice
+    assert schedules.get(b.conn, sid)["vpath"] == "/papers"

@@ -33,14 +33,12 @@ def select_files(conn: sqlite3.Connection, vpaths: list[str],
     selected: dict[int, str] = {}
     for raw in vpaths:
         vpath = paths.normalize(raw)
-        row = conn.execute("SELECT id, vpath FROM files WHERE vpath = ?", (vpath,)).fetchone()
-        if row:
-            selected[row[0]] = row[1]
+        fid = index.file_id(conn, vpath)
+        if fid is not None:
+            selected[fid] = vpath
             continue
-        lo, hi = paths.prefix_range(vpath) if vpath != "/" else ("/", "0")
-        rows = conn.execute(
-            "SELECT id, vpath FROM files WHERE vpath >= ? AND vpath < ?", (lo, hi)
-        ).fetchall()
+        cond, args = paths.subtree_sql(vpath)
+        rows = conn.execute(f"SELECT f.id, f.vpath FROM vfiles f WHERE {cond}", args).fetchall()
         if not rows:
             if vdirs.exists(conn, vpath):
                 raise JobError(f"{vpath} is a folder without files, there is nothing to copy")
@@ -48,7 +46,7 @@ def select_files(conn: sqlite3.Connection, vpaths: list[str],
         selected.update({r[0]: r[1] for r in rows})
     if tag:
         rows = conn.execute(
-            "SELECT f.id, f.vpath FROM files f JOIN tags t ON t.file_id = f.id"
+            "SELECT f.id, f.vpath FROM vfiles f JOIN tags t ON t.file_id = f.id"
             " WHERE t.tag = ? AND t.present = 1",
             (tag,),
         ).fetchall()
@@ -231,7 +229,7 @@ def _new_job(conn: sqlite3.Connection, kind: str, description: str) -> int:
 
 
 def _wanted_rows(conn, ids: list[int] | None) -> list[sqlite3.Row]:
-    q = ("SELECT w.*, f.vpath FROM wanted w LEFT JOIN files f ON f.id = w.file_id"
+    q = ("SELECT w.*, f.vpath FROM wanted w LEFT JOIN vfiles f ON f.id = w.file_id"
          " WHERE w.status = 'open'")
     rows = conn.execute(q + " ORDER BY w.id").fetchall()
     if ids is None:
@@ -402,7 +400,7 @@ def marked_totals(conn: sqlite3.Connection, node: str | None = None) -> tuple[in
 def marked_copies(conn: sqlite3.Connection, node: str | None = None,
                   limit: int | None = None) -> list[sqlite3.Row]:
     q = ("SELECT f.vpath, n.name AS node_name, n.root_path, n.online, c.size, c.file_id,"
-         " c.node_id FROM copies c JOIN files f ON f.id = c.file_id"
+         " c.node_id FROM copies c JOIN vfiles f ON f.id = c.file_id"
          " JOIN nodes n ON n.id = c.node_id WHERE c.marked_delete = 1")
     args: list = []
     if node:

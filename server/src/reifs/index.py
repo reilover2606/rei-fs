@@ -14,8 +14,40 @@ from . import db, paths
 # --- files -------------------------------------------------------------------
 
 
+def dir_id(conn: sqlite3.Connection, dir_path: str) -> int | None:
+    """The id of a directory row (``""`` is the root), or None when no file lives there."""
+    row = conn.execute("SELECT id FROM dirs WHERE path = ?", (dir_path,)).fetchone()
+    return row[0] if row else None
+
+
+def ensure_dir(conn: sqlite3.Connection, dir_path: str) -> int:
+    """The id of a directory row, creating it and its ancestors as needed."""
+    found = dir_id(conn, dir_path)
+    if found is not None:
+        return found
+    parent, _, name = dir_path.rpartition("/")
+    cur = conn.execute("INSERT INTO dirs(parent_id, name, path) VALUES (?, ?, ?)",
+                       (ensure_dir(conn, parent), name, dir_path))
+    return cur.lastrowid
+
+
+def prune_dirs(conn: sqlite3.Connection, did: int) -> None:
+    """Drop a directory row that holds nothing any more, and then its parents likewise."""
+    while did != 1:
+        if conn.execute("SELECT 1 FROM files WHERE dir_id = ? LIMIT 1", (did,)).fetchone() \
+                or conn.execute("SELECT 1 FROM dirs WHERE parent_id = ? LIMIT 1", (did,)).fetchone():
+            return
+        row = conn.execute("SELECT parent_id FROM dirs WHERE id = ?", (did,)).fetchone()
+        conn.execute("DELETE FROM dirs WHERE id = ?", (did,))
+        if row is None:
+            return
+        did = row[0]
+
+
 def file_id(conn: sqlite3.Connection, vpath: str) -> int | None:
-    row = conn.execute("SELECT id FROM files WHERE vpath = ?", (vpath,)).fetchone()
+    d, name = paths.split_path(vpath)
+    row = conn.execute("SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id"
+                       " WHERE d.path = ? AND f.name = ?", (d, name)).fetchone()
     return row[0] if row else None
 
 
@@ -23,12 +55,13 @@ def ensure_file(conn: sqlite3.Connection, vpath: str) -> int:
     fid = file_id(conn, vpath)
     if fid is not None:
         return fid
-    vkey = paths.key(vpath)
+    d, name = paths.split_path(vpath)
     cur = conn.execute(
-        "INSERT INTO files(vpath, vkey, issues, created) VALUES (?, ?, ?, ?)",
-        (vpath, vkey, paths.encode_issues(paths.portability_issues(vpath)), db.now()),
+        "INSERT INTO files(dir_id, name, vhash, issues, created) VALUES (?, ?, ?, ?, ?)",
+        (ensure_dir(conn, d), name, db.key_hash(vpath),
+         paths.encode_issues(paths.portability_issues(vpath)), db.now()),
     )
-    refresh_case_flags(conn, vkey)
+    refresh_case_flags(conn, vpath)
     fid = cur.lastrowid
     # Tags a peer sent before the file reached us.
     conn.execute(
@@ -39,8 +72,12 @@ def ensure_file(conn: sqlite3.Connection, vpath: str) -> int:
     return fid
 
 
-def refresh_case_flags(conn: sqlite3.Connection, vkey: str) -> None:
-    rows = conn.execute("SELECT id, vpath, issues FROM files WHERE vkey = ?", (vkey,)).fetchall()
+def refresh_case_flags(conn: sqlite3.Connection, vpath: str) -> None:
+    """Flag the files whose path differs from another's only in case. They are found by the
+    number of the casefolded path (indexed) and then compared for real."""
+    key = paths.key(vpath)
+    rows = [r for r in conn.execute("SELECT id, vpath, issues FROM vfiles WHERE vhash = ?",
+                                    (db.key_hash(vpath),)).fetchall() if paths.key(r["vpath"]) == key]
     collide = len(rows) > 1
     for r in rows:
         issues = paths.decode_issues(r["issues"])
@@ -55,11 +92,12 @@ def drop_file_if_orphan(conn: sqlite3.Connection, fid: int) -> bool:
     """Forget a file once no copy of it is tracked anywhere."""
     if conn.execute("SELECT 1 FROM copies WHERE file_id = ?", (fid,)).fetchone():
         return False
-    row = conn.execute("SELECT vkey FROM files WHERE id = ?", (fid,)).fetchone()
+    row = conn.execute("SELECT vpath, dir_id FROM vfiles WHERE id = ?", (fid,)).fetchone()
     if row is None:
         return False
     conn.execute("DELETE FROM files WHERE id = ?", (fid,))
-    refresh_case_flags(conn, row["vkey"])
+    prune_dirs(conn, row["dir_id"])
+    refresh_case_flags(conn, row["vpath"])
     return True
 
 
@@ -81,13 +119,26 @@ def self_id(conn: sqlite3.Connection) -> str:
 
 def append_change(conn: sqlite3.Connection, kind: str, data: dict,
                   origin_id: str | None = None, origin_seq: int | None = None,
-                  ts: str | None = None) -> None:
-    """Append to the log: our own change (origin None) or one learned from a peer."""
+                  ts: str | None = None, ref: tuple[int, str] | None = None) -> None:
+    """Append to the log: our own change (origin None) or one learned from a peer.
+
+    ``ref`` = (file id, node id): the entry is about that copy and holds nothing else; what
+    it says (present, missing, its size and hash) is read from the copy when the entry is
+    sent. An older entry about the same copy is replaced, so the log never holds more than one
+    per copy: it cannot outgrow the index, and a peer that is behind just gets the latest.
+    """
     if origin_id is None:
         origin_id = self_id(conn)
         origin_seq = conn.execute(
             "SELECT IFNULL(MAX(origin_seq), 0) + 1 FROM changes WHERE origin_id = ?",
             (origin_id,)).fetchone()[0]
+    if ref is not None:
+        conn.execute("DELETE FROM changes WHERE ref_node = ? AND ref_file = ?", (ref[1], ref[0]))
+        conn.execute(
+            "INSERT OR IGNORE INTO changes(origin_id, origin_seq, kind, data, ts, ref_file,"
+            " ref_node) VALUES (?, ?, ?, '', ?, ?, ?)",
+            (origin_id, origin_seq, kind, ts or db.now(), ref[0], ref[1]))
+        return
     conn.execute(
         "INSERT OR IGNORE INTO changes(origin_id, origin_seq, kind, data, ts)"
         " VALUES (?, ?, ?, ?, ?)",
@@ -98,7 +149,15 @@ def append_change(conn: sqlite3.Connection, kind: str, data: dict,
 def log_change(
     conn: sqlite3.Connection, node_id: str, vpath: str, op: str,
     size: int | None = None, mtime_ns: int | None = None, hash_: str | None = None,
+    fid: int | None = None,
 ) -> None:
+    """Log a change of a copy. A copy that is there (or marked missing) is logged as a pointer
+    to it; its removal has to carry the path, because nothing is left to point at."""
+    if op in ("upsert", "missing"):
+        fid = fid if fid is not None else file_id(conn, vpath)
+        if fid is not None:
+            append_change(conn, "copy", {}, ref=(fid, node_id))
+            return
     append_change(conn, "copy", {"node_id": node_id, "vpath": vpath, "op": op, "size": size,
                                  "mtime_ns": mtime_ns, "hash": hash_})
 
@@ -127,7 +186,7 @@ def log_node(conn: sqlite3.Connection, node_id: str) -> None:
 def log_tag(conn: sqlite3.Connection, fid: int, tag: str) -> None:
     r = conn.execute(
         "SELECT f.vpath, t.present, t.updated, t.updated_by FROM tags t"
-        " JOIN files f ON f.id = t.file_id WHERE t.file_id = ? AND t.tag = ?",
+        " JOIN vfiles f ON f.id = t.file_id WHERE t.file_id = ? AND t.tag = ?",
         (fid, tag)).fetchone()
     if r:
         append_change(conn, "tag", {"vpath": r["vpath"], "tag": tag, "present": r["present"],
@@ -200,13 +259,14 @@ def owned_node_ids(conn: sqlite3.Connection) -> set[str]:
 
 
 def vpath_of(conn: sqlite3.Connection, fid: int) -> str:
-    return conn.execute("SELECT vpath FROM files WHERE id = ?", (fid,)).fetchone()[0]
+    return conn.execute("SELECT vpath FROM vfiles WHERE id = ?", (fid,)).fetchone()[0]
 
 
 def forget_copy(conn: sqlite3.Connection, fid: int, node_id: str) -> None:
     """Stop tracking a copy (it is physically gone or no longer wanted)."""
     vpath = vpath_of(conn, fid)
     conn.execute("DELETE FROM copies WHERE file_id = ? AND node_id = ?", (fid, node_id))
+    conn.execute("DELETE FROM changes WHERE ref_node = ? AND ref_file = ?", (node_id, fid))
     log_change(conn, node_id, vpath, "remove")
     obsolete_decisions(conn, fid, ("missing",), node_id)
     if not drop_file_if_orphan(conn, fid):
@@ -374,14 +434,14 @@ def record_copy(conn: sqlite3.Connection, fid: int, node_id: str, size: int,
     row = conn.execute("SELECT last_scan_id FROM nodes WHERE id = ?", (node_id,)).fetchone()
     ts = db.now()
     conn.execute(
-        "INSERT INTO copies(file_id, node_id, size, mtime_ns, hash, first_seen, first_scan,"
-        " hashed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(file_id, node_id) DO UPDATE"
-        " SET size = excluded.size, mtime_ns = excluded.mtime_ns, hash = excluded.hash,"
+        "INSERT INTO copies(file_id, node_id, size, mtime_ns, hash_b, first_seen, first_scan,"
+        " hashed_at) VALUES (?, ?, ?, ?, hb(?), ?, ?, ?) ON CONFLICT(file_id, node_id) DO UPDATE"
+        " SET size = excluded.size, mtime_ns = excluded.mtime_ns, hash_b = excluded.hash_b,"
         " state = 'present', hashed_at = excluded.hashed_at,"
-        " marked_delete = CASE WHEN copies.hash = excluded.hash THEN copies.marked_delete"
+        " marked_delete = CASE WHEN copies.hash_b = excluded.hash_b THEN copies.marked_delete"
         " ELSE 0 END",
         (fid, node_id, size, mtime_ns, hash_, ts, (row[0] if row else None) or 0, ts),
     )
-    log_change(conn, node_id, vpath_of(conn, fid), "upsert", size, mtime_ns, hash_)
+    log_change(conn, node_id, vpath_of(conn, fid), "upsert", size, mtime_ns, hash_, fid=fid)
     obsolete_decisions(conn, fid, ("missing",), node_id)
     evaluate_divergence(conn, fid)

@@ -26,13 +26,13 @@ def _set(conn: sqlite3.Connection, vpath: str, present: bool) -> None:
 
 
 def is_file(conn: sqlite3.Connection, vpath: str) -> bool:
-    return conn.execute("SELECT 1 FROM files WHERE vpath = ?", (vpath,)).fetchone() is not None
+    return index.file_id(conn, vpath) is not None
 
 
 def has_files(conn: sqlite3.Connection, vdir: str) -> bool:
-    lo, hi = paths.prefix_range(vdir)
-    return conn.execute("SELECT 1 FROM files WHERE vpath >= ? AND vpath < ? LIMIT 1",
-                        (lo, hi)).fetchone() is not None
+    cond, args = paths.subtree_sql(vdir, "d.path")
+    return conn.execute(f"SELECT 1 FROM files f JOIN dirs d ON d.id = f.dir_id WHERE {cond}"
+                        " LIMIT 1", args).fetchone() is not None
 
 
 def under(conn: sqlite3.Connection, vdir: str, include_self: bool = True) -> list[str]:

@@ -466,7 +466,15 @@ the last run). The worker looks every 15 seconds, and at once when a node comes 
 cannot be used at that moment (a drive unplugged, a computer asleep, the other server unreachable)
 no job is created, the schedule says what it waits for, and it stays due: it runs as soon as both
 nodes are back, **once**, however many intervals were missed. A new run is not started while the
-previous job is still going. A very large directory is synced in pieces of 50,000 files, the next
+previous job is still going.
+
+**Renames.** A schedule names its directory by path. When a directory is renamed or moved in the
+virtual tree (5.5) the schedules for it, and for directories inside it, follow it, and the
+servers paired with this one are told (`POST peer/dir-moved`), because a schedule lives on the
+server owning the backup node, which may not be the one doing the move. A directory renamed
+*outside* rei-fs (on a disk) is not noticed: its next run finds nothing under the path and says so
+in the schedule's note, and `p` in the Schedules tab (`reifs schedule path ID DIR`) points it at the
+new place. A very large directory is synced in pieces of 50,000 files, the next
 piece a minute later.
 
 ### 5.12 Network figures in the client
@@ -478,6 +486,52 @@ copies by file count and, in proportion, by size, as two stacked bars (one colou
 gauges. The figures are the cached coverage figures of §5.9 (`GET network`). The Nodes tab
 lists each server (this one first) with the nodes it owns branching beneath it; a scan key on a
 server's row covers all its nodes.
+
+### 5.13 A smaller database
+
+Measured on 400,000 files and 600,000 copies (paths of 76 characters): 584 MB before, 280 MB after,
+which is about 2.8 GB instead of 5.5 GB at four million files.
+
+* **The change log holds pointers, not copies of the data.** An entry about a copy says only which
+  file and node (`ref_file`, `ref_node`); what it states (present or missing, size, mtime, hash,
+  path) is read from the copy when the entry is sent, so the wire format is unchanged. Writing an
+  entry replaces the older one about the same copy, so the log never holds more than one per
+  copy and cannot outgrow the index. That is safe for a peer that is behind: the entry it would
+  have fetched is replaced by a newer one that is sent instead. Only a copy's removal carries its
+  path (nothing is left to point at). Entries forwarded from another server are stored the same way.
+* **Hashes are stored as 32 bytes.** The `hash` column is computed from them (`hash_b`) for reading,
+  so the code still sees `blake2b:<hex>`, and aggregations compare the raw bytes.
+* **No casefolded copy of the path.** `files.vhash` is a 64-bit number of the casefolded path (indexed);
+  two paths that differ only in case have the same number, and candidates are compared for
+  real. A name search narrows candidates in SQL with the lower-cased path (ASCII) and keeps every
+  path holding a non-ASCII character as a candidate, then checks the exact match, so a case folding
+  SQLite's `lower()` does not know (the Kelvin sign is a `k`) still matches.
+* **Compaction.** The upgrade rewrites the tables in place, so right after it the file is
+  compacted (`VACUUM`, which needs about the database's size in free disk space, and for a short
+  while twice that in total). `reifs db stats` shows where the space goes and `reifs db vacuum` compacts
+  it at any time (it refuses while another process, such as a running server, has the database
+  open, unless `--force`).
+
+The SQL functions the schema uses (`hx`, `hb`, `vh`) are registered by rei-fs on every connection:
+the `sqlite3` command-line tool alone cannot read the `hash` column.
+
+### 5.14 Directories are rows
+
+A file's path used to be stored whole, in its row and again in an index. Now a directory is a row of
+`dirs(id, parent_id, name, path)` (the root is `path = ''`) and a file is `files(dir_id, name)`, unique
+together. The view `vfiles` joins them back into `vpath`, for reads that want the whole path.
+
+* Only directories that hold files (or directories) have rows: `index.ensure_dir` creates them with
+  their ancestors when a file is added, and removing the last file of a folder prunes it (and
+  then its emptied parents). Folders made on purpose are still `vdirs`.
+* "At or below a directory" is `dirs.path = D OR dirs.path >= 'D/' AND dirs.path < 'D0'`, a range on the
+  unique `dirs.path` index (`paths.subtree_sql`). Listing a directory is one lookup of its child rows
+  plus a count per child, instead of walking the index by jumps.
+* Results that used to be in plain path order are in (directory, name) order; the two differ only in
+  corner cases (a name containing a character that sorts before `/`).
+* The upgrade (version 15) builds `dirs` from the existing paths, swaps the `files` table with
+  foreign keys off, checks them afterwards, and then the file is compacted as for 5.13.
+  At 400,000 files (7,800 folders): 280 MB to 237 MB, the upgrade with compaction taking 13 s.
 
 ## 6. Replication (milestone 5)
 

@@ -86,6 +86,26 @@ def prefix_range(vdir: str) -> tuple[str, str]:
     return lo, hi
 
 
+def split_path(vpath: str) -> tuple[str, str]:
+    """``/a/b/c.txt`` -> (``/a/b``, ``c.txt``); a file in the root has the directory ``""``
+    (that is how the root is written in ``dirs.path``)."""
+    d, _, name = vpath.rpartition("/")
+    return d, name
+
+
+def dir_key(vdir: str) -> str:
+    """The virtual directory ``/`` is ``""`` in ``dirs.path``."""
+    return "" if vdir == "/" else vdir
+
+
+def subtree_sql(vdir: str, column: str = "f.dir_path") -> tuple[str, tuple]:
+    """SQL (and its arguments) for "in this directory or below it", on a dirs path column."""
+    key = dir_key(vdir)
+    if not key:
+        return "1", ()
+    return f"({column} = ? OR ({column} >= ? AND {column} < ?))", (key, key + "/", key + "0")
+
+
 def name_issues(name: str) -> set[str]:
     issues: set[str] = set()
     if any(c in ILLEGAL_CHARS for c in name):

@@ -25,12 +25,12 @@ def validate(tag: str) -> str:
 def resolve_targets(conn: sqlite3.Connection, vpath: str, recursive: bool) -> list[int]:
     """File ids for a vpath: the file itself, or every file below a directory."""
     vpath = paths.normalize(vpath)
-    row = conn.execute("SELECT id FROM files WHERE vpath = ?", (vpath,)).fetchone()
-    if row:
-        return [row[0]]
-    lo, hi = paths.prefix_range(vpath)
+    fid = index.file_id(conn, vpath)
+    if fid is not None:
+        return [fid]
+    cond, args = paths.subtree_sql(vpath, "d.path")
     ids = [r[0] for r in conn.execute(
-        "SELECT id FROM files WHERE vpath >= ? AND vpath < ?", (lo, hi))]
+        f"SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id WHERE {cond}", args)]
     if not ids:
         raise TagError(f"no such file or directory in the virtual tree: {vpath}")
     if not recursive:
