@@ -1209,7 +1209,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(status, payload)
 
     def _send(self, status: int, payload: dict) -> None:
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps(db.times_to_iso(payload)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))

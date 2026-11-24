@@ -127,10 +127,5 @@ def cleanup(conn: sqlite3.Connection, cfg: Config) -> int:
     return removed
 
 
-def _age_seconds(iso: str) -> float:
-    from datetime import datetime, timezone
-
-    try:
-        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
-    except ValueError:
-        return 0.0
+def _age_seconds(us: int) -> float:
+    return max(0.0, (db.now() - (us or db.now())) / 1e6)

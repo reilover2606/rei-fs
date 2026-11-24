@@ -533,6 +533,24 @@ together. The view `vfiles` joins them back into `vpath`, for reads that want th
   foreign keys off, checks them afterwards, and then the file is compacted as for 5.13.
   At 400,000 files (7,800 folders): 280 MB to 237 MB, the upgrade with compaction taking 13 s.
 
+### 5.15 Times are numbers
+
+Every time the database keeps (`created`, `updated`, `first_seen`, `hashed_at`, the change log's `ts`,
+`last_seen`, `owner_since`, ...) is an integer: microseconds since the Unix epoch, UTC (`db.now()`). A
+file's modification time was already `mtime_ns`. That is 8 bytes or fewer instead of 32, and
+comparing and ordering them is the same as before.
+
+* **Text stays at the edges.** The API, and so the clients and the peers, still see and send
+  `2026-11-23T23:04:08.123456+00:00`: `api._send` converts the fields named in `db.TIME_KEYS` on the
+  way out (`db.times_to_iso`) and `sync._apply_chunk` converts them on the way in
+  (`db.times_from_iso`). The wire format and the node marker files are unchanged, so a server that
+  has not been upgraded keeps working with one that has.
+* **Upgrade (version 16).** Each table that had such columns is rebuilt with `INTEGER` columns and the
+  old text converted (`db.from_iso`; text that is no time becomes 0), then the file is compacted.
+  Stored change-log payloads are not rewritten: they are converted when sent.
+* Measured on 400,000 files and 600,000 copies: 237 MB before, 181 MB after (from 584 MB at the
+  start of 5.13); the whole upgrade with compaction took 20 s.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

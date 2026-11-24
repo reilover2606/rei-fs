@@ -457,3 +457,11 @@ def test_network_figures_and_the_node_tree_data(server):
     assert {n["name"] for n in net["nodes"]} == {"srv", "ssd"}
     nodes_ = client.get("/api/nodes")["nodes"]
     assert all("owner_id" in n and n["owner_online"] is True for n in nodes_)     # for the tree
+
+
+def test_times_are_text_over_the_api(server):
+    env, client, _ = server
+    login(client)
+    ssd = {n["name"]: n for n in client.get("/api/nodes")["nodes"]}["ssd"]
+    assert ssd["last_scan"].endswith("+00:00") and ssd["last_scan"][:2] == "20"
+    assert env.conn.execute("SELECT typeof(last_scan) FROM nodes WHERE name = 'ssd'").fetchone()[0] == "integer"
