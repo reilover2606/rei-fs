@@ -660,6 +660,10 @@ def hash_to_blob(text: str | None) -> bytes | None:
     as it is, after a zero byte."""
     if text is None:
         return None
+    if isinstance(text, (bytes, bytearray, memoryview)):    # not what we write, but be lenient
+        text = bytes(text).decode("utf-8", "surrogateescape")
+    elif not isinstance(text, str):
+        text = str(text)
     if _HASH_RE.match(text):
         return bytes.fromhex(text[8:])
     return b"\x00" + text.encode("utf-8", "surrogatepass")
@@ -677,6 +681,10 @@ def blob_to_hash(blob: bytes | None) -> str | None:
 def key_hash(vpath: str) -> int:
     """A 64-bit number for the casefolded path: a small, indexable stand-in for it. Two paths
     that differ only in case have the same number (so do, rarely, others: callers check)."""
+    if isinstance(vpath, (bytes, bytearray, memoryview)):
+        vpath = bytes(vpath).decode("utf-8", "surrogateescape")
+    elif not isinstance(vpath, str):
+        vpath = str(vpath)
     digest = hashlib.blake2b(vpath.casefold().encode("utf-8", "surrogatepass"),
                              digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=True)
@@ -772,6 +780,7 @@ def _run_python_migration(conn: sqlite3.Connection, target: int, step) -> None:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
+    sqlite3.enable_callback_tracebacks(True)    # a failing SQL function then says why
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     for target in range(version + 1, SCHEMA_VERSION + 1):
         try:
@@ -782,13 +791,14 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(
                 f"BEGIN;\n{step}\nPRAGMA user_version = {target};\nCOMMIT;"
             )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
             # Another process migrated while we waited for the write lock: fine.
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             if conn.execute("PRAGMA user_version").fetchone()[0] >= target:
                 continue
-            raise
+            raise sqlite3.OperationalError(
+                f"{e} (while upgrading the database to version {target})") from e
 
 
 def table_sizes(conn: sqlite3.Connection) -> list[tuple[str, int]] | None:
@@ -825,6 +835,26 @@ def vacuum(conn: sqlite3.Connection, path: Path | str) -> tuple[int, int]:
     return before, size()
 
 
+def _free(path: Path | str) -> str:
+    try:
+        u = shutil.disk_usage(path)
+        return f"{u.free // 2**20} MiB free of {u.total // 2**20} MiB"
+    except OSError:
+        return "unknown"
+
+
+def _space_report(path: Path | str) -> str:
+    """Where an upgrade writes, and how much room each place has."""
+    db_dir = Path(path).resolve().parent
+    tmp = os.environ.get("SQLITE_TMPDIR") or "/var/tmp or /tmp"
+    lines = [f"  database folder {db_dir}: {_free(db_dir)}"]
+    if os.environ.get("SQLITE_TMPDIR"):
+        lines.append(f"  temporary files {tmp}: {_free(tmp)}")
+    else:
+        lines.append(f"  temporary files {tmp}: {_free('/var/tmp')} / {_free('/tmp')}")
+    return "\n".join(lines)
+
+
 def open_existing(path: Path | str, timeout: float = 30,
                   migration_wait: float = 120) -> sqlite3.Connection:
     conn = connect(path, timeout)
@@ -834,7 +864,22 @@ def open_existing(path: Path | str, timeout: float = 30,
             # Rebuilding the change log of a big database takes a while, and a server
             # that is still running may be writing: be patient.
             conn.execute(f"PRAGMA busy_timeout = {int(migration_wait * 1000)}")
-            migrate(conn)
+            size = Path(path).stat().st_size
+            if size > 32 * 2**20:
+                print(f"rei-fs: upgrading the database ({size // 2**20} MiB) from version "
+                      f"{version} to {SCHEMA_VERSION}; this can take several minutes and "
+                      f"needs about {size * 2 // 2**20} MiB of free space for a while:\n"
+                      f"{_space_report(path)}", file=sys.stderr, flush=True)
+            try:
+                migrate(conn)
+            except sqlite3.OperationalError as e:
+                if "full" in str(e):
+                    raise RuntimeError(
+                        f"the database upgrade ran out of space ({e}). SQLite says this both for "
+                        f"a full disk and for a full temporary folder.\n{_space_report(path)}\n"
+                        "Free some space there (or set SQLITE_TMPDIR to a roomy folder) and "
+                        "start again: nothing was changed.") from e
+                raise
             if version < 16 and Path(path).stat().st_size > 32 * 2**20:
                 # The upgrade rewrote the tables in place, leaving slack in every page: rebuild
                 # the file so the space goes back (once; can take minutes on a big database).
