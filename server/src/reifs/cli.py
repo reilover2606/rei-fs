@@ -641,6 +641,7 @@ def cmd_serve(args) -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg, conn = open_server(args.home)
+    db.make_incremental(conn, cfg.db_path)
     conn.close()
     # Scans and transfers run Python code for a long time. With the default 5 ms
     # switch interval a request thread waits for its turn at every step of its

@@ -578,6 +578,13 @@ It can be packed into one squashfs archive, `<dir>.sqsh`, next to where the dire
   directories like the fetch folder: it does not descend into them). The original files stay on
   disk unless "remove the originals" was chosen: then exactly the files that went into the
   archive are deleted and the folders left empty.
+* **The database shrinks again.** Forgetting the loose files frees pages inside the database file,
+  which SQLite keeps for reuse and does not return. New databases are made with
+  `auto_vacuum = INCREMENTAL`, and after packing (and dropping) `db.reclaim` gives the free pages back
+  in short steps of 4,000 pages, so writers wait only for a moment, then checkpoints so that the
+  file itself gets smaller; the worker's result line says how much was returned. A database made by
+  an earlier version is converted once, when the server starts (`db.make_incremental`: one full rebuild,
+  like the compaction after an upgrade; `reifs db vacuum` does it by hand too).
 * **Unpack** (`z` on a packed entry; `reifs archive unpack DIR`) extracts into the directory
   without overwriting anything (files that differ stop it before anything is written), then
   retires the archive and marks its file for deletion: like every deletion it is confirmed in the

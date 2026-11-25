@@ -334,6 +334,8 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
         for r in loose:
             if r["nid"] in mine:
                 index.forget_copy(conn, r["fid"], r["nid"])
+    say(f"packing {vdir}: giving the database's free space back")
+    reclaimed = db.reclaim(conn)
     removed = 0
     if remove_originals:
         say(f"packing {vdir}: removing the original files")
@@ -341,7 +343,8 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
     say(f"packed {vdir}")
     return {"dir": vdir, "archive": archive_vpath(vdir), "node": target["name"],
             "files": len(members), "bytes": total, "archive_bytes": st.st_size,
-            "originals_removed": removed, "originals_kept": not remove_originals}
+            "originals_removed": removed, "originals_kept": not remove_originals,
+            "database_reclaimed": reclaimed}
 
 
 def _remove_originals(src: Path, rels: list[str]) -> int:
@@ -386,6 +389,7 @@ def drop(conn: sqlite3.Connection, vdir: str) -> dict:
         raise ArchiveError(f"{vdir} is not a packed directory")
     with db.transaction(conn, "dropping an archive"):
         _retire(conn, row)
+    db.reclaim(conn)
     return {"dir": vdir, "archive": archive_vpath(vdir)}
 
 

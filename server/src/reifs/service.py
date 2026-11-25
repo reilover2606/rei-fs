@@ -285,6 +285,9 @@ class Worker:
                                f"{res['archive_bytes'] / 1e6:.1f} MB")
                         msg += (f"; {res['originals_removed']:,} original files removed"
                                 if remove else "; the original files were kept")
+                        if res["database_reclaimed"]:
+                            msg += (f"; {res['database_reclaimed'] / 1e6:.1f} MB of database "
+                                    "space given back")
                     else:
                         res = archives.unpack(conn, self.cfg, vdir, node,
                                               progress=self._progress, stop=stop)

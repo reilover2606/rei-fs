@@ -162,3 +162,28 @@ def test_a_packed_directory_is_tagged_as_its_archive(env):
     pack(env)
     ids = tags.resolve_targets(env.conn, "/src/foo", False)
     assert ids == [index.file_id(env.conn, "/src/foo.sqsh")]
+
+
+def test_the_database_gives_back_the_space_of_the_files_it_forgot(env):
+    assert db.is_incremental(env.conn)
+    for i in range(1500):
+        write(env.root / "big" / "tiny" / f"file-with-a-longish-name-{i:05d}.txt", f"x{i}", mtime=1_000_000)
+    env.scan()
+    env.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    pages = env.conn.execute("PRAGMA page_count").fetchone()[0]
+    res = archives.pack(env.conn, env.cfg, "/big/tiny")
+    assert res["database_reclaimed"] > 0
+    assert env.conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+    # the rows of 1500 files and copies (and the change-log entries that pointed at them) are gone
+    assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+    assert env.conn.execute("PRAGMA page_count").fetchone()[0] <= pages
+
+
+def test_an_old_database_is_converted_once(tmp_path, capsys):
+    conn = db.connect(tmp_path / "old.db")
+    conn.execute("PRAGMA auto_vacuum = NONE")
+    conn.executescript("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+    assert not db.is_incremental(conn)
+    db.make_incremental(conn, tmp_path / "old.db")
+    assert db.is_incremental(conn)
+    assert conn.execute("SELECT x FROM t").fetchone()[0] == 1
