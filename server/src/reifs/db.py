@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -573,6 +573,30 @@ def _migration_16(conn: sqlite3.Connection) -> None:
 
 MIGRATIONS[16] = _migration_16
 
+
+def _rebuild_table(conn: sqlite3.Connection, table: str, edits: list[tuple[str, str]]) -> None:
+    """Recreate a table with its definition edited (SQLite cannot change a CHECK in place),
+    keeping its rows and indexes. Python migrations run with foreign keys off."""
+    import re
+
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                       (table,)).fetchone()[0]
+    indexes = [r[0] for r in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL",
+        (table,))]
+    names = [r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})") if r[6] == 0]
+    sql = re.sub(r'^CREATE TABLE\s+("?)\w+\1', f"CREATE TABLE {table}_new", sql, count=1)
+    for old, new in edits:
+        assert old in sql, (table, old)
+        sql = sql.replace(old, new, 1)
+    conn.execute(sql)
+    cols = ", ".join(names)
+    conn.execute(f"INSERT INTO {table}_new({cols}) SELECT {cols} FROM {table}")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+    for ix in indexes:
+        conn.execute(ix)
+
 MIGRATIONS[17] = """
 -- Packed directories (design 5.16): a directory kept as one squashfs file. The archive is an
 -- ordinary file of the virtual tree (``<dir>.sqsh``); this table says which directory it stands
@@ -609,6 +633,29 @@ ALTER TABLE nodes ADD COLUMN mirrored INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE nodes ADD COLUMN backup_first INTEGER NOT NULL DEFAULT 0;
 """
 
+def _migration_20(conn: sqlite3.Connection) -> None:
+    """Scans, packing and unpacking are jobs (design 5.19): new kinds and operations."""
+    _rebuild_table(conn, "jobs", [
+        ("CHECK (kind IN ('copy', 'move', 'wanted'))",
+         "CHECK (kind IN ('copy', 'move', 'wanted', 'scan', 'pack', 'unpack'))")])
+    _rebuild_table(conn, "job_items", [
+        ("CHECK (op IN ('copy', 'overwrite', 'rename'))",
+         "CHECK (op IN ('copy', 'overwrite', 'rename', 'scan', 'pack', 'unpack', 'clean'))")])
+    conn.execute("ALTER TABLE job_items ADD COLUMN params TEXT")
+    # What an archive is for: pack everywhere (the archive is copied to every node that held the
+    # directory, the originals removed there once it is verified).
+    conn.execute("ALTER TABLE archives ADD COLUMN cleanup INTEGER NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE archives ADD COLUMN targets TEXT NOT NULL DEFAULT '[]'")
+    conn.execute("ALTER TABLE archive_members ADD COLUMN hash INTEGER")
+    conn.execute("""CREATE TABLE archive_todo (
+        dir_path TEXT NOT NULL,
+        node_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        stage    TEXT NOT NULL,              -- copy -> clean
+        job_id   INTEGER,
+        updated  INTEGER NOT NULL,
+        PRIMARY KEY (dir_path, node_id))""")
+
+
 MIGRATIONS[19] = """
 -- Jobs made by the synchronizer (changes of synchronous files) are frequent: hidden from the
 -- job list unless they fail.
@@ -630,6 +677,8 @@ CREATE TABLE apps (
 );
 CREATE UNIQUE INDEX apps_token ON apps(token_hash) WHERE token_hash IS NOT NULL;
 """
+
+MIGRATIONS[20] = _migration_20
 
 
 def now() -> int:

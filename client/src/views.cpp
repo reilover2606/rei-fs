@@ -465,12 +465,12 @@ class OverviewView : public View {
     if (e == Event::Home) return scroll_ = 0.f, true;
     if (e == Event::End) return scroll_ = 1.f, true;
     if (key(e, "s")) {
-      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan queued"); });
+      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan: see the Jobs tab (c cancels it)"); });
       return true;
     }
     if (key(e, "w")) {
       ctx_.send("/api/scan", {{"new_only", true}},
-                [this](json) { ctx_.notify("scan for new files queued"); });
+                [this](json) { ctx_.notify("scan for new files: see the Jobs tab (c cancels it)"); });
       return true;
     }
     if (key(e, "j")) {
@@ -1219,15 +1219,18 @@ class TreeView : public View {
     ctx_.dialogs->ask_choice(
         "Pack " + target + " into one squashfs archive (" + target + ".sqsh)?\n"
         "It then shows as a single entry; search looks inside only with 'deep search'.\n"
-        "The directory must be on one node of a server with the squashfs tools.",
-        {"pack, keep the original files", "pack, then remove the original files"},
+        "The job is in the Jobs tab and can be cancelled there.",
+        {"pack on every node that holds it: pack on one, copy the archive to the others, then "
+         "remove the original files (each is checked against the archive first)",
+         "pack here only, keep the original files",
+         "pack here only, then remove the original files"},
         [this, target](int i) {
-          ctx_.send("/api/archives/pack", {{"vpath", target}, {"remove_originals", i == 1}},
-                    [this, target](json out) {
-                      ctx_.notify("packing " + target + " on " + out.value("node", "") +
-                                  " in the background (see the status line)");
-                      follow_ = 5;
-                    });
+          json body = {{"vpath", target}, {"everywhere", i == 0}, {"remove_originals", i == 2}};
+          ctx_.send("/api/archives/pack", body, [this, target](json out) {
+            ctx_.notify("packing " + target + " on " + out.value("node", "") +
+                        ": job #" + std::to_string(out.value("job_id", 0)) + " in the Jobs tab");
+            follow_ = 5;
+          });
         });
   }
 
@@ -1237,8 +1240,8 @@ class TreeView : public View {
         "then marked for deletion (you confirm that in the Marked tab).",
         [this, target] {
           ctx_.send("/api/archives/unpack", {{"vpath", target}}, [this, target](json out) {
-            ctx_.notify("unpacking " + target + " on " + out.value("node", "") +
-                        " in the background (see the status line)");
+            ctx_.notify("unpacking " + target + " on " + out.value("node", "") + ": job #" +
+                        std::to_string(out.value("job_id", 0)) + " in the Jobs tab");
             follow_ = 5;
           });
         });
@@ -2326,7 +2329,7 @@ class NodesView : public View {
   bool on_event(const Event& e) {
     if (key(e, "r")) return refresh(), true;
     if (key(e, "S")) {
-      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan of all nodes queued"); });
+      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan of all nodes: see the Jobs tab (c cancels it)"); });
       return true;
     }
     if (key(e, "n")) {
@@ -2411,7 +2414,7 @@ class NodesView : public View {
     if (key(e, "s")) {
       auto targets = scan_targets(name);
       ctx_.send("/api/scan", {{"nodes", targets}}, [this, targets](json) {
-        ctx_.notify("scan of " + joined(targets) + " queued");
+        ctx_.notify("scan of " + joined(targets) + ": see the Jobs tab (c cancels it)");
         marked_.clear();
         rebuild_labels();
       });
@@ -2479,7 +2482,7 @@ class NodesView : public View {
     if (key(e, "w")) {   // discover new files only
       auto targets = scan_targets(name);
       ctx_.send("/api/scan", {{"nodes", targets}, {"new_only", true}}, [this, targets](json) {
-        ctx_.notify("scan for new files on " + joined(targets) + " queued");
+        ctx_.notify("scan for new files on " + joined(targets) + ": see the Jobs tab");
         marked_.clear();
         rebuild_labels();
       });

@@ -14,6 +14,7 @@ is marked for deletion like any copy, so that the user confirms it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -86,16 +87,17 @@ def contains_packed(conn: sqlite3.Connection, vdir: str) -> list[str]:
 # --- the change log ---------------------------------------------------------------
 
 
-def _log_pack(conn: sqlite3.Connection, row: sqlite3.Row, members: list[tuple[str, int]]) -> None:
+def _log_pack(conn: sqlite3.Connection, row: sqlite3.Row,
+              members: list[tuple[str, int, int]]) -> None:
     me = index.self_id(conn)
     index.append_change(conn, "archive", {
         "op": "pack", "dir": row["dir_path"], "file": archive_vpath(row["dir_path"]),
         "files": row["files"], "bytes": row["bytes"], "updated": row["updated"],
-        "updated_by": me})
+        "updated_by": me, "cleanup": row["cleanup"], "targets": json.loads(row["targets"])})
     for i in range(0, len(members), CHUNK):
         index.append_change(conn, "archive", {
             "op": "members", "dir": row["dir_path"], "updated": row["updated"],
-            "updated_by": me, "entries": [[p, s] for p, s in members[i:i + CHUNK]]})
+            "updated_by": me, "entries": [[p, s, h] for p, s, h in members[i:i + CHUNK]]})
 
 
 def _log_remove(conn: sqlite3.Connection, vdir: str, ts: int) -> None:
@@ -111,26 +113,42 @@ def apply_change(conn: sqlite3.Connection, d: dict) -> None:
     if op == "members":
         if row is not None and (row["updated"], row["updated_by"]) == stamp and row["present"]:
             conn.executemany(
-                "INSERT OR REPLACE INTO archive_members(archive_id, path, size) VALUES (?, ?, ?)",
-                [(row["id"], p, s) for p, s in d["entries"]])
+                "INSERT OR REPLACE INTO archive_members(archive_id, path, size, hash)"
+                " VALUES (?, ?, ?, ?)",
+                [(row["id"], e[0], e[1], e[2] if len(e) > 2 else None) for e in d["entries"]])
         return
     if row is not None and stamp <= (row["updated"], row["updated_by"]):
         return                                  # we know something newer
     if op == "pack":
         fid = index.ensure_file(conn, d["file"])
+        targets = json.dumps(d.get("targets") or [])
+        cleanup = int(bool(d.get("cleanup")))
         if row is None:
             conn.execute("INSERT INTO archives(dir_path, file_id, present, files, bytes, updated,"
-                         " updated_by) VALUES (?, ?, 1, ?, ?, ?, ?)",
-                         (d["dir"], fid, d["files"], d["bytes"], *stamp))
+                         " updated_by, cleanup, targets) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                         (d["dir"], fid, d["files"], d["bytes"], *stamp, cleanup, targets))
         else:
             conn.execute("UPDATE archives SET file_id = ?, present = 1, files = ?, bytes = ?,"
-                         " updated = ?, updated_by = ? WHERE id = ?",
-                         (fid, d["files"], d["bytes"], *stamp, row["id"]))
+                         " updated = ?, updated_by = ?, cleanup = ?, targets = ? WHERE id = ?",
+                         (fid, d["files"], d["bytes"], *stamp, cleanup, targets, row["id"]))
             conn.execute("DELETE FROM archive_members WHERE archive_id = ?", (row["id"],))
+        if cleanup:
+            _todo(conn, d["dir"], d.get("targets") or [])
     elif op == "remove" and row is not None:
         conn.execute("UPDATE archives SET present = 0, updated = ?, updated_by = ? WHERE id = ?",
                      (*stamp, row["id"]))
         conn.execute("DELETE FROM archive_members WHERE archive_id = ?", (row["id"],))
+        conn.execute("DELETE FROM archive_todo WHERE dir_path = ?", (d["dir"],))
+
+
+def _todo(conn: sqlite3.Connection, vdir: str, targets: list[str]) -> None:
+    """What this server must still do for a directory packed everywhere: copy the archive to
+    its nodes that held the directory, and remove the originals there."""
+    mine = index.owned_node_ids(conn)
+    for node_id in targets:
+        if node_id in mine:
+            conn.execute("INSERT OR IGNORE INTO archive_todo(dir_path, node_id, stage, updated)"
+                         " VALUES (?, ?, 'copy', ?)", (vdir, node_id, db.now()))
 
 
 # --- the tools ------------------------------------------------------------------------
@@ -239,9 +257,14 @@ def choose_node(conn: sqlite3.Connection, cfg: Config, vdir: str,
         if row["id"] not in {c["id"] for c in cands}:
             raise ArchiveError(f"node {row['name']} does not hold every file below {vdir}")
         return row
+    # On a node of the server asked, if one holds it; otherwise on any online one (the
+    # request is then handed to the server that owns it).
+    online = [c for c in cands if c["online"]]
+    if not online:
+        raise ArchiveError(f"no node that holds every file below {vdir} is online")
     me = index.self_id(conn)
-    mine = [c for c in cands if c["owner_id"] == me]
-    return (mine or cands)[0]
+    mine = [c for c in online if c["owner_id"] == me]
+    return (mine or online)[0]
 
 
 # --- packing --------------------------------------------------------------------------
@@ -261,10 +284,38 @@ def check_packable(conn: sqlite3.Connection, vdir: str) -> None:
         raise ArchiveError(f"{archive_vpath(vdir)} exists already")
 
 
+def member_hash(path: Path | str) -> int:
+    """A 64-bit stand-in for a file's content (the start of its blake2b hash), as the member
+    lists carry it: enough to check a loose file against the archive before removing it."""
+    n = int(hash_file(path).split(":", 1)[1][:16], 16)
+    return n - (1 << 64) if n >= 1 << 63 else n
+
+
+def _hashed_walk(src: Path, stop: StopFn | None, say: ProgressFn) -> list[tuple[str, int, int]]:
+    members = []
+    walked = _walk(src)
+    for i, (rel, size) in enumerate(walked):
+        check(stop)
+        if i % 200 == 0:
+            say(f"reading the files: {i:,} of {len(walked):,}")
+        try:
+            members.append((rel, size, member_hash(src / rel)))
+        except OSError as e:
+            raise ArchiveError(f"cannot read {rel}: {e}") from None
+    return members
+
+
 def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = None,
          remove_originals: bool = False, progress: ProgressFn | None = None,
-         stop: StopFn | None = None) -> dict:
-    """Pack ``vdir`` on a node of this server. The caller holds the server lock."""
+         stop: StopFn | None = None, everywhere: bool = False) -> dict:
+    """Pack ``vdir`` on a node of this server. The caller holds the server lock.
+
+    ``everywhere``: the archive is then copied to every node that held the directory and the
+    originals are removed there too, each node's own server doing it once the archive has
+    arrived and each file has been checked against it (see ``followup``). A stop request
+    before the archive is registered leaves nothing behind; after that it only
+    ends the optional removal of the originals.
+    """
     say = progress or (lambda _m: None)
     mksquashfs, unsquashfs = _need_tools()
     vdir = paths.normalize(vdir)
@@ -283,10 +334,10 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
         raise ArchiveError(f"{dst} exists already")
     part = dst.with_name(dst.name + ".part")
     say(f"packing {vdir}: listing the files")
-    members = _walk(src)
+    members = _hashed_walk(src, stop, lambda m: say(f"packing {vdir}: {m}"))
     if not members:
         raise ArchiveError(f"{vdir} holds no files")
-    total = sum(s for _, s in members)
+    total = sum(s for _, s, _ in members)
     try:
         say(f"packing {vdir}: {len(members):,} files, {total:,} bytes")
         for comp in ("zstd", "xz", "gzip"):
@@ -301,10 +352,11 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
             raise ArchiveError(f"mksquashfs failed: {err[-300:]}")
         say(f"packing {vdir}: checking the archive")
         listed = _listing(unsquashfs, part)
-        missing = [rel for rel, _ in members if rel not in listed]
+        missing = [rel for rel, _, _ in members if rel not in listed]
         if missing:
             raise ArchiveError(f"the archive lacks {len(missing)} file(s), e.g. {missing[0]}; "
                                "nothing was changed")
+        check(stop)
         os.replace(part, dst)
     except BaseException:
         part.unlink(missing_ok=True)
@@ -312,19 +364,28 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
     say(f"packing {vdir}: recording the archive")
     st = dst.stat()
     digest = hash_file(dst)
+    # The nodes that hold the directory now (any server's) are where the archive must go.
+    cond, args = paths.subtree_sql(vdir, "d.path")
+    targets = sorted({r[0] for r in conn.execute(
+        "SELECT DISTINCT c.node_id FROM files f JOIN dirs d ON d.id = f.dir_id"
+        f" JOIN copies c ON c.file_id = f.id WHERE {cond}", args)} - {target["id"]}) \
+        if everywhere else []
     with db.transaction(conn, "packing a directory"):
         fid = index.ensure_file(conn, archive_vpath(vdir))
         ts = db.now()
         me = index.self_id(conn)
         conn.execute("DELETE FROM archives WHERE dir_path = ?", (vdir,))
         conn.execute("INSERT INTO archives(dir_path, file_id, present, files, bytes, updated,"
-                     " updated_by) VALUES (?, ?, 1, ?, ?, ?, ?)",
-                     (vdir, fid, len(members), total, ts, me))
+                     " updated_by, cleanup, targets) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                     (vdir, fid, len(members), total, ts, me, int(everywhere),
+                      json.dumps(targets)))
         row = get(conn, vdir)
-        conn.executemany("INSERT INTO archive_members(archive_id, path, size) VALUES (?, ?, ?)",
-                         [(row["id"], p, s) for p, s in members])
+        conn.executemany("INSERT INTO archive_members(archive_id, path, size, hash)"
+                         " VALUES (?, ?, ?, ?)", [(row["id"], p, s, h) for p, s, h in members])
         index.record_copy(conn, fid, target["id"], st.st_size, st.st_mtime_ns, digest)
         _log_pack(conn, row, members)
+        if everywhere:
+            _todo(conn, vdir, targets)
         # The loose files are not tracked any more: the archive stands for them.
         cond, args = paths.subtree_sql(vdir, "d.path")
         loose = conn.execute(
@@ -336,32 +397,138 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
                 index.forget_copy(conn, r["fid"], r["nid"])
     say(f"packing {vdir}: giving the database's free space back")
     reclaimed = db.reclaim(conn)
-    removed = 0
-    if remove_originals:
-        say(f"packing {vdir}: removing the original files")
-        removed = _remove_originals(src, [p for p, _ in members])
+    removed = kept = 0
+    if remove_originals or everywhere:
+        say(f"packing {vdir}: removing the original files (each is checked against the archive)")
+        removed, kept = remove_verified(src, members, stop)
     say(f"packed {vdir}")
     return {"dir": vdir, "archive": archive_vpath(vdir), "node": target["name"],
             "files": len(members), "bytes": total, "archive_bytes": st.st_size,
-            "originals_removed": removed, "originals_kept": not remove_originals,
-            "database_reclaimed": reclaimed}
+            "originals_removed": removed, "originals_kept": not (remove_originals or everywhere),
+            "originals_left": kept, "targets": len(targets), "database_reclaimed": reclaimed}
 
 
-def _remove_originals(src: Path, rels: list[str]) -> int:
-    """Delete exactly the files that went into the archive, then the folders left empty."""
-    n = 0
-    for rel in rels:
+def remove_verified(src: Path, members: list[tuple[str, int, int | None]],
+                    stop: StopFn | None = None) -> tuple[int, int]:
+    """Delete the files of ``members`` found below ``src`` that are exactly what the archive
+    holds (same size, same content hash), then the folders left empty. A file that differs,
+    or is not in the archive, stays. Stopping between two files is safe: what is gone was
+    checked, what is left is simply still there. Returns (removed, left)."""
+    removed = left = 0
+    for rel, size, h in members:
+        check(stop)
+        f = src / rel
         try:
-            os.unlink(src / rel)
-            n += 1
+            if not f.is_file() or f.is_symlink():
+                continue                   # not there (a node holds some of the files only)
+            if f.stat().st_size != size or h is None or member_hash(f) != h:
+                left += 1
+                continue
+            f.unlink()
+            removed += 1
         except OSError as e:
-            log.warning("could not remove %s: %s", src / rel, e)
+            log.warning("could not remove %s: %s", f, e)
+            left += 1
     for base, _dirs, _files in os.walk(src, topdown=False):
         try:
             os.rmdir(base)          # refuses unless empty: only what the archive replaced goes
         except OSError:
             pass
-    return n
+    return removed, left
+
+
+# --- the other nodes of a directory packed everywhere ----------------------------------
+
+
+def cleanup_node(conn: sqlite3.Connection, cfg: Config, vdir: str, node_id: str,
+                 progress: ProgressFn | None = None, stop: StopFn | None = None) -> dict:
+    """On a node of this server that holds the archive: remove the loose files it still has
+    (checked one by one against the archive), forget them in the index and give the
+    database's free space back."""
+    say = progress or (lambda _m: None)
+    row = get(conn, vdir)
+    if row is None:
+        raise ArchiveError(f"{vdir} is no longer packed")
+    root = _local_roots(conn, cfg).get(node_id)
+    if root is None:
+        raise ArchiveError("the node is offline")
+    cur = index.current_version(conn, row["file_id"])
+    mine = conn.execute("SELECT hash FROM copies WHERE file_id = ? AND node_id = ?"
+                        " AND state = 'present'", (row["file_id"], node_id)).fetchone()
+    if cur is None or mine is None or mine["hash"] != cur.hash:
+        raise ArchiveError("the archive has not arrived on this node (or differs): "
+                           "nothing was removed")
+    members = [(r["path"], r["size"], r["hash"]) for r in conn.execute(
+        "SELECT path, size, hash FROM archive_members WHERE archive_id = ? ORDER BY path",
+        (row["id"],))]
+    if any(h is None for _, _, h in members):
+        raise ArchiveError("the archive was made by an older version (no checksums): "
+                           "unpack it and pack it again")
+    src = paths.to_physical(root, vdir)
+    say(f"removing the originals of {vdir} (checked against the archive)")
+    removed = left = 0
+    if src.is_dir():
+        removed, left = remove_verified(src, members, stop)
+    cond, args = paths.subtree_sql(vdir, "d.path")
+    with db.transaction(conn, "forgetting the originals"):
+        for r in conn.execute(
+                "SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id JOIN copies c"
+                f" ON c.file_id = f.id WHERE c.node_id = ? AND {cond}", (node_id, *args)).fetchall():
+            index.forget_copy(conn, r[0], node_id)
+    reclaimed = db.reclaim(conn)
+    return {"dir": vdir, "removed": removed, "left": left, "database_reclaimed": reclaimed}
+
+
+def followup(conn: sqlite3.Connection, cfg: Config) -> int:
+    """Advance what is owed for directories packed everywhere, for this server's nodes:
+    copy the archive to a node that lacks it, then remove the originals there. Makes the
+    (visible, cancelable) jobs; returns how many it made."""
+    from . import jobs
+
+    made = 0
+    online = {loc.node_id for loc in nodes.discover(conn, cfg).online}
+    for t in conn.execute("SELECT * FROM archive_todo ORDER BY dir_path").fetchall():
+        row = get(conn, t["dir_path"])
+        if row is None or t["node_id"] not in online:
+            if row is None:
+                conn.execute("DELETE FROM archive_todo WHERE dir_path = ? AND node_id = ?",
+                             (t["dir_path"], t["node_id"]))
+            continue
+        vdir, node_id = t["dir_path"], t["node_id"]
+        name = conn.execute("SELECT name FROM nodes WHERE id = ?", (node_id,)).fetchone()[0]
+        if t["stage"] == "clean":
+            job = conn.execute("SELECT status FROM jobs WHERE id = ?", (t["job_id"],)).fetchone()
+            if job is None or job["status"] == "done":
+                conn.execute("DELETE FROM archive_todo WHERE dir_path = ? AND node_id = ?",
+                             (vdir, node_id))
+            elif job["status"] in ("failed", "cancelled"):
+                conn.execute("UPDATE archive_todo SET stage = 'copy', job_id = NULL WHERE"
+                             " dir_path = ? AND node_id = ?", (vdir, node_id))
+            continue
+        cur = index.current_version(conn, row["file_id"])
+        have = conn.execute("SELECT hash FROM copies WHERE file_id = ? AND node_id = ?"
+                            " AND state = 'present'", (row["file_id"], node_id)).fetchone()
+        if cur is not None and have is not None and have["hash"] == cur.hash:
+            with db.transaction(conn, "removing the originals"):
+                job_id = jobs.create_tool_job(
+                    conn, "pack", f"remove the original files of {vdir} on {name}",
+                    [("clean", vdir, node_id, {})])
+                conn.execute("UPDATE archive_todo SET stage = 'clean', job_id = ?, updated = ?"
+                             " WHERE dir_path = ? AND node_id = ?",
+                             (job_id, db.now(), vdir, node_id))
+            made += 1
+        elif not conn.execute(
+                "SELECT 1 FROM job_items i JOIN jobs j ON j.id = i.job_id WHERE i.vpath = ?"
+                " AND i.dst_node = ? AND i.op = 'copy' AND i.state IN ('pending', 'running')"
+                " AND j.status IN ('pending', 'running', 'waiting')",
+                (archive_vpath(vdir), node_id)).fetchone():
+            try:
+                rep = jobs.create_transfer_job(conn, [archive_vpath(vdir)], None, name, None)
+            except jobs.JobError as e:
+                log.warning("cannot copy the archive of %s to %s: %s", vdir, name, e)
+                continue
+            made += rep.job_id is not None
+    return made
 
 
 # --- unpacking and dropping -----------------------------------------------------------
@@ -377,6 +544,7 @@ def _retire(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     conn.execute("UPDATE archives SET present = 0, updated = ?, updated_by = ? WHERE id = ?",
                  (ts, index.self_id(conn), row["id"]))
     conn.execute("DELETE FROM archive_members WHERE archive_id = ?", (row["id"],))
+    conn.execute("DELETE FROM archive_todo WHERE dir_path = ?", (row["dir_path"],))
     _log_remove(conn, row["dir_path"], ts)
     _mark_archive_for_deletion(conn, row["file_id"])
 

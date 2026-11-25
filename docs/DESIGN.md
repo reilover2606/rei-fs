@@ -652,6 +652,31 @@ itself (its path is in `info`) and call `sync` to have it looked at now:
 
 Paths are relative to the app's directory; `..` and symlinks that lead out are refused.
 
+### 5.19 Packing everywhere, and scans, packing and unpacking as jobs
+
+**Jobs.** A scan the user asks for, a pack and an unpack are jobs (`jobs.kind` `scan`, `pack`,
+`unpack`; item operations `scan`, `pack`, `unpack`, `clean`; `job_items.params` holds the
+options). They show in the Jobs tab with their progress in the item's message and can be cancelled
+there (`c`) at any moment. The runner looks for the cancellation about once a second, and the
+tools look between their steps, and each leaves nothing half-done: a stopped scan marks nothing
+missing, packing removes its `.part` file and registers nothing, unpacking removes its scratch
+folder and, once it starts moving the extracted files into place, finishes that (a few renames)
+first, and removing originals stops between two files (what is gone was checked). Cancelling after
+the archive is registered ends only the optional removal. The scans the server starts by itself
+(a due directory, a node coming back) stay plain tasks, out of the list.
+
+**Pack everywhere** (Tree `z`, first choice; `reifs archive pack --everywhere`). The server asked
+packs on its own node if one holds the directory, otherwise the request goes to the server of
+another online node that holds all of it. When the archive is registered the record says which
+other nodes held the directory (`archives.targets`, `cleanup`). Every server that owns such a node
+then owes two things (`archive_todo`, advanced every 15 seconds by `archives.followup`): copy the
+archive to the node (an ordinary visible copy job), and, once the node has it, remove the
+original files there (a `clean` job). Each file is removed only if its size and content hash match
+the archive's member list (the member lists carry a 64-bit hash of every file): a file that was
+changed since, or is not in the archive, stays, and the job says how many. The index forgets the
+loose copies, empty folders go, and the server's database is given its free space back
+(`db.reclaim`). A node that is offline is done when it is back.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

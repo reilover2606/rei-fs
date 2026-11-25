@@ -226,9 +226,13 @@ def cmd_archive(args) -> None:
         with ServerLock(cfg.home):
             if act == "pack":
                 res = archives.pack(conn, cfg, args.vpath, args.node, args.remove_originals,
-                                    progress=progress)
+                                    progress=progress, everywhere=args.everywhere)
                 print(f"Packed {res['files']:,} files of {res['dir']} on {res['node']} into "
                       f"{res['archive']} ({res['archive_bytes'] / 1e6:.1f} MB).")
+                if args.everywhere:
+                    print(f"The archive will be copied to {res['targets']} other node(s) and the "
+                          "originals removed there once it has arrived (the running server does "
+                          "this; see the Jobs tab).")
                 if res["originals_kept"]:
                     print("The original files were kept: remove them yourself once you are happy "
                           "with the archive (or pack with --remove-originals).")
@@ -1183,6 +1187,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--node", help="node to pack on / unpack to (default: one holding everything)")
     s.add_argument("--remove-originals", action="store_true",
                    help="pack: delete the files that went into the archive, after checking it")
+    s.add_argument("--everywhere", action="store_true",
+                   help="pack: also copy the archive to every node that holds the directory and "
+                        "remove the originals there (each file is checked against the archive)")
     s.set_defaults(func=cmd_archive)
 
     s = sub.add_parser("scan", help="scan online owned nodes for changes")

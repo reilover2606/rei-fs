@@ -483,9 +483,26 @@ class Api:
                            "due": bool(body.get("due")),
                            "new_only": bool(body.get("new_only"))})
         if local or not remote:
-            self._need_worker().request_scan(local or None, bool(body.get("verify")),
-                                             full=not body.get("due"),
-                                             new_only=bool(body.get("new_only")))
+            if body.get("due"):    # the automatic kind: not worth a job
+                self._need_worker().request_scan(local or None, bool(body.get("verify")),
+                                                 full=False, new_only=bool(body.get("new_only")))
+                return {"ok": True, "queued": True}
+            # A scan the user asks for is a job: it shows in the job list and can be cancelled.
+            params = {"verify": bool(body.get("verify")), "new_only": bool(body.get("new_only")),
+                      "full": True}
+            names = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM nodes")}
+            targets = local or [loc.node_id for loc in nodes.discover(conn, self.cfg).online]
+            fresh = [n for n in targets if jobs.active_tool_item(conn, "scan", "/", n) is None]
+            job_id = None
+            if fresh:
+                kind = "verify" if params["verify"] else "new files of" if params["new_only"] else ""
+                with db.transaction(conn):
+                    job_id = jobs.create_tool_job(
+                        conn, "scan", f"scan {kind + ' ' if kind else ''}"
+                        + ", ".join(names.get(n, n) for n in fresh),
+                        [("scan", "/", n, params) for n in fresh])
+                self._need_worker().request_jobs()
+            return {"ok": True, "queued": True, "job_id": job_id}
         return {"ok": True, "queued": True}
 
     def tolerance_get(self, conn, q, body, **_):
@@ -618,16 +635,23 @@ class Api:
             vdir = paths.normalize(body.get("vpath", ""))
             archives.check_packable(conn, vdir)
             target = archives.choose_node(conn, self.cfg, vdir, body.get("node") or None)
+            flags = {"remove_originals": bool(body.get("remove_originals")),
+                     "everywhere": bool(body.get("everywhere"))}
             if target["owner_id"] != nodes.self_id(conn):
                 return peers.forward(conn, target["owner_id"], "POST", "/api/archives/pack",
-                                     {"vpath": vdir, "node": target["id"],
-                                      "remove_originals": bool(body.get("remove_originals"))})
+                                     {"vpath": vdir, "node": target["id"], **flags})
             archives._need_tools()
+            job_id = jobs.active_tool_item(conn, "pack", vdir, target["id"])
+            if job_id is None:
+                with db.transaction(conn):
+                    job_id = jobs.create_tool_job(
+                        conn, "pack", f"pack {vdir} on {target['name']}"
+                        + (" and everywhere it is held" if flags["everywhere"] else ""),
+                        [("pack", vdir, target["id"], flags)])
         except (archives.ArchiveError, paths.VPathError, nodes.NodeError) as e:
             raise ApiError(400, str(e)) from None
-        self._need_worker().request_archive("pack", vdir, target["id"],
-                                            bool(body.get("remove_originals")))
-        return {"ok": True, "queued": True, "node": target["name"]}
+        self._need_worker().request_jobs()
+        return {"ok": True, "queued": True, "job_id": job_id, "node": target["name"]}
 
     def archive_unpack(self, conn, q, body, **_):
         try:
@@ -646,10 +670,16 @@ class Api:
                 return peers.forward(conn, held[0]["owner_id"], "POST", "/api/archives/unpack",
                                      {"vpath": vdir, "node": held[0]["id"]})
             archives._need_tools()
+            node_id = body.get("node") or mine[0]["id"]
+            job_id = jobs.active_tool_item(conn, "unpack", vdir, node_id)
+            if job_id is None:
+                with db.transaction(conn):
+                    job_id = jobs.create_tool_job(conn, "unpack", f"unpack {vdir}",
+                                                  [("unpack", vdir, node_id, {})])
         except (archives.ArchiveError, paths.VPathError, nodes.NodeError) as e:
             raise ApiError(400, str(e)) from None
-        self._need_worker().request_archive("unpack", vdir, body.get("node") or mine[0]["id"])
-        return {"ok": True, "queued": True, "node": mine[0]["name"]}
+        self._need_worker().request_jobs()
+        return {"ok": True, "queued": True, "job_id": job_id, "node": mine[0]["name"]}
 
     def archive_drop(self, conn, q, body, **_):
         try:

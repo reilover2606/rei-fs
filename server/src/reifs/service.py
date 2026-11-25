@@ -37,6 +37,7 @@ RELAY_POLL_SECONDS = 5
 SCHEDULE_CHECK_SECONDS = 15   # how often scheduled syncs are looked at (a late node is caught up)
 HOUSEKEEPING_SECONDS = 600
 SYNC_SECONDS = 30
+FOLLOWUP_SECONDS = 15   # directories packed everywhere: copy the archive, remove the originals
 SYNC_CHECK_SECONDS = 3   # synchronous files: look at the change log this often
 PLAN_SECONDS = 600     # replication planning, at least this often
 PLAN_CHECK_SECONDS = 60  # ...and when the log changed (local or peer facts)
@@ -101,11 +102,6 @@ class Worker:
     def request_plan(self) -> None:
         self._enqueue(("plan",))
 
-    def request_archive(self, op: str, vdir: str, node: str | None,
-                        remove_originals: bool = False) -> None:
-        """Pack a directory into an archive, or unpack one."""
-        self._enqueue(("archive", op, vdir, node, remove_originals))
-
     def request_sync(self, full: bool = False) -> None:
         """Bring the copies of synchronous files up to date (a full pass looks at all of them)."""
         self._enqueue(("sync", full))
@@ -160,6 +156,7 @@ class Worker:
         last_plan = never
         last_plan_check = never
         last_sync_check = never
+        last_followup = never
         last_full_sync = never
         synced_at_seq = None
         planned_at_seq = None
@@ -206,6 +203,11 @@ class Worker:
                         elif seq != synced_at_seq:
                             synced_at_seq = seq
                             self.request_sync()
+                    if now - last_followup >= FOLLOWUP_SECONDS:
+                        last_followup = now
+                        if conn.execute("SELECT 1 FROM archive_todo LIMIT 1").fetchone():
+                            if archives.followup(conn, self.cfg):
+                                self.request_jobs()
                     if now - last_jobs >= JOBS_SECONDS:
                         last_jobs = now
                         if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
@@ -276,11 +278,8 @@ class Worker:
             except Exception as e:  # noqa: BLE001
                 log.warning("synchronizing failed: %s", e)
             return
-        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups",
-                 "archive": "packing" if kind == "archive" and task[1] == "pack"
-                 else "unpacking"}[kind]
-        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups",
-                      "archive": state}[kind])
+        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups"}[kind]
+        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups"}[kind])
         self._set(state=state, detail="", since=db.now())
         if kind == "plan":
             started = time.monotonic()
@@ -307,27 +306,7 @@ class Worker:
         stop = self.stop_requested.is_set
         try:
             with ServerLock(self.cfg.home):
-                if kind == "archive":
-                    op, vdir, node, remove = task[1:]
-                    if op == "pack":
-                        res = archives.pack(conn, self.cfg, vdir, node, remove,
-                                            progress=self._progress, stop=stop)
-                        msg = (f"packed {vdir}: {res['files']:,} files into "
-                               f"{res['archive_bytes'] / 1e6:.1f} MB")
-                        msg += (f"; {res['originals_removed']:,} original files removed"
-                                if remove else "; the original files were kept")
-                        if res["database_reclaimed"]:
-                            msg += (f"; {res['database_reclaimed'] / 1e6:.1f} MB of database "
-                                    "space given back")
-                    else:
-                        res = archives.unpack(conn, self.cfg, vdir, node,
-                                              progress=self._progress, stop=stop)
-                        msg = f"unpacked {vdir}: {res['files']:,} files"
-                    self._set(last_result=msg, last_error="")
-                    self.request_plan()
-                    if self.syncer is not None:
-                        self.syncer.request_poke()
-                elif kind == "scan":
+                if kind == "scan":
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
                         progress=self._scan_progress, stop=stop, full=task[3],
@@ -357,8 +336,6 @@ class Worker:
                         self.syncer.request_poke()
         except Stopped:
             self._set(last_result=f"{kind} stopped on request")
-        except archives.ArchiveError as e:
-            self._set(last_error=str(e))
         except LockError as e:
             self._set(last_error=str(e))
         except Exception as e:  # noqa: BLE001 - report, keep serving

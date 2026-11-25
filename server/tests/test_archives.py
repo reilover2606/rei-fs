@@ -187,3 +187,128 @@ def test_an_old_database_is_converted_once(tmp_path, capsys):
     db.make_incremental(conn, tmp_path / "old.db")
     assert db.is_incremental(conn)
     assert conn.execute("SELECT x FROM t").fetchone()[0] == 1
+
+
+# --- packing everywhere, and the jobs ---------------------------------------------------
+
+
+def two_nodes(env):
+    _, ssd = env.add_node("ssd")
+    for base in (env.root, ssd):
+        for i, name in enumerate(("a.c", "sub/b.c", "sub/deep/c.txt")):
+            write(base / "src" / "foo" / name, f"content {i}" * 10, mtime=1_000_000)
+    env.scan()
+    return ssd
+
+
+def run_jobs(env):
+    from reifs import runner
+    return runner.run_jobs(env.conn, env.cfg)
+
+
+def test_pack_everywhere_copies_the_archive_and_removes_the_originals_after_checking(env):
+    ssd = two_nodes(env)
+    write(ssd / "src" / "foo" / "sub" / "b.c", "changed on the other node")    # differs
+    env.scan()
+    res = archives.pack(env.conn, env.cfg, "/src/foo", "srv", everywhere=True)
+    assert res["originals_removed"] == 3 and res["targets"] == 1
+    assert not (env.root / "src" / "foo").exists()
+    assert (env.root / "src" / "foo.sqsh").exists()
+    # the other server (here: the same one) owes a copy of the archive, then a removal
+    assert env.conn.execute("SELECT stage FROM archive_todo").fetchone()[0] == "copy"
+    assert archives.followup(env.conn, env.cfg) == 1
+    run_jobs(env)                                                  # copies the archive to ssd
+    assert (ssd / "src" / "foo.sqsh").exists()
+    write(ssd / "src" / "foo" / "mine.txt", "made there meanwhile")           # not in the archive
+    assert archives.followup(env.conn, env.cfg) == 1
+    assert env.conn.execute("SELECT stage FROM archive_todo").fetchone()[0] == "clean"
+    run_jobs(env)                                                  # removes what is verified
+    # identical files are gone; the changed one and the extra one are kept
+    assert (ssd / "src" / "foo" / "sub" / "b.c").read_text() == "changed on the other node"
+    assert (ssd / "src" / "foo" / "mine.txt").exists()
+    assert not (ssd / "src" / "foo" / "a.c").exists()
+    assert not (ssd / "src" / "foo" / "sub" / "deep").exists()
+    archives.followup(env.conn, env.cfg)
+    assert env.conn.execute("SELECT COUNT(*) FROM archive_todo").fetchone()[0] == 0
+    # the index no longer tracks the loose files, on any node
+    assert vpaths(env) == ["/src/foo.sqsh"]
+
+
+def test_a_removal_is_refused_where_the_archive_has_not_arrived(env):
+    two_nodes(env)
+    archives.pack(env.conn, env.cfg, "/src/foo", "srv", everywhere=True)
+    ssd = [r["id"] for r in env.conn.execute("SELECT id FROM nodes WHERE name = 'ssd'")][0]
+    with pytest.raises(archives.ArchiveError, match="not arrived"):
+        archives.cleanup_node(env.conn, env.cfg, "/src/foo", ssd)
+
+
+def test_the_server_asked_packs_on_its_own_node_when_it_holds_the_directory(env):
+    two_nodes(env)
+    assert archives.choose_node(env.conn, env.cfg, "/src/foo", None)["name"] == "srv"
+
+
+def test_a_pack_job_can_be_cancelled_in_the_middle_and_leaves_nothing(env, monkeypatch):
+    from reifs import jobs, runner
+    monkeypatch.setattr(runner, "CANCEL_LOOK_SECONDS", 0)
+    tree(env)
+    node = env.conn.execute("SELECT id FROM nodes WHERE name = 'srv'").fetchone()[0]
+    with db.transaction(env.conn):
+        job_id = jobs.create_tool_job(env.conn, "pack", "pack /src/foo",
+                                      [("pack", "/src/foo", node, {})])
+    real = archives._run
+
+    def cancel_then_run(cmd, stop, what):
+        jobs.cancel_job(env.conn, job_id)          # the user presses c while mksquashfs runs
+        return real(cmd, stop, what)
+
+    monkeypatch.setattr(archives, "_run", cancel_then_run)
+    run_jobs(env)
+    state = env.conn.execute("SELECT state FROM job_items WHERE job_id = ?", (job_id,)).fetchone()[0]
+    assert state == "cancelled"
+    assert not (env.root / "src" / "foo.sqsh").exists()
+    assert not list((env.root / "src").glob("*.part"))
+    assert archives.get(env.conn, "/src/foo") is None
+    assert (env.root / "src" / "foo" / "a.c").exists()               # nothing was touched
+    assert env.conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()[0] == "cancelled"
+
+
+def test_a_scan_job_can_be_cancelled_before_it_runs_and_while_it_runs(env, monkeypatch):
+    from reifs import jobs, runner, scanner
+    monkeypatch.setattr(runner, "CANCEL_LOOK_SECONDS", 0)
+    for i in range(30):
+        write(env.root / "d" / f"f{i}.txt", str(i), mtime=1_000_000)
+    node = env.conn.execute("SELECT id FROM nodes WHERE name = 'srv'").fetchone()[0]
+    with db.transaction(env.conn):
+        first = jobs.create_tool_job(env.conn, "scan", "scan srv", [("scan", "/", node, {"full": True})])
+    jobs.cancel_job(env.conn, first)
+    run_jobs(env)
+    assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0     # never ran
+    with db.transaction(env.conn):
+        second = jobs.create_tool_job(env.conn, "scan", "scan srv", [("scan", "/", node, {"full": True})])
+    real = scanner.hash_file
+    seen = []
+
+    def cancel_midway(*a, **kw):
+        seen.append(1)
+        if len(seen) == 5:
+            jobs.cancel_job(env.conn, second)       # the user presses c while it hashes
+        return real(*a, **kw)
+
+    monkeypatch.setattr(scanner, "hash_file", cancel_midway)
+    run_jobs(env)
+    assert env.conn.execute("SELECT state FROM job_items WHERE job_id = ?", (second,)).fetchone()[0] == "cancelled"
+    assert len(seen) < 30                                   # it stopped
+    assert env.conn.execute("SELECT COUNT(*) FROM copies WHERE state = 'missing'").fetchone()[0] == 0
+
+
+def test_an_unpack_job_runs(env):
+    from reifs import jobs
+    tree(env)
+    pack(env, remove_originals=True)
+    node = env.conn.execute("SELECT id FROM nodes WHERE name = 'srv'").fetchone()[0]
+    with db.transaction(env.conn):
+        job_id = jobs.create_tool_job(env.conn, "unpack", "unpack /src/foo",
+                                      [("unpack", "/src/foo", node, {})])
+    run_jobs(env)
+    assert env.conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()[0] == "done"
+    assert (env.root / "src" / "foo" / "a.c").exists() and archives.get(env.conn, "/src/foo") is None
