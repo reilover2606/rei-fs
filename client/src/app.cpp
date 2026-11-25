@@ -12,6 +12,8 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/string.hpp>
+#include <ftxui/screen/terminal.hpp>
 
 #include "format.hpp"
 #include "profiles.hpp"
@@ -510,7 +512,33 @@ class App {
   void switch_to(int index) {
     if (index < 0 || index >= static_cast<int>(views_.size())) return;
     tab_ = index;
+    help_offset_ = 0;
     views_[tab_]->refresh();
+  }
+
+  // The part of the key list that fits in `width` columns, starting `offset` columns in
+  // (clamped), with arrows where more is hidden. [ and ] move it.
+  static std::string help_window(const std::string& full, int width, int& offset) {
+    int total = ftxui::string_width(full);
+    if (total <= width || width < 12) {
+      offset = 0;
+      return full;
+    }
+    offset = std::max(0, std::min(offset, total - (width - 2)));
+    std::string out;
+    int col = 0, used = 0;
+    for (const auto& g : ftxui::Utf8ToGlyphs(full)) {
+      int w = ftxui::string_width(g);
+      if (col < offset) {
+        col += w;
+        continue;
+      }
+      if (used + w > width - 2) break;
+      out += g;
+      used += w;
+    }
+    bool more = offset + used < total;
+    return (offset > 0 ? "‹" : " ") + out + (more ? "›" : " ");
   }
 
   bool on_global_event(const Event& e) {
@@ -540,13 +568,27 @@ class App {
         dialogs_.confirm("Quit rei-fs?", [this] { screen_.Exit(); });
         return true;
       }
+      if (c == "[" || c == "]") {   // scroll the key list at the bottom
+        help_offset_ = std::max(0, help_offset_ + (c == "]" ? 24 : -24));
+        return true;
+      }
       if (c == "?") {
+        // This tab's keys, one per line (the list at the bottom separates them by two spaces).
+        std::string tab_keys, help = views_[tab_]->help();
+        for (size_t pos = 0; pos <= help.size();) {
+          size_t end = help.find("  ", pos);
+          if (end == std::string::npos) end = help.size();
+          std::string item = help.substr(pos, end - pos);
+          while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+          if (!item.empty()) tab_keys += "  " + item + "\n";
+          pos = end + 2;
+        }
         dialogs_.info("Keys",
                       "1-9, 0        switch tab\n"
                       "arrows        move, Enter opens / chooses\n"
                       "r             refresh the current tab\n"
-                      "q             quit\n\n"
-                      "Each tab lists its own keys at the bottom of the screen.");
+                      "[ ]           scroll the key list at the bottom\n"
+                      "q             quit\n\nThis tab (" + views_[tab_]->title() + "):\n" + tab_keys);
         return true;
       }
     }
@@ -614,7 +656,9 @@ class App {
         tabs->Render() | flex,
         separator(),
         notice,
-        text(" " + views_[tab_]->help() + "   ?: keys  q: quit") | dim,
+        text(help_window(" " + views_[tab_]->help(),
+                         std::max(20, ftxui::Terminal::Size().dimx - 22), help_offset_) +
+             "   [ ]: scroll  ?: keys  q: quit") | dim,
         hbox(bar),
     });
   }
@@ -690,6 +734,7 @@ class App {
   int page_ = 0;
   int holder_index_ = 0;
   int tab_ = 0;
+  int help_offset_ = 0;   // how far the key list at the bottom is scrolled
   std::string host_, port_str_, password_, login_message_;
   Notice notice_;
   std::unique_ptr<Api> poll_api_;

@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import archives, db, index
+from . import archives, db, index, tolerance
 
 BATCH = 2000
 
@@ -128,6 +128,8 @@ def _apply_chunk(conn: sqlite3.Connection, entries: list[dict]) -> int:
                 _apply_dirpref(conn, data)
             elif kind == "archive":
                 archives.apply_change(conn, data)
+            elif kind == "tolerance":
+                tolerance.apply_change(conn, data)
             ref = None
             if kind == "copy" and data.get("op") in ("upsert", "missing") and fid is not None \
                     and conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id = ?",
@@ -190,12 +192,14 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
     fields = (name, d.get("kind", "storage"), d["owner_id"], d.get("owner_since") or 0,
               d.get("case_sensitive"), d.get("restricted_names"), int(d.get("priority") or 0),
               int(d.get("replication_target", 1)), int(d.get("online") or 0),
-              d.get("free_bytes"), d.get("total_bytes"), d.get("ssh_root"))
+              d.get("free_bytes"), d.get("total_bytes"), d.get("ssh_root"),
+              int(d.get("mirrored") or 0), int(d.get("backup_first") or 0))
     if row is None:
         conn.execute(
             "INSERT INTO nodes(name, kind, owner_id, owner_since, case_sensitive,"
             " restricted_names, priority, replication_target, online, free_bytes, total_bytes,"
-            " ssh_root, id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*fields, d["id"]))
+            " ssh_root, mirrored, backup_first, id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*fields, d["id"]))
         return
     if row["owner_id"] != origin and (d.get("owner_since") or 0) <= (row["owner_since"] or 0):
         return  # stale announcement from a former owner
@@ -205,7 +209,8 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
     conn.execute(
         "UPDATE nodes SET name = ?, kind = ?, owner_id = ?, owner_since = ?,"
         " case_sensitive = ?, restricted_names = ?, priority = ?, replication_target = ?,"
-        " online = ?, free_bytes = ?, total_bytes = ?, ssh_root = ? WHERE id = ?",
+        " online = ?, free_bytes = ?, total_bytes = ?, ssh_root = ?, mirrored = ?,"
+        " backup_first = ? WHERE id = ?",
         (*fields, d["id"]))
 
 

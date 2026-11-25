@@ -8,7 +8,7 @@ import time
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import archives, index, paths, vdirs
+from . import archives, index, paths, tolerance, vdirs
 from .tags import tags_of
 
 DEFAULT_COPIES = 2
@@ -46,6 +46,7 @@ class CopyInfo:
     state: str
     marked_delete: bool
     current: bool
+    weight: int = 1          # a copy on a mirrored drive counts as two
 
 
 @dataclass
@@ -56,12 +57,13 @@ class FileInfo:
     tags: list[str]
     copies: list[CopyInfo] = field(default_factory=list)
     goal: int = DEFAULT_COPIES
+    tolerant: bool = False   # several versions are fine: every present copy is current
 
     @property
     def good_copies(self) -> int:
         """Copies that count towards the two-copy goal."""
-        return len({c.node_id for c in self.copies
-                    if c.state == "present" and c.current and not c.marked_delete})
+        return sum({c.node_id: c.weight for c in self.copies
+                    if c.state == "present" and c.current and not c.marked_delete}.values())
 
     @property
     def size(self) -> int:
@@ -75,16 +77,18 @@ def file_info(conn: sqlite3.Connection, fid: int,
     version = index.current_version(conn, fid)
     file_tags = tags_of(conn, fid)
     info = FileInfo(fid, f["vpath"], paths.decode_issues(f["issues"]), file_tags,
-                    goal=policy.goal(file_tags))
+                    goal=policy.goal(file_tags), tolerant=tolerance.is_tolerant(conn, f["vpath"]))
     for c in conn.execute(
-        "SELECT c.*, n.name, n.online FROM copies c JOIN nodes n ON n.id = c.node_id"
+        "SELECT c.*, n.name, n.online, n.mirrored FROM copies c JOIN nodes n ON n.id = c.node_id"
         " WHERE c.file_id = ? ORDER BY n.name",
         (fid,),
     ):
         info.copies.append(CopyInfo(
             c["node_id"], c["name"], bool(c["online"]), c["size"], c["mtime_ns"], c["hash"],
             c["state"], bool(c["marked_delete"]),
-            current=bool(version and c["state"] == "present" and c["hash"] == version.hash),
+            current=bool(version and c["state"] == "present"
+                         and (info.tolerant or c["hash"] == version.hash)),
+            weight=1 + c["mirrored"],
         ))
     return info
 
@@ -445,8 +449,12 @@ def exact_good(conn: sqlite3.Connection, fid: int) -> tuple[int, int, str] | Non
     v = index.current_version(conn, fid)
     if v is None:
         return None
-    good = conn.execute("SELECT COUNT(*) FROM copies WHERE file_id = ? AND state = 'present'"
-                        " AND hash = ? AND marked_delete = 0", (fid, v.hash)).fetchone()[0]
+    # A mirrored drive counts twice; where several versions are fine every version counts.
+    tolerant = tolerance.is_tolerant(conn, index.vpath_of(conn, fid))
+    good = conn.execute(
+        "SELECT IFNULL(SUM(1 + n.mirrored), 0) FROM copies c JOIN nodes n ON n.id = c.node_id"
+        " WHERE c.file_id = ? AND c.state = 'present' AND c.marked_delete = 0"
+        " AND (? OR c.hash = ?)", (fid, int(tolerant), v.hash)).fetchone()[0]
     size = conn.execute("SELECT MAX(size) FROM copies WHERE file_id = ? AND hash = ?"
                         " AND state = 'present'", (fid, v.hash)).fetchone()[0] or 0
     return good, size, v.hash
@@ -460,9 +468,10 @@ def _compute_stats(conn: sqlite3.Connection, policy: GoalPolicy, seq: int) -> Co
     hist = [0] * 5
     for kind, a, b, c, d, e in conn.execute("""
         WITH g AS MATERIALIZED (
-            SELECT file_id, MIN(hash_b) = MAX(hash_b) AS one, SUM(marked_delete = 0) AS good,
-                   MAX(size) AS sz
-            FROM copies WHERE state = 'present' GROUP BY file_id)
+            SELECT file_id, MIN(hash_b) = MAX(hash_b) AS one,
+                   SUM((marked_delete = 0) * (1 + n.mirrored)) AS good, MAX(size) AS sz
+            FROM copies c JOIN nodes n ON n.id = c.node_id WHERE state = 'present'
+            GROUP BY file_id)
         SELECT 1, COUNT(*), IFNULL(SUM(sz), 0),
                IFNULL(SUM(good >= COALESCE(o.goal, ?1)), 0),
                IFNULL(SUM(good < COALESCE(o.goal, ?1)), 0),
@@ -569,8 +578,10 @@ def fill_under_ids(conn: sqlite3.Connection, policy: GoalPolicy) -> None:
     conn.execute("""
         INSERT OR IGNORE INTO temp.under_ids
         SELECT g.file_id FROM (
-            SELECT file_id, MIN(hash_b) = MAX(hash_b) AS one, SUM(marked_delete = 0) AS good
-            FROM copies WHERE state = 'present' GROUP BY file_id) g
+            SELECT file_id, MIN(hash_b) = MAX(hash_b) AS one,
+                   SUM((marked_delete = 0) * (1 + n.mirrored)) AS good
+            FROM copies c JOIN nodes n ON n.id = c.node_id WHERE state = 'present'
+            GROUP BY file_id) g
         LEFT JOIN temp.goal_override o ON o.file_id = g.file_id
         WHERE g.one AND g.good < COALESCE(o.goal, ?)""", (policy.copies,))
     for (fid,) in conn.execute("SELECT file_id FROM copies WHERE state = 'present'"

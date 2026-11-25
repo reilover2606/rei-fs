@@ -499,3 +499,25 @@ def test_pack_search_deep_and_unpack_over_the_api(server):
     wait(lambda: not any(e.get("packed") for e in client.get("/api/tree?path=/")["entries"]),
          "unpacked")
     assert client.get("/api/find?q=a.txt")["total"] == 1
+
+
+def test_holders_say_which_nodes_have_the_selected_files(server):
+    env, client, _ = server
+    login(client)
+    out = client.post("/api/holders", {"paths": ["/docs", "/top.txt"]})
+    have = {n["name"]: n["have"] for n in out["nodes"]}
+    assert out["total"] == 3 and have["ssd"] == 0 and max(have.values()) == 3
+    client.post("/api/holders", {"paths": ["/nope"]}, expect=400)
+
+
+def test_node_flags_and_tolerance_over_the_api(server):
+    env, client, _ = server
+    login(client)
+    client.post("/api/nodes/ssd", {"mirrored": True, "backup_first": True})
+    ssd = {n["name"]: n for n in client.get("/api/nodes")["nodes"]}["ssd"]
+    assert ssd["mirrored"] and ssd["backup_first"]
+    out = client.post("/api/tolerance", {"path": "/docs", "tolerant": True})
+    assert out["tolerant"] and not out["inherited"]
+    entry = [e for e in client.get("/api/tree?path=/")["entries"] if e["name"] == "docs"][0]
+    assert entry["tolerant"]
+    assert client.get("/api/file?path=/docs/a.txt")["tolerant"]

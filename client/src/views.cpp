@@ -104,6 +104,8 @@ Element file_details(const json& f) {
   };
   if (!f.value("tags", json::array()).empty())
     rows.push_back(label_value("tags", join(f["tags"])));
+  if (f.value("tolerant", false))
+    rows.push_back(label_value("versions", text("several versions are fine (no conflicts asked)")));
   if (!f.value("issues", json::array()).empty())
     rows.push_back(label_value("non-portable", paragraph(join(f["issues"])) | color(Color::Yellow)));
   if (!f.value("flags", json::array()).empty())
@@ -167,14 +169,31 @@ void tag_paths(Context& ctx, std::vector<std::string> paths, bool recursive, boo
 void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::string& tag,
                     bool move) {
   if (paths.empty() && tag.empty()) return;
-  ctx.get("/api/nodes", [&ctx, paths, tag, move](json out) {
-    std::vector<std::string> nodes;
+  // The nodes, and how many of the selected files each one holds, decide what is offered.
+  ctx.run(
+      false,
+      [paths, tag](Api& a) {
+        json body = {{"paths", paths}};
+        if (!tag.empty()) body["tag"] = tag;
+        return json{{"nodes", a.get("/api/nodes")["nodes"]}, {"holders", a.post("/api/holders", body)}};
+      },
+      [&ctx, paths, tag, move](json out) {
+    int total = out["holders"].value("total", 0);
+    std::map<std::string, int> have;
+    for (const auto& h : out["holders"]["nodes"]) have[h.value("name", "")] = h.value("have", 0);
+    struct Choice {
+      std::string name, label;
+      int have;
+    };
+    std::vector<Choice> all;
     for (const auto& n : out["nodes"]) {
-      std::string label = n.value("name", "");
+      std::string name = n.value("name", "");
+      std::string label = name;
+      if (total > 0) label += "  (" + std::to_string(have[name]) + " of " + std::to_string(total) + ")";
       if (!n.value("online", false)) label += " (offline)";
-      nodes.push_back(label);
+      all.push_back({name, label, have[name]});
     }
-    if (nodes.empty()) return;
+    if (all.empty()) return;
     auto create = [&ctx, paths, tag, move](const std::string& from, const std::string& to) {
       json body = {{"kind", move ? "move" : "copy"}, {"paths", paths}, {"to", to}};
       if (!tag.empty()) body["tag"] = tag;
@@ -204,20 +223,34 @@ void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::str
     std::string what = !tag.empty() ? "files tagged '" + tag + "'"
                        : paths.size() == 1 ? paths[0]
                                            : std::to_string(paths.size()) + " items";
+    // `skip`: a node left out of the list; `need_files`: only nodes holding something.
+    auto pick = [&ctx, all](const std::string& title, const std::string& skip, bool need_files,
+                            bool not_full, int total, std::function<void(const std::string&)> done) {
+      std::vector<std::string> labels, names;
+      for (const auto& c : all) {
+        if (c.name == skip) continue;
+        if (need_files && c.have == 0) continue;
+        if (not_full && total > 0 && c.have >= total) continue;   // it has them all already
+        labels.push_back(c.label);
+        names.push_back(c.name);
+      }
+      if (labels.empty()) {
+        ctx.notify(need_files ? "no node holds any of these files"
+                              : "no other node to put them on");
+        return;
+      }
+      ctx.dialogs->ask_choice(title, labels, [names, done](int i) { done(names[i]); });
+    };
     if (!move) {
-      ctx.dialogs->ask_choice("Copy " + what + " to which node?", nodes,
-                              [create, nodes](int i) { create("", strip_offline(nodes[i])); });
+      pick("Copy " + what + " to which node?  (files held / selected)", "", false, true, total,
+           [create](const std::string& to) { create("", to); });
       return;
     }
-    ctx.dialogs->ask_choice(
-        "Move " + what + " FROM which node? (its copies get marked for deletion)", nodes,
-        [&ctx, create, nodes, what](int i) {
-          std::string from = strip_offline(nodes[i]);
-          ctx.dialogs->ask_choice("Move " + what + " from " + from + " TO which node?", nodes,
-                                  [create, nodes, from](int j) {
-                                    create(from, strip_offline(nodes[j]));
-                                  });
-        });
+    pick("Move " + what + " FROM which node? (its copies get marked for deletion)", "", true, false,
+         total, [&ctx, create, what, pick, total](const std::string& from) {
+           pick("Move " + what + " from " + from + " TO which node?", from, false, false, total,
+                [create, from](const std::string& to) { create(from, to); });
+         });
   });
 }
 
@@ -780,6 +813,9 @@ class TreeView : public View {
       if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
       if (more_files_ > 0)
         heading += "   (" + std::to_string(more_files_) + " more files not listed; use Search)";
+      if (!filter_.empty())
+        heading += "   [showing names with '" + filter_ + "': " + std::to_string(entries_.size()) +
+                   " of " + std::to_string(all_entries_.size()) + "; Esc clears]";
       if (!inside_.empty()) heading += "   [inside " + inside_ + ": read-only, from the archive's list]";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
@@ -794,7 +830,7 @@ class TreeView : public View {
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  S: schedule sync  "
            "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  "
-           "z: pack/unpack  Z: drop archive  r: refresh";
+           "z: pack/unpack  Z: drop archive  V: several versions ok  /: filter this folder  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -812,6 +848,8 @@ class TreeView : public View {
     path_ = dir.empty() ? "/" : dir;
     want_ = select;
     selected_ = 0;
+    filter_.clear();
+    all_entries_ = json::array();
     entries_ = json::array();
     labels_.clear();
     detail_ = text("");
@@ -827,7 +865,8 @@ class TreeView : public View {
         [this, requested, name](json out) {
           if (requested != path_) return;   // the user has gone elsewhere meanwhile
           loading_ = false;
-          entries_ = out["entries"];
+          all_entries_ = out["entries"];
+          entries_ = filtered(all_entries_);
           dir_priority_ = out.value("priority", 2);
           this_node_ = out.value("this_node", "");
           inside_ = out.value("inside_archive", "");
@@ -846,6 +885,29 @@ class TreeView : public View {
             refresh_selecting("");
           }
         });
+  }
+
+  // The entries whose name contains the typed filter (case-insensitive); all of them if none.
+  json filtered(const json& all) const {
+    if (filter_.empty()) return all;
+    json out = json::array();
+    std::string needle = lower(filter_);
+    for (const auto& e : all)
+      if (lower(e.value("name", "")).find(needle) != std::string::npos) out.push_back(e);
+    return out;
+  }
+  static std::string lower(std::string s) {
+    for (auto& c : s)
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return s;
+  }
+  void set_filter(const std::string& f) {
+    filter_ = f;
+    std::string keep = current_name();
+    entries_ = filtered(all_entries_);
+    rebuild_labels();
+    selected_ = reselect(entries_, keep, [](const json& e) { return e.value("name", ""); }, 0);
+    load_detail();
   }
 
   // Does this entry (a file) or something below it (a folder) have a copy on this server's node?
@@ -947,7 +1009,10 @@ class TreeView : public View {
                       text(std::string("update priority: ") + priority_name(e->value("priority", 2)) +
                            (e->value("set_here", false) ? "" : " (inherited)")),
                       here_line(*e),
+                      text(std::string("versions: ") + (e->value("tolerant", false)
+                               ? "several are fine (no conflicts asked)" : "conflicts are decided")),
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
+                      text("V: several versions are fine here (no conflict decisions)") | dim,
                       text("x: pick up to move it in the tree  n: rename") | dim,
                       text("u: update priority (how often it is scanned)") | dim,
                       text("f: fetch it to this machine (the fetch folder)") | dim,
@@ -973,6 +1038,8 @@ class TreeView : public View {
     const json* e = current();
     if (!e || !e->value("dir", false)) return;
     path_ = child_path(e->value("name", ""));
+    filter_.clear();
+    all_entries_ = json::array();
     selected_ = 0;
     entries_ = json::array();
     labels_.clear();
@@ -986,6 +1053,8 @@ class TreeView : public View {
     auto pos = path_.rfind('/');
     std::string child = path_.substr(pos + 1);
     path_ = pos == 0 ? "/" : path_.substr(0, pos);
+    filter_.clear();
+    all_entries_ = json::array();
     entries_ = json::array();
     labels_.clear();
     detail_ = text("");
@@ -1007,7 +1076,7 @@ class TreeView : public View {
       return true;
     }
     if (!inside_.empty()) {   // what is listed from an archive cannot be acted on
-      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z"})
+      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z", "V"})
         if (key(e, k)) {
           ctx_.notify("inside the packed directory " + inside_ +
                       ": read-only (go up to it; z there unpacks it)");
@@ -1016,6 +1085,15 @@ class TreeView : public View {
     }
     if (key(e, "p") && !picked_.empty()) {   // put the picked-up items here
       move_items({picked_.begin(), picked_.end()}, path_, "");
+      return true;
+    }
+    if (e == Event::Escape && !filter_.empty()) {
+      set_filter("");
+      return true;
+    }
+    if (key(e, "/")) {   // find among the entries of this folder
+      ctx_.dialogs->ask_text("Show only the entries of " + path_ + " whose name contains:",
+                             filter_, [this](const std::string& f) { set_filter(f); });
       return true;
     }
     if (e == Event::Escape && !picked_.empty()) {
@@ -1067,6 +1145,25 @@ class TreeView : public View {
     if (key(e, "x")) {   // pick up / put down this item
       if (!picked_.erase(target)) picked_.insert(target);
       rebuild_labels();
+      return true;
+    }
+    if (key(e, "V")) {   // tolerate several versions of this file or everything below this folder
+      ctx_.dialogs->ask_choice(
+          "Several versions of " + target + (dir ? " (everything below it)" : "") + ":\n"
+          "where the copies of a file differ, tolerate it: no decision is asked and nothing is "
+          "overwritten.",
+          {"tolerate several versions", "decide conflicts (the default)", "inherit from the parent"},
+          [this, target](int i) {
+            json value = i == 2 ? json(nullptr) : json(i == 0);
+            ctx_.send("/api/tolerance", {{"path", target}, {"tolerant", value}},
+                      [this, target](json out) {
+                        ctx_.notify(target + ": " +
+                                    (out.value("tolerant", false) ? "several versions are fine"
+                                                                  : "conflicting versions are decided") +
+                                    (out.value("inherited", false) ? " (inherited)" : ""));
+                        refresh();
+                      });
+          });
       return true;
     }
     bool packed = cur->value("packed", false);
@@ -1184,7 +1281,9 @@ class TreeView : public View {
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives
   bool loading_ = false;
-  json entries_ = json::array();
+  json entries_ = json::array();       // what is listed (after the filter)
+  json all_entries_ = json::array();   // the whole folder
+  std::string filter_;                 // "/": only names containing this
   std::vector<std::string> labels_;
   int selected_ = 0;
   Element detail_ = text("");
@@ -2019,7 +2118,7 @@ class NodesView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  c: check completeness  m: move root  n: add drive  "
-           "R: rename  p: priority  t: backup target  o: adopt";
+           "R: rename  p: priority  t: backup target  B: backup first  M: mirrored drive  o: adopt";
   }
 
   void refresh() override {
@@ -2218,6 +2317,8 @@ class NodesView : public View {
         label_value("Windows names", yes(n.value("restricted_names", false))),
         label_value("priority", std::to_string(n.value("priority", 0))),
         label_value("backup target", yes(n.value("replication_target", false))),
+        label_value("backup first", yes(n.value("backup_first", false))),
+        label_value("mirrored drive", yes(n.value("mirrored", false)) ),
         label_value("last scan", n.value("last_scan", "").substr(0, 19)),
     });
   }
@@ -2413,6 +2514,19 @@ class NodesView : public View {
                                ctx_.send("/api/nodes/" + url_encode(name), {{"priority", n}},
                                          [this](json) { refresh(); });
                              });
+      return true;
+    }
+    if (key(e, "B") || key(e, "M")) {   // flags: backup first / mirrored drive
+      std::string flag = key(e, "B") ? "backup_first" : "mirrored";
+      bool now = items_[node_index()].value(flag, false);
+      ctx_.send("/api/nodes/" + url_encode(name), {{flag, !now}}, [this, flag, now, name](json) {
+        ctx_.notify(name + (flag == "mirrored"
+                                ? (now ? ": no longer a mirrored drive"
+                                       : ": mirrored drive (its copies count as two)")
+                                : (now ? ": no longer filled first by backups"
+                                       : ": backups fill it first")));
+        refresh();
+      });
       return true;
     }
     if (key(e, "t")) {

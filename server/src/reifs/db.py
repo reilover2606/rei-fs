@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -593,6 +593,20 @@ CREATE TABLE archive_members (
     size       INTEGER NOT NULL,
     PRIMARY KEY (archive_id, path)
 ) WITHOUT ROWID;
+"""
+
+MIGRATIONS[18] = """
+-- Files and directories whose copies may differ (design 5.17): no decision is asked. A
+-- directory's setting is inherited; NULL clears it (like dirprefs).
+CREATE TABLE tolerance (
+    vpath      TEXT PRIMARY KEY,
+    value      INTEGER,
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+-- Node flags: a mirrored drive counts as two copies; a backup-first node is filled first.
+ALTER TABLE nodes ADD COLUMN mirrored INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE nodes ADD COLUMN backup_first INTEGER NOT NULL DEFAULT 0;
 """
 
 

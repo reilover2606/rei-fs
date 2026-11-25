@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (__version__, archives, auth, db, decisions, index, jobs, nodes, peers, queries,
+from . import (__version__, archives, auth, tolerance, db, decisions, index, jobs, nodes, peers, queries,
                replication, runner, scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
@@ -122,7 +122,8 @@ def cmd_node_list(args) -> None:
 def cmd_node_set(args) -> None:
     _, conn = open_server(args.home)
     node = nodes.get_node(conn, args.node)
-    if args.priority is None and args.target is None and not args.rename:
+    if (args.priority is None and args.target is None and not args.rename
+            and args.mirrored is None and args.backup_first is None):
         raise CliError("nothing to change")
     if node["owner_id"] != nodes.self_id(conn):
         raise CliError(f"node {node['name']!r} belongs to another server; change it there "
@@ -134,6 +135,10 @@ def cmd_node_set(args) -> None:
         updates["priority"] = args.priority
     if args.target is not None:
         updates["replication_target"] = int(args.target == "yes")
+    if args.mirrored is not None:
+        updates["mirrored"] = int(args.mirrored == "yes")
+    if args.backup_first is not None:
+        updates["backup_first"] = int(args.backup_first == "yes")
     if updates:
         sets = ", ".join(f"{k} = ?" for k in updates)
         with db.transaction(conn):
@@ -153,6 +158,19 @@ def cmd_discover(args) -> None:
         print(f"moved    {name:20} now at {root}")
     for name, owner, path in d.foreign:
         print(f"foreign  {name:20} {path} (owned by server {owner})")
+
+
+def cmd_tolerate(args) -> None:
+    _, conn = open_server(args.home)
+    value = {"yes": True, "no": False, "inherit": None}[args.value]
+    try:
+        if args.value is None or not args.vpath:
+            raise CliError("usage: reifs tolerate PATH yes|no|inherit")
+        res = tolerance.set_tolerance(conn, args.vpath, value)
+    except tolerance.ToleranceError as e:
+        raise CliError(str(e)) from None
+    state = "several versions are fine" if res["tolerant"] else "conflicting versions are decided"
+    print(f"{res['path']}: {state}" + ("" if not res["inherited"] else f" (from {res['set_on']})"))
 
 
 def cmd_archive(args) -> None:
@@ -1073,6 +1091,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("node")
     s.add_argument("--priority", type=int, help="higher = preferred replication target")
     s.add_argument("--target", choices=["yes", "no"], help="may receive replication copies")
+    s.add_argument("--mirrored", choices=["yes", "no"],
+                   help="the drive is mirrored (RAID 1, ...): its copies count as two")
+    s.add_argument("--backup-first", dest="backup_first", choices=["yes", "no"],
+                   help="the node exists for backups: planning fills it before other nodes")
     s.add_argument("--rename", metavar="NAME")
     s.set_defaults(func=cmd_node_set)
 
@@ -1108,6 +1130,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)
+
+    s = sub.add_parser("tolerate", help="allow several versions of a file or directory (no decisions)")
+    s.add_argument("vpath", help="a file or directory of the virtual tree")
+    s.add_argument("value", choices=["yes", "no", "inherit"])
+    s.set_defaults(func=cmd_tolerate)
 
     s = sub.add_parser("archive", help="pack a directory into one squashfs archive, or unpack one")
     s.add_argument("action", choices=["pack", "unpack", "drop", "list"])

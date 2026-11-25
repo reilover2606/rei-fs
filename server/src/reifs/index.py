@@ -9,7 +9,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-from . import db, paths
+from . import db, paths, tolerance
 
 # --- files -------------------------------------------------------------------
 
@@ -172,6 +172,7 @@ def node_payload(conn: sqlite3.Connection, node_id: str) -> dict | None:
             "owner_name": r["owner_name"], "owner_since": r["owner_since"],
             "case_sensitive": r["case_sensitive"], "restricted_names": r["restricted_names"],
             "priority": r["priority"], "replication_target": r["replication_target"],
+            "mirrored": r["mirrored"], "backup_first": r["backup_first"],
             "online": r["online"], "free_bytes": r["free_bytes"],
             "total_bytes": r["total_bytes"], "ssh_root": r["ssh_root"]}
 
@@ -370,6 +371,10 @@ def evaluate_divergence(conn: sqlite3.Connection, fid: int) -> None:
         (fid,),
     ).fetchall()
     hashes = {r["hash"] for r in rows}
+    if len(hashes) > 1 and tolerance.is_tolerant(conn, vpath_of(conn, fid)):
+        # Several versions are fine here: no decision is asked (and an old one goes).
+        obsolete_decisions(conn, fid, ("divergent",), statuses=("open", "dismissed"))
+        return
     existing = conn.execute(
         "SELECT id, data FROM decisions WHERE file_id = ? AND kind = 'divergent'"
         " AND status IN ('open', 'dismissed')",

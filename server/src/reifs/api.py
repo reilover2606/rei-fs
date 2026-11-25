@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, archives, audit, auth, relay, db, decisions, index, jobs, nodes, paths, peers,
+from . import (__version__, archives, audit, auth, tolerance, relay, db, decisions, index, jobs, nodes, paths, peers,
                priority, queries, replication, schedules, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
@@ -73,6 +73,7 @@ def file_json(info: queries.FileInfo, full: bool = True) -> dict:
         "mtime": _secs(cur.mtime_ns) if cur else 0,
         "good_copies": info.good_copies,
         "goal": info.goal,
+        "tolerant": info.tolerant,
         "tags": info.tags,
         "issues": sorted(info.issues),
         "flags": flags,
@@ -189,6 +190,9 @@ class Api:
         r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
+        r("POST", r"/api/holders", self.holders)
+        r("GET", r"/api/tolerance", self.tolerance_get)
+        r("POST", r"/api/tolerance", self.tolerance_set)
         r("GET", r"/api/archives", self.archive_list)
         r("POST", r"/api/archives/pack", self.archive_pack)
         r("POST", r"/api/archives/unpack", self.archive_unpack)
@@ -360,6 +364,7 @@ class Api:
                 "case_sensitive": bool(r["case_sensitive"]),
                 "restricted_names": bool(r["restricted_names"]), "priority": r["priority"],
                 "replication_target": bool(r["replication_target"]),
+                "mirrored": bool(r["mirrored"]), "backup_first": bool(r["backup_first"]),
                 "root": r["root_path"] or "", "last_scan": r["last_scan"] or "",
             })
         foreign = [{"node_id": f["node_id"], "name": f["name"], "path": f["path"],
@@ -383,6 +388,10 @@ class Api:
             if "replication_target" in body:
                 conn.execute("UPDATE nodes SET replication_target = ? WHERE id = ?",
                              (int(bool(body["replication_target"])), row["id"]))
+            for flag in ("mirrored", "backup_first"):
+                if flag in body:
+                    conn.execute(f"UPDATE nodes SET {flag} = ? WHERE id = ?",
+                                 (int(bool(body[flag])), row["id"]))
             index.log_node(conn, row["id"])
         self._poke()
         return {"ok": True}
@@ -467,6 +476,39 @@ class Api:
                                              full=not body.get("due"),
                                              new_only=bool(body.get("new_only")))
         return {"ok": True, "queued": True}
+
+    def tolerance_get(self, conn, q, body, **_):
+        try:
+            return tolerance.get(conn, q.get("path", "/"))
+        except paths.VPathError as e:
+            raise ApiError(400, str(e)) from None
+
+    def tolerance_set(self, conn, q, body, **_):
+        value = body.get("tolerant")
+        if value is not None:
+            value = bool(value)
+        try:
+            return tolerance.set_tolerance(conn, str(body.get("path", "")), value)
+        except tolerance.ToleranceError as e:
+            raise ApiError(400, str(e)) from None
+
+    def holders(self, conn, q, body, **_):
+        """Which nodes hold a (present) copy of the selected files: for the copy and move menus."""
+        try:
+            ids = [fid for fid, _ in jobs.select_files(conn, list(body.get("paths", [])),
+                                                       body.get("tag") or None)]
+        except (jobs.JobError, paths.VPathError) as e:
+            raise ApiError(400, str(e)) from None
+        have: dict[str, int] = {}
+        for i in range(0, len(ids), 800):
+            part = ids[i:i + 800]
+            for r in conn.execute(
+                    "SELECT node_id, COUNT(*) FROM copies WHERE state = 'present' AND file_id IN"
+                    f" ({','.join('?' * len(part))}) GROUP BY node_id", part):
+                have[r[0]] = have.get(r[0], 0) + r[1]
+        return {"total": len(ids),
+                "nodes": [{"name": r["name"], "have": have.get(r["id"], 0)}
+                          for r in conn.execute("SELECT id, name FROM nodes ORDER BY name")]}
 
     # --- packed directories -----------------------------------------------------------
 
@@ -576,7 +618,8 @@ class Api:
                 child = paths.join(vdir, e.name)
                 d = {"name": e.name, "dir": True, "files": e.files, "here": e.here,
                      "priority": prefs.prefs.get(child, here),
-                     "set_here": child in prefs.prefs}
+                     "set_here": child in prefs.prefs,
+                     "tolerant": tolerance.is_tolerant(conn, child)}
                 if e.packed:
                     d.update(packed=True, archive=e.packed["archive"], bytes=e.packed["bytes"])
                 out.append(d)

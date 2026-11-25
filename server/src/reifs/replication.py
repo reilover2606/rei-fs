@@ -37,7 +37,7 @@ import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 
-from . import db, index, jobs, paths, peers, queries
+from . import db, index, jobs, paths, peers, queries, tolerance
 from .config import Config
 from .queries import GoalPolicy
 from .tags import tags_of
@@ -82,6 +82,7 @@ class UnderFile:
     size: int
     good_nodes: list[str]
     goal: int
+    have: int = 0               # what the good nodes count for (a mirrored drive is two)
 
 
 def good_nodes_of(conn: sqlite3.Connection, fid: int) -> tuple[list[str], str, int] | None:
@@ -91,9 +92,21 @@ def good_nodes_of(conn: sqlite3.Connection, fid: int) -> tuple[list[str], str, i
     if not rows:
         return None
     top = min(rows, key=lambda r: (-r["mtime_ns"], r["hash"]))   # index.current_version
+    # Where several versions are fine, a copy of any version is a good copy.
+    any_version = len({r["hash"] for r in rows}) > 1 and tolerance.is_tolerant(
+        conn, index.vpath_of(conn, fid))
     return (sorted(r["node_id"] for r in rows
-                   if r["hash"] == top["hash"] and not r["marked_delete"]),
+                   if (any_version or r["hash"] == top["hash"]) and not r["marked_delete"]),
             top["hash"], top["size"])
+
+
+def weight_of(conn: sqlite3.Connection, node_ids) -> int:
+    """What copies on these nodes count for: a copy on a mirrored drive counts as two."""
+    ids = list(node_ids)
+    if not ids:
+        return 0
+    return conn.execute(f"SELECT IFNULL(SUM(1 + mirrored), 0) FROM nodes WHERE id IN"
+                        f" ({','.join('?' * len(ids))})", ids).fetchone()[0]
 
 
 def under_file(conn: sqlite3.Connection, fid: int, pol: GoalPolicy) -> UnderFile | None:
@@ -103,10 +116,11 @@ def under_file(conn: sqlite3.Connection, fid: int, pol: GoalPolicy) -> UnderFile
     if got is None or f is None or not got[0]:
         return None
     goal = pol.goal(tags_of(conn, fid))
-    if len(got[0]) >= goal:
+    have = weight_of(conn, got[0])
+    if have >= goal:
         return None
     return UnderFile(fid, f["vpath"], paths.key(f["vpath"]), f["issues"], got[1], got[2], got[0],
-                     goal)
+                     goal, have)
 
 
 class _Planner:
@@ -168,7 +182,8 @@ class _Planner:
         if not candidates:
             reason = rejected.most_common(1)[0][0] if rejected else "there are not enough nodes"
             return None, reason
-        candidates.sort(key=lambda n: (not n["online"], -n["priority"],
+        # Nodes that exist to hold backups are filled first, then the usual order.
+        candidates.sort(key=lambda n: (not n["online"], not n["backup_first"], -n["priority"],
                                        -(n["free_bytes"] or 0), n["name"]))
         best = candidates[0]
         self.reserved[best["id"]] += f.size
@@ -241,7 +256,7 @@ def plan(conn: sqlite3.Connection, cfg: Config) -> PlanReport:
                 continue  # the server holding the first good copy proposes
             report.responsible += 1
             pending = active.get(f.file_id, set())
-            need = f.goal - len(f.good_nodes) - len(pending)
+            need = f.goal - f.have - weight_of(conn, pending)
             if need <= 0:
                 report.already_proposed += 1
                 continue
@@ -253,7 +268,7 @@ def plan(conn: sqlite3.Connection, cfg: Config) -> PlanReport:
                 continue
             chosen: set[str] = set()
             source = next((n for n in f.good_nodes if owners.get(n) == me), f.good_nodes[0])
-            for _ in range(need):
+            while need > 0:
                 dst, why = planner.choose(f, pending | chosen)
                 if dst is None:
                     report.no_destination += 1
@@ -262,6 +277,7 @@ def plan(conn: sqlite3.Connection, cfg: Config) -> PlanReport:
                         report.examples.append((f.vpath, why))
                     break
                 chosen.add(dst)
+                need -= weight_of(conn, [dst])      # a mirrored destination counts as two
                 pending_rows.append(("copy", f.file_id, source, dst, REASON,
                                      {"hash": f.hash, "goal": f.goal}))
                 report.proposed += 1

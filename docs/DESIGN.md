@@ -595,6 +595,23 @@ It can be packed into one squashfs archive, `<dir>.sqsh`, next to where the dire
   forgotten when those servers next scan. The squashfs tools exist on Linux only: a Windows
   node stores and copies the archive like any file but cannot pack or unpack.
 
+### 5.17 Tolerated versions and node flags
+
+* **Several versions are fine** (Tree: `V`; `reifs tolerate PATH yes|no|inherit`). A file or directory
+  can be marked tolerant (table `tolerance`, replicated like the directory priorities: the nearest
+  setting decides, 0 switches an inherited one off, NULL inherits). For such a file differing
+  copies are not a conflict: no `divergent` decision is raised (and open ones go when the mark is set),
+  every present copy counts as a good copy (a stale one is no longer "stale"), and so nothing is planned
+  to overwrite them. The mark moves with the path when it is moved or renamed.
+* **Mirrored drive** (`nodes.mirrored`, Nodes tab `M`, `reifs node set --mirrored yes`): a copy on
+  it counts as two towards the goal, everywhere good copies are counted (coverage figures, the
+  under-replicated filter, the file view and the backup planner, which also counts a mirrored
+  destination as two).
+* **Backup first** (`nodes.backup_first`, Nodes tab `B`, `--backup-first yes`): a node that exists for
+  backups. When the planner picks a destination, online backup-first nodes come before the priority
+  order, so they are filled (until their free space is used) before backing up elsewhere.
+* Both flags are announced with the node, so every server plans with the same figures.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies
