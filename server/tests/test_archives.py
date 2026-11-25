@@ -312,3 +312,20 @@ def test_an_unpack_job_runs(env):
     run_jobs(env)
     assert env.conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()[0] == "done"
     assert (env.root / "src" / "foo" / "a.c").exists() and archives.get(env.conn, "/src/foo") is None
+
+
+def test_packing_registers_the_members_and_forgets_the_files_in_pieces(env, monkeypatch):
+    monkeypatch.setattr(archives, "TX_ROWS", 3)
+    for i in range(10):
+        write(env.root / "big" / f"f{i}.txt", f"x{i}", mtime=1_000_000)
+    env.scan()
+    seen = []
+    env.conn.set_trace_callback(lambda sql: seen.append(sql) if sql.strip().upper().startswith("COMMIT") else None)
+    res = archives.pack(env.conn, env.cfg, "/big")
+    assert res["files"] == 10
+    assert env.conn.execute("SELECT COUNT(*) FROM archive_members").fetchone()[0] == 10
+    assert vpaths(env) == ["/big.sqsh"]                       # the loose files were forgotten
+    assert len(seen) >= 8       # the archive, 4 pieces of the list, 4 pieces of forgetting, ...
+    # the member list of a retired archive goes in pieces too
+    archives.drop(env.conn, "/big")
+    assert env.conn.execute("SELECT COUNT(*) FROM archive_members").fetchone()[0] == 0

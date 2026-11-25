@@ -693,6 +693,10 @@ pointers to it, and files that no other node holds. The database's free space is
   is not applied again (the progress vector is kept).
 * The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
 * The server's own node cannot be removed.
+* Like packing and removing originals, it works in pieces of 500 rows per transaction
+  (`nodes.TX_ROWS`, `archives.TX_ROWS`), so the write lock is held for a moment at a time and the API
+  and the sync with other servers are not kept waiting. A member list is written, and later deleted,
+  the same way; the archive is announced first and, if the list cannot be completed, taken back.
 
 ### 5.20 Removing a node
 
@@ -710,6 +714,36 @@ pointers to it, and files that no other node holds. The database's free space is
   is not applied again (the progress vector is kept).
 * The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
 * The server's own node cannot be removed.
+
+### 5.21 The write lock: what was measured, and why the database is not split (yet)
+
+`db.lock_stats()` (and `GET /api/locks`) say, per kind of write transaction, how often it ran, how long
+it waited for the lock and how long it held it. A benchmark with a scan of 20,000 files, 20,000
+changes from a peer, an API client tagging files and a runner updating job items, all at once on
+one database, showed:
+
+* The heavy writers (a scan saving its results, applying a peer's changes) hold the lock for 40-110
+  ms at a time; the small ones (a tag, a job item's state) hold it for 1-6 ms. But SQLite makes a
+  waiting writer poll with growing pauses and does not queue them, so a writer that takes the lock
+  over and over starved the small ones: a 6 ms transaction waited up to **4 s**.
+* One long hold: after a scan, the versions of *every* touched file were compared in a single
+  transaction (0.65 s for 20,000 files; minutes for millions).
+
+Done: the lock is now a **fair queue** in front of SQLite's (`db._FairLock`): writers are served in
+order of arrival, interactive ones (an API request someone waits for) first, so a wait is bounded
+by the short transactions queued ahead; and the version comparison is done 500 files per
+transaction. Same load, afterwards: longest hold 0.11 s, longest wait of a small writer 0.17 s
+(was 4 s), and three to four times as many small writes per second (66 tags, 85 job-item updates
+instead of 28 and 21 in the same time).
+
+**Splitting the file.** What the scan and the changes of a peer write is the same ten tables
+(`files`, `dirs`, `copies`, `changes`, `decisions`, `tags`, ...): the two cannot be put in different
+files. What *could* move is what is independent of the index: jobs and their items, scan records, the
+outbox. But those reference nodes and files by foreign key (the cascades that make removing a node
+simple), a transaction that changes both (a transfer finishing: the copy and the item) would no longer
+be atomic in WAL mode, and the gain is for writers that, with the queue, already wait a fraction of a
+second. It is the next step if `lock_stats` still shows the small writers waiting behind the index
+under real load.
 
 ## 6. Replication (milestone 5)
 

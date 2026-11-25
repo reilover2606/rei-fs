@@ -32,6 +32,7 @@ from .hashing import hash_file
 from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
 
 BATCH_FILES = 500
+VERSION_CHUNK = 500         # files whose versions are compared per transaction
 BATCH_SECONDS = 1.0
 REPORT_SECONDS = 0.3        # progress callback at least this often
 BIG_FILE = 16 << 20         # announce files from this size on before hashing them
@@ -319,9 +320,16 @@ def scan_node(
     with db.transaction(conn, "scan: reconciling changes"):
         prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched,
                                     root, cfg.scan.group_decisions_min)
-        for fid in touched:
-            if conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone():
-                index.evaluate_divergence(conn, fid)
+    # Looking at the versions of every file the scan touched (all of them, on a first scan) is
+    # done a few hundred at a time: it is the long part, and the lock must not be held for it.
+    pending = sorted(touched)
+    for i in range(0, len(pending), VERSION_CHUNK):
+        check(stop)
+        with db.transaction(conn, "scan: checking versions"):
+            for fid in pending[i:i + VERSION_CHUNK]:
+                if conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone():
+                    index.evaluate_divergence(conn, fid)
+    with db.transaction(conn, "scan: finishing"):
         conn.execute(
             "UPDATE nodes SET last_scan = ?, last_scan_id = ?, online = 1, last_seen = ?"
             " WHERE id = ?",
