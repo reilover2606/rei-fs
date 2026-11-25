@@ -11,7 +11,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, index, nodes, paths, vdirs
+from . import archives, db, index, nodes, paths, vdirs
 
 TERMINAL_ITEM_STATES = ("done", "failed", "skipped", "cancelled")
 
@@ -36,6 +36,10 @@ def select_files(conn: sqlite3.Connection, vpaths: list[str],
         fid = index.file_id(conn, vpath)
         if fid is not None:
             selected[fid] = vpath
+            continue
+        packed = archives.get(conn, vpath)
+        if packed is not None:      # a packed directory is copied as its archive
+            selected[packed["file_id"]] = archives.archive_vpath(vpath)
             continue
         cond, args = paths.subtree_sql(vpath)
         rows = conn.execute(f"SELECT f.id, f.vpath FROM vfiles f WHERE {cond}", args).fetchall()

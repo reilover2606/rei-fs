@@ -780,6 +780,7 @@ class TreeView : public View {
       if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
       if (more_files_ > 0)
         heading += "   (" + std::to_string(more_files_) + " more files not listed; use Search)";
+      if (!inside_.empty()) heading += "   [inside " + inside_ + ": read-only, from the archive's list]";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
       return with_detail(list_panel(heading, menu_, labels_.size(),
@@ -792,7 +793,8 @@ class TreeView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  S: schedule sync  "
-           "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  r: refresh";
+           "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  "
+           "z: pack/unpack  Z: drop archive  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -828,6 +830,7 @@ class TreeView : public View {
           entries_ = out["entries"];
           dir_priority_ = out.value("priority", 2);
           this_node_ = out.value("this_node", "");
+          inside_ = out.value("inside_archive", "");
           more_files_ = out.value("more_files", 0);
           rebuild_labels();
           selected_ = reselect(entries_, name,
@@ -858,7 +861,13 @@ class TreeView : public View {
     for (const auto& e : entries_) {
       bool picked = picked_.count(child_path(e.value("name", ""))) > 0;
       std::string mark = picked ? "» " : "  ";
-      if (e.value("dir", false))
+      if (e.value("in_archive", false) && !e.value("dir", false))
+        labels_.push_back(mark + fit(e.value("name", ""), 40) + " " +
+                          fit(human_size(e.value("size", std::int64_t{0})), 10) + " in archive");
+      else if (e.value("packed", false))
+        labels_.push_back(mark + fit("▣ " + e.value("name", "") + "/", 34) + " " +
+                          fit(std::to_string(e.value("files", 0)) + " files", 11) + " [packed]");
+      else if (e.value("dir", false))
         labels_.push_back(mark + fit("▸ " + e.value("name", "") + "/", 34) + " " +
                           fit(std::to_string(e.value("files", 0)) + " files", 11) +
                           (e.value("priority", 2) != 2
@@ -897,6 +906,40 @@ class TreeView : public View {
       detail_ = text("");
       return;
     }
+    if (e->value("in_archive", false)) {
+      std::string p = child_path(e->value("name", ""));
+      bool d = e->value("dir", false);
+      detail_ = vbox({hard_wrap(p + (d ? "/" : ""), kDetailWidth - 1) | bold, separator(),
+                      text(d ? std::to_string(e->value("files", 0)) + " file(s) below"
+                             : "size: " + human_size(e->value("size", std::int64_t{0}))),
+                      text("inside the packed directory " + inside_),
+                      text(""), text("read-only: it is listed from the archive's contents") | dim,
+                      text("go up to the packed directory: z unpacks it") | dim});
+      return;
+    }
+    if (e->value("packed", false)) {
+      std::string dir = child_path(e->value("name", ""));
+      std::string archive = e->value("archive", dir + ".sqsh");
+      Element head = vbox({hard_wrap(dir + "/", kDetailWidth - 1) | bold,
+                           text("packed: " + std::to_string(e->value("files", 0)) +
+                                " files, " + human_size(e->value("bytes", std::int64_t{0})) +
+                                " before packing"),
+                           text("Enter: look inside (read-only)") | dim,
+                           text("z: unpack it  Z: drop the archive") | dim,
+                           text("c/m/f: copy, move or fetch the archive") | dim,
+                           text("search with 'deep search' to look inside") | dim,
+                           separator()});
+      detail_ = vbox({head, text("the archive " + archive + ":") | dim});
+      ctx_.run(
+          false, [archive](Api& a) { return a.get("/api/file?path=" + url_encode(archive)); },
+          [this, dir, head](json f) {
+            const json* cur = current();
+            if (!cur || child_path(cur->value("name", "")) != dir) return;
+            detail_ = vbox({head, file_details(f)});
+          },
+          "tree-detail");
+      return;
+    }
     if (e->value("dir", false)) {
       detail_ = vbox({hard_wrap(child_path(e->value("name", "")) + "/", kDetailWidth - 1) | bold,
                       separator(),
@@ -908,6 +951,7 @@ class TreeView : public View {
                       text("x: pick up to move it in the tree  n: rename") | dim,
                       text("u: update priority (how often it is scanned)") | dim,
                       text("f: fetch it to this machine (the fetch folder)") | dim,
+                      text("z: pack it into one squashfs archive") | dim,
                       text("blue: a copy is on this server's own node") | dim});
       return;
     }
@@ -961,6 +1005,14 @@ class TreeView : public View {
     if (key(e, "r")) {
       refresh();
       return true;
+    }
+    if (!inside_.empty()) {   // what is listed from an archive cannot be acted on
+      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z"})
+        if (key(e, k)) {
+          ctx_.notify("inside the packed directory " + inside_ +
+                      ": read-only (go up to it; z there unpacks it)");
+          return true;
+        }
     }
     if (key(e, "p") && !picked_.empty()) {   // put the picked-up items here
       move_items({picked_.begin(), picked_.end()}, path_, "");
@@ -1017,6 +1069,26 @@ class TreeView : public View {
       rebuild_labels();
       return true;
     }
+    bool packed = cur->value("packed", false);
+    if (key(e, "z") && dir) {   // pack a directory into one archive, or unpack it
+      if (packed)
+        unpack_dir(target);
+      else
+        pack_dir(target);
+      return true;
+    }
+    if (key(e, "Z") && packed) {   // forget the archive without unpacking it
+      ctx_.dialogs->confirm(
+          "Drop the archive of " + target + "?\nIts files are NOT extracted: they are gone once "
+          "the archive is deleted (it is only marked for deletion, you confirm in the Marked tab).",
+          [this, target] {
+            ctx_.send("/api/archives/drop", {{"vpath", target}}, [this, target](json) {
+              ctx_.notify(target + " is no longer packed; its archive is marked for deletion");
+              refresh();
+            });
+          });
+      return true;
+    }
     if (key(e, "D") && dir) {   // remove an empty directory
       ctx_.dialogs->confirm("Remove the empty directory " + target + "?", [this, target] {
         ctx_.send("/api/rmdir", {{"path", target}}, [this, target](json) {
@@ -1045,6 +1117,35 @@ class TreeView : public View {
       return true;
     }
     return false;
+  }
+
+  void pack_dir(const std::string& target) {
+    ctx_.dialogs->ask_choice(
+        "Pack " + target + " into one squashfs archive (" + target + ".sqsh)?\n"
+        "It then shows as a single entry; search looks inside only with 'deep search'.\n"
+        "The directory must be on one node of a server with the squashfs tools.",
+        {"pack, keep the original files", "pack, then remove the original files"},
+        [this, target](int i) {
+          ctx_.send("/api/archives/pack", {{"vpath", target}, {"remove_originals", i == 1}},
+                    [this, target](json out) {
+                      ctx_.notify("packing " + target + " on " + out.value("node", "") +
+                                  " in the background (see the status line)");
+                      follow_ = 5;
+                    });
+        });
+  }
+
+  void unpack_dir(const std::string& target) {
+    ctx_.dialogs->confirm(
+        "Unpack " + target + "?\nThe files are extracted next to the archive; the archive is "
+        "then marked for deletion (you confirm that in the Marked tab).",
+        [this, target] {
+          ctx_.send("/api/archives/unpack", {{"vpath", target}}, [this, target](json out) {
+            ctx_.notify("unpacking " + target + " on " + out.value("node", "") +
+                        " in the background (see the status line)");
+            follow_ = 5;
+          });
+        });
   }
 
   void set_priority(const std::string& dir_path) {
@@ -1077,6 +1178,7 @@ class TreeView : public View {
   std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
   int dir_priority_ = 2;           // update priority of the directory shown
   std::string this_node_;          // name of this server's own node
+  std::string inside_;             // the packed directory being looked into ("" outside one)
   int more_files_ = 0;             // files of this folder beyond the listing limit
   int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";
@@ -1101,12 +1203,13 @@ class SearchView : public View {
     tag_input_ = Input(&tag_, "tag", opt);
     auto issues = Checkbox("non-portable", &issues_);
     auto under = Checkbox("under-replicated", &under_);
+    auto deep = Checkbox("deep search (inside packed dirs)", &deep_);
     auto button = Button("Search", [this] { search(); }, ButtonOption::Ascii());
     MenuOption mopt = MenuOption::Vertical();
     mopt.on_change = [this] { load_detail(); };
     mopt.on_enter = [this] { show_in_tree(); };
     menu_ = Menu(&labels_, &selected_, mopt);
-    auto form = Container::Horizontal({query_input_, tag_input_, issues, under, button});
+    auto form = Container::Horizontal({query_input_, tag_input_, issues, under, deep, button});
     // Focusable line holding the keyboard focus while not typing, so that the
     // number keys keep switching tabs ("/" starts typing a search).
     hint_ = Renderer([this](bool focused) {
@@ -1119,7 +1222,7 @@ class SearchView : public View {
       auto form_el = hbox({
           query_input_->Render() | border | flex,
           tag_input_->Render() | border | size(WIDTH, EQUAL, 20),
-          vbox({issues->Render(), under->Render()}),
+          vbox({issues->Render(), under->Render(), deep->Render()}),
           button->Render() | vcenter,
       });
       std::string heading = "results";
@@ -1128,6 +1231,9 @@ class SearchView : public View {
       } else if (!labels_.empty()) {
         heading = (dirs_total_ > 0 ? std::to_string(dirs_total_) + " folder(s), " : "") +
                   std::to_string(total_) + " file(s)" +
+                  (members_.empty() ? ""
+                                    : ", " + std::to_string(members_.size()) +
+                                          (members_truncated_ ? "+" : "") + " inside packed dirs") +
                   (truncated_ ? " (first 1000 shown)" : "");
       }
       return vbox({form_el, hint_->Render(),
@@ -1158,18 +1264,25 @@ class SearchView : public View {
   }
 
  private:
-  // Folders come first, then files: row i is a folder if i < dirs_.size().
+  // Folders come first, then files, then (deep search) files inside packed directories:
+  // row i is a folder if i < dirs_.size().
   int ndirs() const { return static_cast<int>(dirs_.size()); }
   bool on_dir() const { return selected_ >= 0 && selected_ < ndirs(); }
   const json* current_file() const {
     int i = selected_ - ndirs();
     return i >= 0 && i < static_cast<int>(results_.size()) ? &results_[i] : nullptr;
   }
+  const json* current_member() const {
+    int i = selected_ - ndirs() - static_cast<int>(results_.size());
+    return i >= 0 && i < static_cast<int>(members_.size()) ? &members_[i] : nullptr;
+  }
   // Path of the selected row (folder or file); "" if there is none.
   std::string current_path() const {
     if (on_dir()) return dirs_[selected_].value("path", "");
     const json* f = current_file();
-    return f ? f->value("path", "") : "";
+    if (f) return f->value("path", "");
+    const json* m = current_member();
+    return m ? m->value("vpath", "") : "";
   }
 
   // Only while this tab is the one on screen: taking the focus of a hidden
@@ -1187,6 +1300,7 @@ class SearchView : public View {
     std::string q = "/api/find?q=" + url_encode(query_) + "&tag=" + url_encode(tag_);
     if (issues_) q += "&issues=1";
     if (under_) q += "&under=1";
+    if (deep_) q += "&deep=1";
     searched_ = true;
     searching_ = true;
     ctx_.get(q, [this, from_user](json out) {
@@ -1195,6 +1309,8 @@ class SearchView : public View {
       dirs_ = out.value("dirs", json::array());
       total_ = out.value("total", 0);
       dirs_total_ = out.value("dirs_total", 0);
+      members_ = out.value("members", json::array());
+      members_truncated_ = out.value("members_truncated", false);
       truncated_ = out.value("truncated", false) || dirs_total_ > ndirs();
       labels_.clear();
       for (const auto& d : dirs_)
@@ -1205,6 +1321,9 @@ class SearchView : public View {
         shown["name"] = f.value("path", "");
         labels_.push_back("  " + file_label(shown, 48));
       }
+      for (const auto& m : members_)
+        labels_.push_back("▣ " + fit(m.value("vpath", ""), 60) + " " +
+                          human_size(m.value("size", std::int64_t{0})));
       selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
       load_detail();
       if (from_user && typing()) leave_inputs();
@@ -1220,6 +1339,14 @@ class SearchView : public View {
                       text(""),
                       text("Enter: show it in the Tree") | dim,
                       text("t: tag every file below  c/m: copy/move it all") | dim});
+      return;
+    }
+    if (const json* m = current_member()) {
+      detail_ = vbox({hard_wrap(m->value("vpath", ""), kDetailWidth - 1) | bold, separator(),
+                      text("inside the packed directory " + m->value("archive", "")),
+                      text("size: " + human_size(m->value("size", std::int64_t{0}))), text(""),
+                      text("Enter: show the packed directory in the Tree") | dim,
+                      text("z (in the Tree): unpack it") | dim});
       return;
     }
     const json* cur = current_file();
@@ -1242,6 +1369,13 @@ class SearchView : public View {
   void show_in_tree() {
     std::string path = current_path();
     if (path.empty()) return;
+    if (const json* m = current_member()) {   // the packed directory it is in
+      std::string dir = m->value("archive", "");
+      auto cut = dir.rfind('/');
+      ctx_.show_in_tree(cut == 0 || cut == std::string::npos ? "/" : dir.substr(0, cut),
+                        dir.substr(cut + 1));
+      return;
+    }
     if (on_dir()) {
       ctx_.show_in_tree(path, "");
       return;
@@ -1270,6 +1404,12 @@ class SearchView : public View {
     if (!menu_->Focused() || labels_.empty()) return false;
     std::string path = current_path();
     if (path.empty()) return false;
+    if (current_member() && (key(e, "t") || key(e, "T") || key(e, "c") || key(e, "m") ||
+                             key(e, "f"))) {
+      ctx_.error("this file is inside a packed directory: act on the directory (Enter shows it "
+                 "in the Tree), or unpack it");
+      return true;
+    }
     if (key(e, "t") || key(e, "T")) {
       tag_paths(ctx_, {path}, on_dir(), key(e, "t"), [this] { search(false); });
       return true;
@@ -1304,8 +1444,10 @@ class SearchView : public View {
   Context& ctx_;
   bool searching_ = false;
   std::string query_, tag_, tags_line_;
-  bool issues_ = false, under_ = false, searched_ = false, truncated_ = false;
+  bool issues_ = false, under_ = false, deep_ = false, searched_ = false, truncated_ = false;
+  bool members_truncated_ = false;
   int total_ = 0, dirs_total_ = 0;
+  json members_ = json::array();   // deep search: files inside packed directories
   json results_ = json::array();
   json dirs_ = json::array();
   std::vector<std::string> labels_;

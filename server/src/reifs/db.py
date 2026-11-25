@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -573,6 +573,28 @@ def _migration_16(conn: sqlite3.Connection) -> None:
 
 MIGRATIONS[16] = _migration_16
 
+MIGRATIONS[17] = """
+-- Packed directories (design 5.16): a directory kept as one squashfs file. The archive is an
+-- ordinary file of the virtual tree (``<dir>.sqsh``); this table says which directory it stands
+-- for, and ``archive_members`` lists what is inside so that a "deep" search can find it.
+CREATE TABLE archives (
+    id         INTEGER PRIMARY KEY,
+    dir_path   TEXT NOT NULL UNIQUE,         -- the packed directory, '/src/foo'
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    present    INTEGER NOT NULL DEFAULT 1,   -- 0: unpacked or removed (a tombstone for peers)
+    files      INTEGER NOT NULL DEFAULT 0,   -- members
+    bytes      INTEGER NOT NULL DEFAULT 0,   -- their size before packing
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+CREATE TABLE archive_members (
+    archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,                -- relative to the packed directory
+    size       INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, path)
+) WITHOUT ROWID;
+"""
+
 
 def now() -> int:
     """The current time as the database keeps it: microseconds since the Unix epoch (UTC)."""
@@ -698,11 +720,15 @@ def register_functions(conn: sqlite3.Connection) -> None:
     conn.create_function("vh", 1, key_hash, deterministic=True)
 
 
-def connect(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
+def connect(path: Path | str, timeout: float = 30, new: bool = False) -> sqlite3.Connection:
     _use_a_roomy_temp_dir(path)
     conn = sqlite3.connect(path, isolation_level=None, timeout=timeout)
     conn.row_factory = sqlite3.Row
     register_functions(conn)
+    if new:
+        # Free pages can then be given back to the disk a little at a time (see ``reclaim``);
+        # this has to be chosen before the file is used at all (before WAL mode, too).
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
@@ -710,7 +736,7 @@ def connect(path: Path | str, timeout: float = 30) -> sqlite3.Connection:
 
 
 def create(path: Path | str) -> sqlite3.Connection:
-    conn = connect(path)
+    conn = connect(path, new=True)
     # executescript() manages its own transaction; keep schema + version atomic.
     conn.executescript(f"BEGIN;\n{SCHEMA}\nPRAGMA user_version = 1;\nCOMMIT;")
     migrate(conn)
@@ -830,9 +856,47 @@ def vacuum(conn: sqlite3.Connection, path: Path | str) -> tuple[int, int]:
         raise DatabaseLocked(f"not enough free disk space to compact the database: it takes "
                              f"about {before // 2**20} MiB and {free // 2**20} MiB are free")
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")     # takes effect with the rebuild
     conn.execute("VACUUM")
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return before, size()
+
+
+def is_incremental(conn: sqlite3.Connection) -> bool:
+    return conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+
+
+def reclaim(conn: sqlite3.Connection, seconds: float = 20.0, chunk: int = 4000) -> int:
+    """Give free pages back to the disk after many rows were deleted, a little at a time so that
+    writers wait for a moment only. Needs ``auto_vacuum = INCREMENTAL`` (databases made by this
+    version; older ones get it with ``vacuum``). Returns the bytes freed (0 if nothing could be)."""
+    if not is_incremental(conn):
+        return 0
+    page = conn.execute("PRAGMA page_size").fetchone()[0]
+    start = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        left = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        if not left:
+            break
+        conn.execute(f"PRAGMA incremental_vacuum({chunk})").fetchall()
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")      # the file itself shrinks at a checkpoint
+    return (start - conn.execute("PRAGMA freelist_count").fetchone()[0]) * page
+
+
+def make_incremental(conn: sqlite3.Connection, path: Path | str) -> None:
+    """Databases made by older versions give no space back: convert them once (a full rebuild,
+    like the compaction after an upgrade). Called when the server starts."""
+    if is_incremental(conn):
+        return
+    print("rei-fs: preparing the database to give space back after deletions "
+          "(one-time rebuild of the file; a few minutes if it is big)", file=sys.stderr, flush=True)
+    try:
+        b, a = vacuum(conn, path)
+        print(f"rei-fs: database {b // 2**20} MiB -> {a // 2**20} MiB", file=sys.stderr, flush=True)
+    except (DatabaseLocked, sqlite3.Error) as e:
+        print(f"rei-fs: could not rebuild it now ({e}); 'reifs db vacuum' does it",
+              file=sys.stderr, flush=True)
 
 
 def _free(path: Path | str) -> str:

@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import db, fsops, index, paths, priority
+from . import archives, db, fsops, index, paths, priority
 from .config import Config, ScanSection
 from .control import Stopped, StopFn, check
 from .hashing import hash_file
@@ -42,15 +42,16 @@ def reserved_dirs(conn: sqlite3.Connection, cfg: Config, node_id: str) -> tuple[
     """Folders at the root of a node that are not part of the virtual tree: the "fetch"
     folder of this server's own node, where fetched files are put. Unless the node
     already tracks files there (a folder of the user's with that name): those stay."""
+    packed = tuple(archives.packed_dirs(conn))   # kept as an archive: not tracked loose
     row = conn.execute("SELECT kind FROM nodes WHERE id = ?", (node_id,)).fetchone()
     name = cfg.storage.fetch_dir.strip("/")
     if row is None or row["kind"] != "server" or not name:
-        return ()
+        return packed
     cond, args = paths.subtree_sql("/" + name, "f.dir_path")
     if conn.execute("SELECT 1 FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?"
                     f" AND {cond} LIMIT 1", (node_id, *args)).fetchone():
-        return ()
-    return ("/" + name,)
+        return packed
+    return ("/" + name, *packed)
 
 
 class Ignorer:

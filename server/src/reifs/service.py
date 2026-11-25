@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import db, index, peers, priority, relay, replication, runner, scanner, schedules, sync
+from . import archives, db, index, peers, priority, relay, replication, runner, scanner, schedules, sync
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
@@ -98,6 +98,11 @@ class Worker:
 
     def request_plan(self) -> None:
         self._enqueue(("plan",))
+
+    def request_archive(self, op: str, vdir: str, node: str | None,
+                        remove_originals: bool = False) -> None:
+        """Pack a directory into an archive, or unpack one."""
+        self._enqueue(("archive", op, vdir, node, remove_originals))
 
     def request_stop(self) -> None:
         """Interrupt the current operation and drop queued ones."""
@@ -240,8 +245,11 @@ class Worker:
 
     def _run(self, conn, task: tuple) -> None:
         kind = task[0]
-        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups"}[kind]
-        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups"}[kind])
+        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups",
+                 "archive": "packing" if kind == "archive" and task[1] == "pack"
+                 else "unpacking"}[kind]
+        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups",
+                      "archive": state}[kind])
         self._set(state=state, detail="", since=db.now())
         if kind == "plan":
             started = time.monotonic()
@@ -268,7 +276,27 @@ class Worker:
         stop = self.stop_requested.is_set
         try:
             with ServerLock(self.cfg.home):
-                if kind == "scan":
+                if kind == "archive":
+                    op, vdir, node, remove = task[1:]
+                    if op == "pack":
+                        res = archives.pack(conn, self.cfg, vdir, node, remove,
+                                            progress=self._progress, stop=stop)
+                        msg = (f"packed {vdir}: {res['files']:,} files into "
+                               f"{res['archive_bytes'] / 1e6:.1f} MB")
+                        msg += (f"; {res['originals_removed']:,} original files removed"
+                                if remove else "; the original files were kept")
+                        if res["database_reclaimed"]:
+                            msg += (f"; {res['database_reclaimed'] / 1e6:.1f} MB of database "
+                                    "space given back")
+                    else:
+                        res = archives.unpack(conn, self.cfg, vdir, node,
+                                              progress=self._progress, stop=stop)
+                        msg = f"unpacked {vdir}: {res['files']:,} files"
+                    self._set(last_result=msg, last_error="")
+                    self.request_plan()
+                    if self.syncer is not None:
+                        self.syncer.request_poke()
+                elif kind == "scan":
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
                         progress=self._scan_progress, stop=stop, full=task[3],
@@ -295,6 +323,8 @@ class Worker:
                         self.syncer.request_poke()
         except Stopped:
             self._set(last_result=f"{kind} stopped on request")
+        except archives.ArchiveError as e:
+            self._set(last_error=str(e))
         except LockError as e:
             self._set(last_error=str(e))
         except Exception as e:  # noqa: BLE001 - report, keep serving

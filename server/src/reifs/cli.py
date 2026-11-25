@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (__version__, auth, db, decisions, index, jobs, nodes, peers, queries,
+from . import (__version__, archives, auth, db, decisions, index, jobs, nodes, peers, queries,
                replication, runner, scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
@@ -153,6 +153,45 @@ def cmd_discover(args) -> None:
         print(f"moved    {name:20} now at {root}")
     for name, owner, path in d.foreign:
         print(f"foreign  {name:20} {path} (owned by server {owner})")
+
+
+def cmd_archive(args) -> None:
+    cfg, conn = open_server(args.home)
+    act = args.action
+    try:
+        if act == "list":
+            rows = conn.execute("SELECT * FROM archives WHERE present = 1 ORDER BY dir_path").fetchall()
+            if not rows:
+                print("No packed directories.")
+            for r in rows:
+                print(f"{r['dir_path']}  ({r['files']:,} files, {r['bytes'] / 1e6:.1f} MB unpacked, "
+                      f"archive {archives.archive_vpath(r['dir_path'])})")
+            return
+        if not args.vpath:
+            raise CliError(f"usage: reifs archive {act} DIRECTORY")
+
+        def progress(msg: str) -> None:
+            print(msg, file=sys.stderr, flush=True)
+
+        with ServerLock(cfg.home):
+            if act == "pack":
+                res = archives.pack(conn, cfg, args.vpath, args.node, args.remove_originals,
+                                    progress=progress)
+                print(f"Packed {res['files']:,} files of {res['dir']} on {res['node']} into "
+                      f"{res['archive']} ({res['archive_bytes'] / 1e6:.1f} MB).")
+                if res["originals_kept"]:
+                    print("The original files were kept: remove them yourself once you are happy "
+                          "with the archive (or pack with --remove-originals).")
+            elif act == "unpack":
+                res = archives.unpack(conn, cfg, args.vpath, args.node, progress=progress)
+                print(f"Unpacked {res['files']:,} files into {res['dir']} on {res['node']}. "
+                      "The archive is marked for deletion (Marked tab, or 'reifs marked').")
+            else:
+                res = archives.drop(conn, args.vpath)
+                print(f"{res['dir']} is no longer a packed directory; {res['archive']} is "
+                      "marked for deletion. Its contents are lost once it is deleted.")
+    except archives.ArchiveError as e:
+        raise CliError(str(e)) from None
 
 
 def cmd_scan(args) -> None:
@@ -602,6 +641,7 @@ def cmd_serve(args) -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg, conn = open_server(args.home)
+    db.make_incremental(conn, cfg.db_path)
     conn.close()
     # Scans and transfers run Python code for a long time. With the default 5 ms
     # switch interval a request thread waits for its turn at every step of its
@@ -1068,6 +1108,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)
+
+    s = sub.add_parser("archive", help="pack a directory into one squashfs archive, or unpack one")
+    s.add_argument("action", choices=["pack", "unpack", "drop", "list"])
+    s.add_argument("vpath", nargs="?", help="the directory in the virtual tree, e.g. /src/old-app")
+    s.add_argument("--node", help="node to pack on / unpack to (default: one holding everything)")
+    s.add_argument("--remove-originals", action="store_true",
+                   help="pack: delete the files that went into the archive, after checking it")
+    s.set_defaults(func=cmd_archive)
 
     s = sub.add_parser("scan", help="scan online owned nodes for changes")
     s.add_argument("nodes", nargs="*", help="node names (default: all online)")
