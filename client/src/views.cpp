@@ -780,6 +780,7 @@ class TreeView : public View {
       if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
       if (more_files_ > 0)
         heading += "   (" + std::to_string(more_files_) + " more files not listed; use Search)";
+      if (!inside_.empty()) heading += "   [inside " + inside_ + ": read-only, from the archive's list]";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
       return with_detail(list_panel(heading, menu_, labels_.size(),
@@ -829,6 +830,7 @@ class TreeView : public View {
           entries_ = out["entries"];
           dir_priority_ = out.value("priority", 2);
           this_node_ = out.value("this_node", "");
+          inside_ = out.value("inside_archive", "");
           more_files_ = out.value("more_files", 0);
           rebuild_labels();
           selected_ = reselect(entries_, name,
@@ -859,7 +861,10 @@ class TreeView : public View {
     for (const auto& e : entries_) {
       bool picked = picked_.count(child_path(e.value("name", ""))) > 0;
       std::string mark = picked ? "» " : "  ";
-      if (e.value("packed", false))
+      if (e.value("in_archive", false) && !e.value("dir", false))
+        labels_.push_back(mark + fit(e.value("name", ""), 40) + " " +
+                          fit(human_size(e.value("size", std::int64_t{0})), 10) + " in archive");
+      else if (e.value("packed", false))
         labels_.push_back(mark + fit("▣ " + e.value("name", "") + "/", 34) + " " +
                           fit(std::to_string(e.value("files", 0)) + " files", 11) + " [packed]");
       else if (e.value("dir", false))
@@ -901,6 +906,17 @@ class TreeView : public View {
       detail_ = text("");
       return;
     }
+    if (e->value("in_archive", false)) {
+      std::string p = child_path(e->value("name", ""));
+      bool d = e->value("dir", false);
+      detail_ = vbox({hard_wrap(p + (d ? "/" : ""), kDetailWidth - 1) | bold, separator(),
+                      text(d ? std::to_string(e->value("files", 0)) + " file(s) below"
+                             : "size: " + human_size(e->value("size", std::int64_t{0}))),
+                      text("inside the packed directory " + inside_),
+                      text(""), text("read-only: it is listed from the archive's contents") | dim,
+                      text("go up to the packed directory: z unpacks it") | dim});
+      return;
+    }
     if (e->value("packed", false)) {
       std::string dir = child_path(e->value("name", ""));
       std::string archive = e->value("archive", dir + ".sqsh");
@@ -908,6 +924,7 @@ class TreeView : public View {
                            text("packed: " + std::to_string(e->value("files", 0)) +
                                 " files, " + human_size(e->value("bytes", std::int64_t{0})) +
                                 " before packing"),
+                           text("Enter: look inside (read-only)") | dim,
                            text("z: unpack it  Z: drop the archive") | dim,
                            text("c/m/f: copy, move or fetch the archive") | dim,
                            text("search with 'deep search' to look inside") | dim,
@@ -955,10 +972,6 @@ class TreeView : public View {
   void enter() {
     const json* e = current();
     if (!e || !e->value("dir", false)) return;
-    if (e->value("packed", false)) {
-      ctx_.notify(e->value("name", "") + " is packed: z unpacks it, 'deep search' looks inside");
-      return;
-    }
     path_ = child_path(e->value("name", ""));
     selected_ = 0;
     entries_ = json::array();
@@ -992,6 +1005,14 @@ class TreeView : public View {
     if (key(e, "r")) {
       refresh();
       return true;
+    }
+    if (!inside_.empty()) {   // what is listed from an archive cannot be acted on
+      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z"})
+        if (key(e, k)) {
+          ctx_.notify("inside the packed directory " + inside_ +
+                      ": read-only (go up to it; z there unpacks it)");
+          return true;
+        }
     }
     if (key(e, "p") && !picked_.empty()) {   // put the picked-up items here
       move_items({picked_.begin(), picked_.end()}, path_, "");
@@ -1157,6 +1178,7 @@ class TreeView : public View {
   std::set<std::string> picked_;   // vpaths picked up for a move (kept while browsing)
   int dir_priority_ = 2;           // update priority of the directory shown
   std::string this_node_;          // name of this server's own node
+  std::string inside_;             // the packed directory being looked into ("" outside one)
   int more_files_ = 0;             // files of this folder beyond the listing limit
   int follow_ = 0;                 // polls left to refresh the listing after a move
   std::string path_ = "/";

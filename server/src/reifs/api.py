@@ -569,7 +569,10 @@ class Api:
         here = prefs.effective(vdir)
         out = []
         for e in entries:
-            if e.is_dir:
+            if entries.inside:       # read from an archive: nothing here can be acted on
+                out.append({"name": e.name, "dir": e.is_dir, "in_archive": True,
+                            "files": e.files, "size": e.member_size or 0})
+            elif e.is_dir:
                 child = paths.join(vdir, e.name)
                 d = {"name": e.name, "dir": True, "files": e.files, "here": e.here,
                      "priority": prefs.prefs.get(child, here),
@@ -584,6 +587,7 @@ class Api:
                 out.append(f)
         mine = conn.execute("SELECT name FROM nodes WHERE id = ?", (nodes.self_id(conn),)).fetchone()
         return {"path": vdir, "entries": out, "priority": here, "more_files": entries.more,
+                "inside_archive": entries.inside or "",
                 "this_node": mine[0] if mine else ""}
 
     def file(self, conn, q, body, **_):

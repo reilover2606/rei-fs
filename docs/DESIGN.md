@@ -562,8 +562,10 @@ It can be packed into one squashfs archive, `<dir>.sqsh`, next to where the dire
   archive. The `archives` table (`dir_path`, `file_id`, `files`, `bytes`, a `present` flag that
   makes a removal a tombstone) says which directory it stands for; `archive_members` lists the
   files inside (path and size) so that they can be searched.
-* **In the tree** a packed directory is one entry, marked packed, that cannot be entered;
-  its archive file is not listed beside it. A packed directory cannot be moved or renamed
+* **In the tree** a packed directory is one entry, marked packed; its archive file is not listed
+  beside it. It can be entered: the listing is then read from `archive_members` (folders with
+  their file counts, files with their size) and is read-only (`in_archive` entries, nothing can be
+  tagged, copied or moved from inside; act on the packed directory). A packed directory cannot be moved or renamed
   (unpack it first) and a directory holding or inside one cannot be packed.
 * **Search is flat by default.** Names inside archives are found only with `deep` (the "deep
   search" box of the Search tab, `deep=1` of `/api/find`, which adds a `members` list).

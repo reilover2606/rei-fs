@@ -103,11 +103,13 @@ class DirEntry:
     file: FileInfo | None = None
     here: int = 0              # of them, files with a copy on this server's own node
     packed: dict | None = None  # a packed directory: {"archive": vpath, "bytes": n, "file_id": id}
+    member_size: int | None = None   # inside a packed directory: a file's size (read-only entry)
 
 
 class Entries(list):
     """The listing of a directory; ``more`` = files beyond the limit that are not listed."""
     more: int = 0
+    inside: str | None = None   # the packed directory this listing is read from, if any
 
 
 MAX_FILES_LISTED = 2000   # a folder of a million files is not worth sending whole
@@ -128,10 +130,8 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     me = index.self_id(conn)
     if vdir != "/":
         outer = archives.packed_dir_of(conn, vdir)
-        if outer == vdir:
-            return Entries()          # a packed directory is opaque
         if outer:
-            return None
+            return _list_archive(conn, outer, vdir)
     packed_here = {r["dir_path"]: r for r in conn.execute(
         "SELECT dir_path, files, bytes, file_id FROM archives WHERE present = 1")
         if paths.parent(r["dir_path"]) == vdir}
@@ -186,6 +186,34 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
         entries.append(DirEntry(name, False, 1, file_info(conn, fid, policy), int(here)))
     out.extend(sorted(entries, key=lambda e: e.name))
     out.more = more
+    return out
+
+
+def _list_archive(conn: sqlite3.Connection, packed: str, vdir: str) -> Entries | None:
+    """What is inside a packed directory, read from its member list (read-only)."""
+    row = archives.get(conn, packed)
+    sub = vdir[len(packed):].strip("/")
+    lo = sub + "/" if sub else ""
+    q = "SELECT path, size FROM archive_members WHERE archive_id = ?"
+    args: list = [row["id"]]
+    if lo:
+        q += " AND path >= ? AND path < ?"
+        args += [lo, lo[:-1] + "0"]
+    dirs: dict[str, int] = {}
+    files: list[tuple[str, int]] = []
+    for path, size in conn.execute(q + " ORDER BY path", args):
+        head, sep, _ = path[len(lo):].partition("/")
+        if sep:
+            dirs[head] = dirs.get(head, 0) + 1
+        else:
+            files.append((head, size))
+    if sub and not dirs and not files:
+        return None
+    out = Entries(DirEntry(n, True, c) for n, c in sorted(dirs.items()))
+    shown = files[:MAX_FILES_LISTED]
+    out.extend(DirEntry(n, False, 1, member_size=s) for n, s in sorted(shown))
+    out.more = len(files) - len(shown)
+    out.inside = packed
     return out
 
 

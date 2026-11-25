@@ -488,7 +488,10 @@ def test_pack_search_deep_and_unpack_over_the_api(server):
     wait(lambda: any(e.get("packed") for e in client.get("/api/tree?path=/")["entries"]), "packed")
     entry = [e for e in client.get("/api/tree?path=/")["entries"] if e["name"] == "docs"][0]
     assert entry["packed"] and entry["archive"] == "/docs.sqsh" and entry["files"] == 2
-    assert client.get("/api/find?q=a.txt")["total"] == 0                  # opaque
+    inside = client.get("/api/tree?path=/docs")                          # can be looked into
+    assert inside["inside_archive"] == "/docs"
+    assert [(e["name"], e["in_archive"]) for e in inside["entries"]][0] == ("a.txt", True)
+    assert client.get("/api/find?q=a.txt")["total"] == 0                  # opaque to a search
     deep = client.get("/api/find?q=a.txt&deep=1")
     assert deep["total"] == 0 and [m["vpath"] for m in deep["members"]] == ["/docs/a.txt"]
     client.post("/api/archives/pack", {"vpath": "/docs"}, expect=400)       # already packed

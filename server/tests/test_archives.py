@@ -34,8 +34,15 @@ def test_pack_makes_one_archive_and_the_directory_is_opaque(env):
     entries = queries.list_dir(env.conn, "/src")
     assert [(e.name, e.is_dir, bool(e.packed), e.files) for e in entries] == [
         ("foo", True, True, 4), ("keep.txt", False, False, 1)]
-    assert queries.list_dir(env.conn, "/src/foo") == []          # opaque
-    assert queries.list_dir(env.conn, "/src/foo/sub") is None
+    # it can still be looked into (read-only), from the member list
+    inside = queries.list_dir(env.conn, "/src/foo")
+    assert inside.inside == "/src/foo"
+    assert [(e.name, e.is_dir, e.files, e.member_size) for e in inside] == [
+        (".git", True, 1, None), ("sub", True, 2, None), ("a.c", False, 1, 90)]
+    deeper = queries.list_dir(env.conn, "/src/foo/sub")
+    assert [(e.name, e.is_dir) for e in deeper] == [("deep", True), ("b.c", False)]
+    assert queries.list_dir(env.conn, "/src/foo/sub/deep")[0].name == "c.txt"
+    assert queries.list_dir(env.conn, "/src/foo/nothing") is None
     # a scan does not take the loose files up again
     env.scan()
     assert vpaths(env) == ["/src/foo.sqsh", "/src/keep.txt"]
