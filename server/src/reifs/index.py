@@ -301,16 +301,19 @@ def group_decisions(conn: sqlite3.Connection, member_kind: str, node_id: str,
     buckets: dict[str, list[tuple[int, dict]]] = {}
     for did, key, info in entries:
         buckets.setdefault(key, []).append((did, info))
+    # The open groups of this node and kind, read once (a query per key was a scan of every
+    # open group for every folder: with thousands of each, minutes).
+    open_groups = {r[1]: r[0] for r in conn.execute(
+        "SELECT id, json_extract(data, '$.key') FROM decisions WHERE kind = 'group'"
+        " AND status = 'open' AND node_id = ? AND json_extract(data, '$.member_kind') = ?",
+        (node_id, member_kind))}
     grouped = 0
     for key, members in buckets.items():
-        existing = conn.execute(
-            "SELECT id FROM decisions WHERE kind = 'group' AND status = 'open' AND node_id = ?"
-            " AND json_extract(data, '$.key') = ? AND json_extract(data, '$.member_kind') = ?",
-            (node_id, key, member_kind)).fetchone()
+        existing = open_groups.get(key)
         if existing is None and len(members) < minimum:
             continue
         if existing is not None:
-            gid = existing[0]
+            gid = existing
         else:
             info = dict(members[0][1], key=key, member_kind=member_kind)
             gid = add_decision(conn, "group", None, node_id, info)

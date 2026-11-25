@@ -107,3 +107,27 @@ def test_files_that_come_back_empty_the_group(two):
     two.scan()
     assert top(two) == []                                         # the group closes by itself
     assert decisions.count_decisions(two.conn) == 0
+
+
+def test_grouping_does_not_look_up_the_open_groups_once_per_folder(env):
+    """Thousands of folders with a vanished file each, and thousands of open groups, were a
+    scan of every group for every folder (minutes). The open groups are read once."""
+    import json
+    from reifs import db, index
+    node = env.conn.execute("SELECT id FROM nodes").fetchone()[0]
+    with db.transaction(env.conn):
+        old = index.add_decision(env.conn, "group", None, node,
+                                 {"key": "in:/d0", "member_kind": "missing", "dir": "/d0", "mode": "in"})
+        entries = []
+        for i in range(300):
+            did = index.add_decision(env.conn, "missing", None, node, {"vpath": f"/d{i}/x"})
+            entries.append((did, f"in:/d{i % 100}", {"dir": f"/d{i % 100}", "mode": "in"}))
+        seen = []
+        env.conn.set_trace_callback(lambda sql: seen.append(sql) if "json_extract" in sql else None)
+        grouped = index.group_decisions(env.conn, "missing", node, entries, 3)
+        env.conn.set_trace_callback(None)
+    assert grouped == 300 and len(seen) == 1                        # one look, not one per folder
+    parents = env.conn.execute("SELECT parent_id, COUNT(*) FROM decisions WHERE parent_id IS NOT NULL"
+                               " GROUP BY parent_id").fetchall()
+    assert len(parents) == 100 and {r[1] for r in parents} == {3}
+    assert env.conn.execute("SELECT COUNT(*) FROM decisions WHERE parent_id = ?", (old,)).fetchone()[0] == 3
