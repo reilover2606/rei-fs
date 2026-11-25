@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import itertools
 import os
 import re
@@ -1067,6 +1068,9 @@ _waiters: dict[int, dict] = {}
 _tokens = itertools.count(1)
 _busy_errors = 0
 _local = threading.local()
+# What each kind of write transaction has cost since the server started (or the last reset):
+# who -> [count, seconds waiting for the lock, longest wait, seconds holding it, longest hold].
+_stats: dict[str, list] = {}
 
 
 def set_label(label: str | None) -> None:
@@ -1095,6 +1099,18 @@ def lock_activity() -> dict:
         return {"holders": holders, "waiting": waiting, "busy_errors": _busy_errors}
 
 
+def lock_stats(reset: bool = False) -> list[dict]:
+    """Who has used the write lock, most held first: how often, and how long they waited for it
+    and held it. This is what says which operation is the bottleneck."""
+    with _state_lock:
+        rows = [{"who": who, "count": v[0], "wait_total": round(v[1], 3), "wait_max": round(v[2], 3),
+                 "hold_total": round(v[3], 3), "hold_max": round(v[4], 3)}
+                for who, v in _stats.items()]
+        if reset:
+            _stats.clear()
+    return sorted(rows, key=lambda r: -r["hold_total"])
+
+
 def probe_lock(path: Path | str) -> bool:
     """Is the write lock free right now? True = free. Takes it for an instant.
 
@@ -1112,6 +1128,54 @@ def probe_lock(path: Path | str) -> bool:
         conn.close()
 
 
+class _FairLock:
+    """The write lock, in this process, handed out in order of arrival (and quick, interactive
+    writers first). SQLite makes waiting writers poll with growing pauses, so a writer that
+    takes the lock again and again (a scan saving results) can keep a three-millisecond
+    writer waiting for seconds; with a queue in front of it the waiting is bounded by the
+    transactions queued ahead, which are short. Other processes still use SQLite's own wait."""
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.queue: list[tuple[int, int]] = []     # (priority, ticket) of the waiting writers
+        self.owner: int | None = None
+        self.tickets = itertools.count()
+
+    def acquire(self, priority: int) -> bool:
+        """True if the lock was taken; False if this thread already holds it (a second
+        connection of the same thread: SQLite will say "busy", as it always did)."""
+        me = threading.get_ident()
+        with self.cond:
+            if self.owner == me:
+                return False
+            key = (priority, next(self.tickets))
+            heapq.heappush(self.queue, key)
+            try:
+                while self.owner is not None or self.queue[0] != key:
+                    self.cond.wait()
+            except BaseException:          # interrupted while waiting: leave the queue
+                self.queue.remove(key)
+                heapq.heapify(self.queue)
+                self.cond.notify_all()
+                raise
+            heapq.heappop(self.queue)
+            self.owner = me
+            return True
+
+    def release(self) -> None:
+        with self.cond:
+            self.owner = None
+            self.cond.notify_all()
+
+
+_write_lock = _FairLock()
+
+
+def _priority(who: str) -> int:
+    """A person waiting for an answer goes before background work."""
+    return 0 if who.startswith(("GET ", "POST ")) else 1
+
+
 class transaction:
     """``with transaction(conn):`` -- BEGIN IMMEDIATE / COMMIT / ROLLBACK.
 
@@ -1125,24 +1189,34 @@ class transaction:
         self.outer = False
         self.label = label
         self.token = 0
+        self.who = ""
+        self.waited = 0.0
+        self.queued = False
 
     def __enter__(self) -> sqlite3.Connection:
         if self.conn.in_transaction:
             self.outer = True
             return self.conn
         self.token = next(_tokens)
-        who = _who(self.label)
+        who = self.who = _who(self.label)
+        asked = time.monotonic()
         with _state_lock:
-            _waiters[self.token] = {"who": who, "since": time.monotonic()}
+            _waiters[self.token] = {"who": who, "since": asked}
         try:
+            self.queued = _write_lock.acquire(_priority(who))
             self.conn.execute("BEGIN IMMEDIATE")
         except BaseException:
+            if self.queued:
+                _write_lock.release()
+                self.queued = False
             with _state_lock:
                 _waiters.pop(self.token, None)
             raise
+        got = time.monotonic()
+        self.waited = got - asked
         with _state_lock:
             _waiters.pop(self.token, None)
-            _holders[self.token] = {"who": who, "since": time.monotonic()}
+            _holders[self.token] = {"who": who, "since": got}
         return self.conn
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -1154,8 +1228,19 @@ class transaction:
             else:
                 self.conn.execute("ROLLBACK")
         finally:
+            if self.queued:
+                _write_lock.release()
+                self.queued = False
             with _state_lock:
-                _holders.pop(self.token, None)
+                h = _holders.pop(self.token, None)
+                if h is not None:
+                    held = time.monotonic() - h["since"]
+                    v = _stats.setdefault(self.who, [0, 0.0, 0.0, 0.0, 0.0])
+                    v[0] += 1
+                    v[1] += self.waited
+                    v[2] = max(v[2], self.waited)
+                    v[3] += held
+                    v[4] = max(v[4], held)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

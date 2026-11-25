@@ -192,6 +192,7 @@ class Api:
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/holders", self.holders)
+        r("GET", r"/api/locks", self.locks)
         r("GET", r"/api/tolerance", self.tolerance_get)
         r("POST", r"/api/tolerance", self.tolerance_set)
         r("GET", r"/api/apps", self.apps_list)
@@ -535,6 +536,10 @@ class Api:
             return tolerance.set_tolerance(conn, str(body.get("path", "")), value)
         except tolerance.ToleranceError as e:
             raise ApiError(400, str(e)) from None
+
+    def locks(self, conn, q, body, **_):
+        """Who has used the database's write lock, and for how long (reset=1 starts over)."""
+        return {"activity": db.lock_activity(), "stats": db.lock_stats(q.get("reset") == "1")[:40]}
 
     def holders(self, conn, q, body, **_):
         """Which nodes hold a (present) copy of the selected files: for the copy and move menus."""
