@@ -677,6 +677,40 @@ changed since, or is not in the archive, stays, and the job says how many. The i
 loose copies, empty folders go, and the server's database is given its free space back
 (`db.reclaim`). A node that is offline is done when it is back.
 
+### 5.20 Removing a node
+
+A node can be taken out of the index (Nodes tab `X`; `reifs node remove NAME [--force]`;
+`nodes.remove_node`). Its drive and files are never touched: rei-fs forgets its copies,
+decisions, proposals, jobs, schedules and application registrations, the change-log
+pointers to it, and files that no other node holds. The database's free space is given back.
+
+* A node of this server is announced as removed (a `node` entry with `removed`), so every server
+  forgets it. Adding the folder again gives the same node back (its ID file keeps the id).
+* A node of another server can be removed here only while that server is not answering (or with
+  `--force`): that is how what is left of a server that was reset (new database, new identity,
+  same name) is cleaned up. The other servers must do the same on their side. When it was the last
+  node of such a server, the server is forgotten too; what a third server still forwards of its log
+  is not applied again (the progress vector is kept).
+* The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
+* The server's own node cannot be removed.
+
+### 5.20 Removing a node
+
+A node can be taken out of the index (Nodes tab `X`; `reifs node remove NAME [--force]`;
+`nodes.remove_node`). Its drive and files are never touched: rei-fs forgets its copies,
+decisions, proposals, jobs, schedules and application registrations, the change-log
+pointers to it, and files that no other node holds. The database's free space is given back.
+
+* A node of this server is announced as removed (a `node` entry with `removed`), so every server
+  forgets it. Adding the folder again gives the same node back (its ID file keeps the id).
+* A node of another server can be removed here only while that server is not answering (or with
+  `--force`): that is how what is left of a server that was reset (new database, new identity,
+  same name) is cleaned up. The other servers must do the same on their side. When it was the last
+  node of such a server, the server is forgotten too; what a third server still forwards of its log
+  is not applied again (the progress vector is kept).
+* The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
+* The server's own node cannot be removed.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

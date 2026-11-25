@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import apps, archives, db, index, tolerance
+from . import apps, archives, db, index, nodes, tolerance
 
 BATCH = 2000
 
@@ -188,6 +188,11 @@ def _ensure_node(conn, node_id: str, owner: str) -> sqlite3.Row:
 def _apply_node(conn, me: str, origin: str, d: dict) -> None:
     if d.get("owner_id") != origin:
         return  # only the owner announces its node
+    if d.get("removed"):        # the owner took the node out of the index: so do we
+        row = conn.execute("SELECT owner_id FROM nodes WHERE id = ?", (d["id"],)).fetchone()
+        if row is not None and row["owner_id"] == origin:
+            nodes.delete_rows(conn, d["id"])
+        return
     _ensure_server(conn, origin, d.get("owner_name"))
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (d["id"],)).fetchone()
     name = _unique_name(conn, d["name"], d["id"], d.get("owner_name"))

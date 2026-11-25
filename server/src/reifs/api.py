@@ -186,6 +186,7 @@ class Api:
         r("GET", r"/api/nodes", self.list_nodes)
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
+        r("POST", r"/api/nodes/(?P<node>[^/]+)/remove", self.remove_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
         r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
@@ -376,6 +377,11 @@ class Api:
                 "restricted_names": bool(r["restricted_names"]), "priority": r["priority"],
                 "replication_target": bool(r["replication_target"]),
                 "mirrored": bool(r["mirrored"]), "backup_first": bool(r["backup_first"]),
+                # a node of a server that is not answering while another server has its name:
+                # most likely what is left of a server that was reset
+                "leftover": r["owner_id"] != me and not r["owner_online"] and bool(conn.execute(
+                    "SELECT 1 FROM servers s WHERE s.name = ? AND s.id != ? AND s.is_self = 0"
+                    " AND s.online = 1", (r["owner"], r["owner_id"])).fetchone()),
                 "root": r["root_path"] or "", "last_scan": r["last_scan"] or "",
             })
         foreign = [{"node_id": f["node_id"], "name": f["name"], "path": f["path"],
@@ -458,6 +464,16 @@ class Api:
             self.syncer.request_daemon_update()
             self.syncer.request_poke()
         return {"ok": True, "path": str(root)}
+
+    def remove_node(self, conn, q, body, node, **_):
+        try:
+            out = nodes.remove_node(conn, unquote(node), force=bool(body.get("force")))
+        except nodes.NodeError as e:
+            raise ApiError(409, str(e)) from None
+        self._poke()
+        if self.syncer:
+            self.syncer.request_daemon_update()
+        return {"ok": True, **out}
 
     def adopt_node(self, conn, q, body, node, **_):
         name = nodes.adopt_node(conn, unquote(node))

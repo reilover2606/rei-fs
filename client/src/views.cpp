@@ -2121,7 +2121,7 @@ class NodesView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  c: check completeness  m: move root  n: add drive  "
-           "R: rename  p: priority  t: backup target  B: backup first  M: mirrored drive  o: adopt";
+           "R: rename  p: priority  t: backup target  B: backup first  M: mirrored drive  X: remove  o: adopt";
   }
 
   void refresh() override {
@@ -2183,8 +2183,13 @@ class NodesView : public View {
         files += items_[i].value("files", 0);
         bytes += items_[i].value("bytes", std::int64_t{0});
       }
+      bool leftover = false;
+      for (int i : owned[id]) leftover = leftover || items_[i].value("leftover", false);
       std::string tag = info.value("self", false)       ? "this server"
-                        : info.value("online", true) ? "online" : "UNREACHABLE";
+                        : info.value("online", true) ? "online"
+                        : leftover ? "UNREACHABLE: an old server of the same name is online; "
+                                     "X removes its nodes"
+                                   : "UNREACHABLE";
       labels_.push_back("▾ " + info.value("name", "") + "  (" + tag + ")  " +
                         std::to_string(owned[id].size()) + " node(s), " + std::to_string(files) +
                         " files, " + human_size(bytes));
@@ -2383,7 +2388,8 @@ class NodesView : public View {
     if (name.empty() && !on_server) return false;
     // Scanning keys also work on a server's row (all the nodes it owns); the rest need one node.
     if (name.empty() && !(key(e, " ") || key(e, "s") || key(e, "w") || key(e, "v"))) {
-      if (key(e, "R") || key(e, "c") || key(e, "m") || key(e, "p") || key(e, "t")) {
+      if (key(e, "R") || key(e, "c") || key(e, "m") || key(e, "p") || key(e, "t") ||
+          key(e, "X") || key(e, "B") || key(e, "M")) {
         ctx_.error("select a node (a branch), not a server");
         return true;
       }
@@ -2517,6 +2523,24 @@ class NodesView : public View {
                                ctx_.send("/api/nodes/" + url_encode(name), {{"priority", n}},
                                          [this](json) { refresh(); });
                              });
+      return true;
+    }
+    if (key(e, "X")) {   // take the node out of the index (nothing on its drive is touched)
+      ctx_.dialogs->confirm(
+          "Remove the node " + name + " from the index?\nIts drive and files are NOT touched; "
+          "rei-fs forgets what it knew of them (copies, jobs and schedules of the node). A node "
+          "of this server is removed on every server; a node of another server only here, and "
+          "only while that server is not answering (the last one also forgets the server).",
+          [this, name] {
+            ctx_.send("/api/nodes/" + url_encode(name) + "/remove", json::object(), [this, name](json out) {
+              ctx_.notify("removed " + name + " (" + std::to_string(out.value("copies_forgotten", 0)) +
+                          " copies forgotten)" +
+                          (out["server_forgotten"].is_string()
+                               ? "; server " + out.value("server_forgotten", "") + " forgotten too"
+                               : ""));
+              refresh();
+            });
+          });
       return true;
     }
     if (key(e, "B") || key(e, "M")) {   // flags: backup first / mirrored drive

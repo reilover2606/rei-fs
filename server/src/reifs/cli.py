@@ -147,6 +147,18 @@ def cmd_node_set(args) -> None:
     print(f"Updated node {args.rename or node['name']!r}.")
 
 
+def cmd_node_remove(args) -> None:
+    _, conn = open_server(args.home)
+    try:
+        out = nodes.remove_node(conn, args.node, force=args.force)
+    except nodes.NodeError as e:
+        raise CliError(str(e)) from None
+    print(f"Removed node {out['name']!r} from the index ({out['copies_forgotten']} copies "
+          "forgotten); its folder and files were not touched.")
+    if out["server_forgotten"]:
+        print(f"That was the last node of server {out['server_forgotten']!r}: it is forgotten too.")
+
+
 def cmd_discover(args) -> None:
     cfg, conn = open_server(args.home)
     d = nodes.discover(conn, cfg)
@@ -1123,6 +1135,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_node_add)
     s = node.add_parser("list", help="list nodes")
     s.set_defaults(func=cmd_node_list)
+    s = node.add_parser("remove", help="take a node out of the index (its files are not touched)")
+    s.add_argument("node")
+    s.add_argument("--force", action="store_true",
+                   help="also a node of a server that is online (it keeps announcing it)")
+    s.set_defaults(func=cmd_node_remove)
+
     s = node.add_parser("set", help="change node settings")
     s.add_argument("node")
     s.add_argument("--priority", type=int, help="higher = preferred replication target")

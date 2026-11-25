@@ -178,6 +178,70 @@ def rename_node(conn: sqlite3.Connection, node: str, new_name: str) -> str:
     return new_name
 
 
+def delete_rows(conn: sqlite3.Connection, node_id: str) -> int:
+    """Forget a node in the database: its copies, decisions, proposals, jobs, schedules and
+    the change-log pointers to it go, and files that no node holds any more with them.
+    The caller holds the transaction. Nothing is touched on any disk."""
+    fids = [r[0] for r in conn.execute("SELECT file_id FROM copies WHERE node_id = ?",
+                                       (node_id,))]
+    conn.execute("DELETE FROM changes WHERE ref_node = ?", (node_id,))
+    conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))      # the rest cascades
+    for fid in fids:
+        index.drop_file_if_orphan(conn, fid)
+    return len(fids)
+
+
+def remove_node(conn: sqlite3.Connection, node: str, force: bool = False) -> dict:
+    """Take a node out of the index: its drive and files are left exactly as they are.
+
+    A node of this server is announced as removed, so every server forgets it. A node of
+    another server can be removed here (the server is gone, or was reset and is a different
+    one now) only while that server is not reachable, unless ``force``; the other servers
+    must do the same on their side. When it was the last node of a server that is not
+    answering, that server is forgotten too.
+    """
+    row = get_node(conn, node)
+    me = self_id(conn)
+    if row["kind"] == "server" and row["owner_id"] == me:
+        raise NodeError("this server's own node cannot be removed (its folder is set in the "
+                        "configuration)")
+    owner = conn.execute("SELECT * FROM servers WHERE id = ?", (row["owner_id"],)).fetchone()
+    if row["owner_id"] != me and not force and owner is not None and owner["online"]:
+        raise NodeError(f"node {row['name']!r} belongs to server {owner['name']!r}, which is "
+                        "online: remove it from there")
+    with db.transaction(conn, "removing a node"):
+        if row["owner_id"] == me:
+            index.append_change(conn, "node", {"id": row["id"], "name": row["name"],
+                                               "owner_id": me, "removed": True})
+        copies = delete_rows(conn, row["id"])
+        forgot = None
+        if row["owner_id"] != me and not conn.execute(
+                "SELECT 1 FROM nodes WHERE owner_id = ?", (row["owner_id"],)).fetchone():
+            forgot = forget_server_rows(conn, row["owner_id"])
+    db.reclaim(conn)
+    return {"name": row["name"], "copies_forgotten": copies, "server_forgotten": forgot}
+
+
+def forget_server_rows(conn: sqlite3.Connection, server_id: str) -> str | None:
+    """Drop what is left of a server that is gone (no node of it remains)."""
+    srv = conn.execute("SELECT * FROM servers WHERE id = ? AND is_self = 0", (server_id,)).fetchone()
+    if srv is None:
+        return None
+    conn.execute("UPDATE servers SET paired = 0, token_out = NULL, token_in_hash = NULL,"
+                 " rsync_user = NULL, rsync_password = NULL, rsync_in_user = NULL,"
+                 " rsync_in_password = NULL, online = 0 WHERE id = ?", (server_id,))
+    conn.execute("DELETE FROM outbox WHERE server_id = ?", (server_id,))
+    conn.execute("DELETE FROM pair_requests WHERE server_id = ?", (server_id,))
+    conn.execute("DELETE FROM relay_requests WHERE requester = ?", (server_id,))
+    conn.execute("DELETE FROM changes WHERE origin_id = ?", (server_id,))
+    # origin_progress is kept: what a third server still forwards of its log is not applied again
+    try:
+        conn.execute("DELETE FROM servers WHERE id = ?", (server_id,))
+    except sqlite3.IntegrityError:
+        return None                    # still referenced: leave the row (it is not paired)
+    return srv["name"]
+
+
 def move_root(conn: sqlite3.Connection, cfg: Config, node: str, new_path: str,
               move_folder: bool = False) -> Path:
     """Change where a storage node's root is on this machine.
