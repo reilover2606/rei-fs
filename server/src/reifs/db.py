@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -572,6 +572,28 @@ def _migration_16(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[16] = _migration_16
+
+MIGRATIONS[17] = """
+-- Packed directories (design 5.16): a directory kept as one squashfs file. The archive is an
+-- ordinary file of the virtual tree (``<dir>.sqsh``); this table says which directory it stands
+-- for, and ``archive_members`` lists what is inside so that a "deep" search can find it.
+CREATE TABLE archives (
+    id         INTEGER PRIMARY KEY,
+    dir_path   TEXT NOT NULL UNIQUE,         -- the packed directory, '/src/foo'
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    present    INTEGER NOT NULL DEFAULT 1,   -- 0: unpacked or removed (a tombstone for peers)
+    files      INTEGER NOT NULL DEFAULT 0,   -- members
+    bytes      INTEGER NOT NULL DEFAULT 0,   -- their size before packing
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+CREATE TABLE archive_members (
+    archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,                -- relative to the packed directory
+    size       INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, path)
+) WITHOUT ROWID;
+"""
 
 
 def now() -> int:

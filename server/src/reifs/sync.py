@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import db, index
+from . import archives, db, index
 
 BATCH = 2000
 
@@ -126,6 +126,8 @@ def _apply_chunk(conn: sqlite3.Connection, entries: list[dict]) -> int:
                 _apply_vdir(conn, data)
             elif kind == "dirpref":
                 _apply_dirpref(conn, data)
+            elif kind == "archive":
+                archives.apply_change(conn, data)
             ref = None
             if kind == "copy" and data.get("op") in ("upsert", "missing") and fid is not None \
                     and conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id = ?",

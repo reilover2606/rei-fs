@@ -551,6 +551,41 @@ comparing and ordering them is the same as before.
 * Measured on 400,000 files and 600,000 copies: 237 MB before, 181 MB after (from 584 MB at the
   start of 5.13); the whole upgrade with compaction took 20 s.
 
+### 5.16 Packed directories
+
+A directory of thousands of small, insignificant files (a decompiled application, old source code)
+costs an index row, a copy row per node and a hash per file, and a backup transfers them one by one.
+It can be packed into one squashfs archive, `<dir>.sqsh`, next to where the directory was.
+
+* **The archive is an ordinary file** of the virtual tree: it has copies, a hash, tags, is
+  backed up, scheduled and fetched like any file. Copying or fetching the directory selects its
+  archive. The `archives` table (`dir_path`, `file_id`, `files`, `bytes`, a `present` flag that
+  makes a removal a tombstone) says which directory it stands for; `archive_members` lists the
+  files inside (path and size) so that they can be searched.
+* **In the tree** a packed directory is one entry, marked packed, that cannot be entered;
+  its archive file is not listed beside it. A packed directory cannot be moved or renamed
+  (unpack it first) and a directory holding or inside one cannot be packed.
+* **Search is flat by default.** Names inside archives are found only with `deep` (the "deep
+  search" box of the Search tab, `deep=1` of `/api/find`, which adds a `members` list).
+* **Pack** (Tree: `z`; `reifs archive pack DIR`) runs on the server owning a node that holds
+  every file of the directory, in the worker (the status line shows it; a request for a node of
+  another server is forwarded to its owner). `mksquashfs` (zstd, else xz, else gzip) writes
+  `<dir>.sqsh.part`; the archive is listed back with `unsquashfs -l` and must contain every file
+  found on disk; only then is it renamed, registered, hashed and its copy recorded, and the
+  copies of the loose files on this server's nodes are forgotten (the scanner treats packed
+  directories like the fetch folder: it does not descend into them). The original files stay on
+  disk unless "remove the originals" was chosen: then exactly the files that went into the
+  archive are deleted and the folders left empty.
+* **Unpack** (`z` on a packed entry; `reifs archive unpack DIR`) extracts into the directory
+  without overwriting anything (files that differ stop it before anything is written), then
+  retires the archive and marks its file for deletion: like every deletion it is confirmed in the
+  Marked tab. **Drop** (`Z`) retires it without extracting.
+* **Replication.** Packing, the member lists (in chunks of 1,000) and removal travel in the
+  change log as `archive` entries, latest writer wins, so every server shows the same tree and
+  can search inside. Loose files of the directory that other servers' nodes still hold are
+  forgotten when those servers next scan. The squashfs tools exist on Linux only: a Windows
+  node stores and copies the archive like any file but cannot pack or unpack.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

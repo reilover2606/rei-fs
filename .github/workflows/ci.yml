@@ -24,7 +24,7 @@ jobs:
           enable-cache: false
       - name: Install rsync (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y rsync openssh-server openssh-client
+        run: sudo apt-get update && sudo apt-get install -y rsync openssh-server openssh-client squashfs-tools
       - name: Install rsync (Windows, cwRsync)
         if: runner.os == 'Windows'
         run: choco install rsync -y --no-progress

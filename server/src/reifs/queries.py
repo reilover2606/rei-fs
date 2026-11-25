@@ -8,7 +8,7 @@ import time
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import index, paths, vdirs
+from . import archives, index, paths, vdirs
 from .tags import tags_of
 
 DEFAULT_COPIES = 2
@@ -102,6 +102,7 @@ class DirEntry:
     files: int                 # files at or below this entry
     file: FileInfo | None = None
     here: int = 0              # of them, files with a copy on this server's own node
+    packed: dict | None = None  # a packed directory: {"archive": vpath, "bytes": n, "file_id": id}
 
 
 class Entries(list):
@@ -125,6 +126,15 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     vdir = paths.normalize(vdir)
     lo = vdir.rstrip("/") + "/"
     me = index.self_id(conn)
+    if vdir != "/":
+        outer = archives.packed_dir_of(conn, vdir)
+        if outer == vdir:
+            return Entries()          # a packed directory is opaque
+        if outer:
+            return None
+    packed_here = {r["dir_path"]: r for r in conn.execute(
+        "SELECT dir_path, files, bytes, file_id FROM archives WHERE present = 1")
+        if paths.parent(r["dir_path"]) == vdir}
     dirs: dict[str, tuple[int, int]] = {}
     files: list[tuple[int, str]] = []
     more = 0
@@ -132,6 +142,8 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     if did is not None:
         for cid, name, cpath in conn.execute(
                 "SELECT id, name, path FROM dirs WHERE parent_id = ?", (did,)).fetchall():
+            if cpath in packed_here:
+                continue
             cond, cargs = paths.subtree_sql(cpath, "d.path")
             n = conn.execute("SELECT COUNT(*) FROM files f JOIN dirs d ON d.id = f.dir_id"
                              f" WHERE {cond}", cargs).fetchone()[0]
@@ -145,8 +157,9 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
                 f" WHERE {cond} LIMIT ?)", (me, *cargs, HERE_CAP)).fetchone()[0]
             dirs[name] = (n, here)
         files = [(r[0], r[1]) for r in conn.execute(
-            "SELECT id, name FROM files WHERE dir_id = ? ORDER BY name LIMIT ?",
-            (did, MAX_FILES_LISTED))]
+            "SELECT id, name FROM files WHERE dir_id = ?"
+            " AND id NOT IN (SELECT file_id FROM archives WHERE present = 1)"
+            " ORDER BY name LIMIT ?", (did, MAX_FILES_LISTED))]
         if len(files) == MAX_FILES_LISTED:
             more = conn.execute("SELECT COUNT(*) FROM files WHERE dir_id = ?",
                                 (did,)).fetchone()[0] - MAX_FILES_LISTED
@@ -154,9 +167,18 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     for d in vdirs.under(conn, vdir, include_self=False):
         head = d[len(lo):].partition("/")[0]
         dirs.setdefault(head, (0, 0))
-    if not dirs and not files and vdir != "/" and not vdirs.under(conn, vdir):
+    if not dirs and not files and not packed_here and vdir != "/" \
+            and not vdirs.under(conn, vdir):
         return None
     out = Entries(DirEntry(name, True, n, here=h) for name, (n, h) in sorted(dirs.items()))
+    for dpath, r in sorted(packed_here.items()):
+        mine = conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id IN"
+                            " (SELECT id FROM nodes WHERE owner_id = ?) AND state = 'present'",
+                            (r["file_id"], me)).fetchone() is not None
+        out.append(DirEntry(paths.basename(dpath), True, r["files"], here=r["files"] if mine else 0,
+                            packed={"archive": archives.archive_vpath(dpath), "bytes": r["bytes"],
+                                    "file_id": r["file_id"]}))
+    out.sort(key=lambda e: e.name)
     entries = []
     for fid, name in files:
         here = conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id = ?"
@@ -187,6 +209,10 @@ def _filters(tag: str | None, node: str | None, issues_only: bool, under: bool,
     """FROM/WHERE of the files passing the filters (and, with a pattern, whose name matches)."""
     q = " FROM vfiles f"
     where, args = [], []
+    # What is inside a packed directory is only found by a deep search.
+    where.append("f.dir_id NOT IN (SELECT d2.id FROM archives a JOIN dirs d2 ON d2.path = a.dir_path"
+                 " OR (d2.path >= a.dir_path || '/' AND d2.path < a.dir_path || '0')"
+                 " WHERE a.present = 1)")
     if tag:
         q += " JOIN tags t ON t.file_id = f.id AND t.present = 1"
         where.append("t.tag = ?")

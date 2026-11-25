@@ -29,7 +29,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import db, index, jobs, nodes, paths, peers, priority, schedules, vdirs
+from . import archives, db, index, jobs, nodes, paths, peers, priority, schedules, vdirs
 
 MODES = ("merge", "preserve")
 
@@ -161,6 +161,18 @@ def plan_move(conn: sqlite3.Connection, sources: list[str], dest: str,
     blocker = _ancestor_file(conn, paths.join(dest, "x")) if dest != "/" else None
     if blocker or (dest != "/" and _is_file(conn, dest)):
         raise MoveError(f"{blocker or dest} is a file, not a directory")
+
+    inside = archives.packed_dir_of(conn, dest) if dest != "/" else None
+    if inside:
+        raise MoveError(f"{dest} is inside the packed directory {inside}")
+    for src in srcs:
+        outer = archives.packed_dir_of(conn, src)
+        if outer or archives.contains_packed(conn, src):
+            raise MoveError(f"{src} is or holds a packed directory ({outer or src}): unpack it "
+                            "first, a packed directory cannot be moved or renamed")
+        fid = index.file_id(conn, src)
+        if fid is not None and fid in archives.archive_file_ids(conn):
+            raise MoveError(f"{src} is the archive of a packed directory and cannot be moved")
 
     plan = Plan()
     taken: set[str] = set()   # vpaths given to files in this plan

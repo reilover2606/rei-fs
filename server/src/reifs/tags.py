@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from . import db, index, paths
+from . import archives, db, index, paths
 
 
 class TagError(Exception):
@@ -28,6 +28,9 @@ def resolve_targets(conn: sqlite3.Connection, vpath: str, recursive: bool) -> li
     fid = index.file_id(conn, vpath)
     if fid is not None:
         return [fid]
+    packed = archives.get(conn, vpath)
+    if packed is not None:          # a packed directory is tagged as its archive
+        return [packed["file_id"]]
     cond, args = paths.subtree_sql(vpath, "d.path")
     ids = [r[0] for r in conn.execute(
         f"SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id WHERE {cond}", args)]

@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, audit, auth, relay, db, decisions, index, jobs, nodes, paths, peers,
+from . import (__version__, archives, audit, auth, relay, db, decisions, index, jobs, nodes, paths, peers,
                priority, queries, replication, schedules, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
@@ -189,6 +189,10 @@ class Api:
         r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
+        r("GET", r"/api/archives", self.archive_list)
+        r("POST", r"/api/archives/pack", self.archive_pack)
+        r("POST", r"/api/archives/unpack", self.archive_unpack)
+        r("POST", r"/api/archives/drop", self.archive_drop)
         r("POST", r"/api/stop", self.stop)
         r("GET", r"/api/tree", self.tree)
         r("GET", r"/api/file", self.file)
@@ -464,6 +468,59 @@ class Api:
                                              new_only=bool(body.get("new_only")))
         return {"ok": True, "queued": True}
 
+    # --- packed directories -----------------------------------------------------------
+
+    def archive_list(self, conn, q, body, **_):
+        return {"tools": archives.tools() is not None,
+                "archives": [{"dir": r["dir_path"], "archive": archives.archive_vpath(r["dir_path"]),
+                              "files": r["files"], "bytes": r["bytes"]}
+                             for r in conn.execute("SELECT * FROM archives WHERE present = 1"
+                                                   " ORDER BY dir_path")]}
+
+    def archive_pack(self, conn, q, body, **_):
+        try:
+            vdir = paths.normalize(body.get("vpath", ""))
+            archives.check_packable(conn, vdir)
+            target = archives.choose_node(conn, self.cfg, vdir, body.get("node") or None)
+            if target["owner_id"] != nodes.self_id(conn):
+                return peers.forward(conn, target["owner_id"], "POST", "/api/archives/pack",
+                                     {"vpath": vdir, "node": target["id"],
+                                      "remove_originals": bool(body.get("remove_originals"))})
+            archives._need_tools()
+        except (archives.ArchiveError, paths.VPathError, nodes.NodeError) as e:
+            raise ApiError(400, str(e)) from None
+        self._need_worker().request_archive("pack", vdir, target["id"],
+                                            bool(body.get("remove_originals")))
+        return {"ok": True, "queued": True, "node": target["name"]}
+
+    def archive_unpack(self, conn, q, body, **_):
+        try:
+            vdir = paths.normalize(body.get("vpath", ""))
+            row = archives.get(conn, vdir)
+            if row is None:
+                raise archives.ArchiveError(f"{vdir} is not a packed directory")
+            me = nodes.self_id(conn)
+            held = conn.execute(
+                "SELECT n.id, n.owner_id, n.name FROM copies c JOIN nodes n ON n.id = c.node_id"
+                " WHERE c.file_id = ? AND c.state = 'present'", (row["file_id"],)).fetchall()
+            mine = [h for h in held if h["owner_id"] == me]
+            if not mine:
+                if not held:
+                    raise archives.ArchiveError(f"no node holds {archives.archive_vpath(vdir)}")
+                return peers.forward(conn, held[0]["owner_id"], "POST", "/api/archives/unpack",
+                                     {"vpath": vdir, "node": held[0]["id"]})
+            archives._need_tools()
+        except (archives.ArchiveError, paths.VPathError, nodes.NodeError) as e:
+            raise ApiError(400, str(e)) from None
+        self._need_worker().request_archive("unpack", vdir, body.get("node") or mine[0]["id"])
+        return {"ok": True, "queued": True, "node": mine[0]["name"]}
+
+    def archive_drop(self, conn, q, body, **_):
+        try:
+            return {"ok": True, **archives.drop(conn, paths.normalize(body.get("vpath", "")))}
+        except (archives.ArchiveError, paths.VPathError) as e:
+            raise ApiError(400, str(e)) from None
+
     def _poke(self) -> None:
         if self.syncer:
             self.syncer.request_poke()
@@ -514,9 +571,12 @@ class Api:
         for e in entries:
             if e.is_dir:
                 child = paths.join(vdir, e.name)
-                out.append({"name": e.name, "dir": True, "files": e.files, "here": e.here,
-                            "priority": prefs.prefs.get(child, here),
-                            "set_here": child in prefs.prefs})
+                d = {"name": e.name, "dir": True, "files": e.files, "here": e.here,
+                     "priority": prefs.prefs.get(child, here),
+                     "set_here": child in prefs.prefs}
+                if e.packed:
+                    d.update(packed=True, archive=e.packed["archive"], bytes=e.packed["bytes"])
+                out.append(d)
             else:
                 f = file_json(e.file, full=False)
                 f["dir"] = False
@@ -538,12 +598,17 @@ class Api:
         ids, dirs = queries.search(conn, q.get("q") or None, tag=q.get("tag") or None,
                                    node=q.get("node") or None, issues_only=q.get("issues") == "1",
                                    under_replicated=q.get("under") == "1", policy=pol)
-        return {"total": len(ids), "truncated": len(ids) > limit,
-                "files": [file_json(queries.file_info(conn, fid, pol), full=False)
-                          for fid in ids[:limit]],
-                "dirs_total": len(dirs),
-                "dirs": [{"path": d, "name": paths.basename(d), "files": n}
-                         for d, n in dirs[:FIND_LIMIT]]}
+        out = {"total": len(ids), "truncated": len(ids) > limit,
+               "files": [file_json(queries.file_info(conn, fid, pol), full=False)
+                         for fid in ids[:limit]],
+               "dirs_total": len(dirs),
+               "dirs": [{"path": d, "name": paths.basename(d), "files": n}
+                        for d, n in dirs[:FIND_LIMIT]]}
+        if q.get("deep") == "1":     # also look inside the packed directories
+            found = archives.search_members(conn, q.get("q") or None, FIND_LIMIT + 1)
+            out["members_truncated"] = len(found) > FIND_LIMIT
+            out["members"] = found[:FIND_LIMIT]
+        return out
 
     # --- tags -----------------------------------------------------------------------------
 

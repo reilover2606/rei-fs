@@ -465,3 +465,34 @@ def test_times_are_text_over_the_api(server):
     ssd = {n["name"]: n for n in client.get("/api/nodes")["nodes"]}["ssd"]
     assert ssd["last_scan"].endswith("+00:00") and ssd["last_scan"][:2] == "20"
     assert env.conn.execute("SELECT typeof(last_scan) FROM nodes WHERE name = 'ssd'").fetchone()[0] == "integer"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the squashfs tools are Linux only")
+def test_pack_search_deep_and_unpack_over_the_api(server):
+    from reifs import archives
+    if archives.tools() is None:
+        pytest.skip("needs squashfs-tools")
+    env, client, _ = server
+    login(client)
+
+    def wait(pred, what):
+        end = time.time() + 30
+        while time.time() < end:
+            if pred():
+                return
+            time.sleep(0.2)
+        raise AssertionError(f"timed out: {what}")
+
+    out = client.post("/api/archives/pack", {"vpath": "/docs"})
+    assert out["queued"]
+    wait(lambda: any(e.get("packed") for e in client.get("/api/tree?path=/")["entries"]), "packed")
+    entry = [e for e in client.get("/api/tree?path=/")["entries"] if e["name"] == "docs"][0]
+    assert entry["packed"] and entry["archive"] == "/docs.sqsh" and entry["files"] == 2
+    assert client.get("/api/find?q=a.txt")["total"] == 0                  # opaque
+    deep = client.get("/api/find?q=a.txt&deep=1")
+    assert deep["total"] == 0 and [m["vpath"] for m in deep["members"]] == ["/docs/a.txt"]
+    client.post("/api/archives/pack", {"vpath": "/docs"}, expect=400)       # already packed
+    client.post("/api/archives/unpack", {"vpath": "/docs"})
+    wait(lambda: not any(e.get("packed") for e in client.get("/api/tree?path=/")["entries"]),
+         "unpacked")
+    assert client.get("/api/find?q=a.txt")["total"] == 1
