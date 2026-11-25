@@ -16,8 +16,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (__version__, archives, auth, db, decisions, index, jobs, nodes, peers, queries,
-               replication, runner, scanner, tags)
+from . import (__version__, apps, archives, auth, tolerance, db, decisions, index, jobs, nodes, peers, queries,
+               priority, replication, runner, scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
 from .locking import LockError, ServerLock
@@ -122,7 +122,8 @@ def cmd_node_list(args) -> None:
 def cmd_node_set(args) -> None:
     _, conn = open_server(args.home)
     node = nodes.get_node(conn, args.node)
-    if args.priority is None and args.target is None and not args.rename:
+    if (args.priority is None and args.target is None and not args.rename
+            and args.mirrored is None and args.backup_first is None):
         raise CliError("nothing to change")
     if node["owner_id"] != nodes.self_id(conn):
         raise CliError(f"node {node['name']!r} belongs to another server; change it there "
@@ -134,12 +135,28 @@ def cmd_node_set(args) -> None:
         updates["priority"] = args.priority
     if args.target is not None:
         updates["replication_target"] = int(args.target == "yes")
+    if args.mirrored is not None:
+        updates["mirrored"] = int(args.mirrored == "yes")
+    if args.backup_first is not None:
+        updates["backup_first"] = int(args.backup_first == "yes")
     if updates:
         sets = ", ".join(f"{k} = ?" for k in updates)
         with db.transaction(conn):
             conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", (*updates.values(), node["id"]))
             index.log_node(conn, node["id"])
     print(f"Updated node {args.rename or node['name']!r}.")
+
+
+def cmd_node_remove(args) -> None:
+    _, conn = open_server(args.home)
+    try:
+        out = nodes.remove_node(conn, args.node, force=args.force)
+    except nodes.NodeError as e:
+        raise CliError(str(e)) from None
+    print(f"Removed node {out['name']!r} from the index ({out['copies_forgotten']} copies "
+          "forgotten); its folder and files were not touched.")
+    if out["server_forgotten"]:
+        print(f"That was the last node of server {out['server_forgotten']!r}: it is forgotten too.")
 
 
 def cmd_discover(args) -> None:
@@ -153,6 +170,51 @@ def cmd_discover(args) -> None:
         print(f"moved    {name:20} now at {root}")
     for name, owner, path in d.foreign:
         print(f"foreign  {name:20} {path} (owned by server {owner})")
+
+
+def cmd_tolerate(args) -> None:
+    _, conn = open_server(args.home)
+    value = {"yes": True, "no": False, "inherit": None}[args.value]
+    try:
+        if args.value is None or not args.vpath:
+            raise CliError("usage: reifs tolerate PATH yes|no|inherit")
+        res = tolerance.set_tolerance(conn, args.vpath, value)
+    except tolerance.ToleranceError as e:
+        raise CliError(str(e)) from None
+    state = "several versions are fine" if res["tolerant"] else "conflicting versions are decided"
+    print(f"{res['path']}: {state}" + ("" if not res["inherited"] else f" (from {res['set_on']})"))
+
+
+def cmd_app(args) -> None:
+    cfg, conn = open_server(args.home)
+    act = args.action
+    try:
+        if act == "list":
+            rows = apps.list_apps(conn)
+            if not rows:
+                print("No applications registered.")
+            print(table([[a["name"], a["mode"], a["node"], a["dir"], a["server"],
+                          "online" if a["online"] else "offline"] for a in rows],
+                        ["NAME", "MODE", "NODE", "DIRECTORY", "SERVER", "STATE"]) if rows else "",
+                  end="")
+            return
+        if not args.name:
+            raise CliError(f"usage: reifs app {act} NAME")
+        if act == "add":
+            info, token = apps.register(conn, cfg, args.name, args.mode, args.node)
+            print(f"Registered {info['name']!r} ({info['mode']}) on node {info['node']}.")
+            print(f"  directory: {info['dir']}" + (f"   on disk: {info['path']}" if info["path"] else ""))
+            if len(info["instances"]) > 1:
+                print("  instances: " + ", ".join(i["node"] for i in info["instances"]))
+            print(f"  token: {token}")
+            print("Keep the token: it is not shown again (reifs app token NAME makes a new one).")
+        elif act == "remove":
+            apps.remove(conn, args.name, args.node)
+            print(f"Unregistered {args.name!r}; its directory and files were left as they are.")
+        else:
+            print(apps.regenerate_token(conn, args.name, args.node))
+    except (apps.AppError, nodes.NodeError, priority.PriorityError) as e:
+        raise CliError(str(e)) from None
 
 
 def cmd_archive(args) -> None:
@@ -176,9 +238,13 @@ def cmd_archive(args) -> None:
         with ServerLock(cfg.home):
             if act == "pack":
                 res = archives.pack(conn, cfg, args.vpath, args.node, args.remove_originals,
-                                    progress=progress)
+                                    progress=progress, everywhere=args.everywhere)
                 print(f"Packed {res['files']:,} files of {res['dir']} on {res['node']} into "
                       f"{res['archive']} ({res['archive_bytes'] / 1e6:.1f} MB).")
+                if args.everywhere:
+                    print(f"The archive will be copied to {res['targets']} other node(s) and the "
+                          "originals removed there once it has arrived (the running server does "
+                          "this; see the Jobs tab).")
                 if res["originals_kept"]:
                     print("The original files were kept: remove them yourself once you are happy "
                           "with the archive (or pack with --remove-originals).")
@@ -471,9 +537,9 @@ def cmd_jobs(args) -> None:
         else:
             _show_job(conn, job_id, args.all)
         return
-    q = "SELECT * FROM jobs"
+    q = "SELECT * FROM jobs WHERE hidden = 0"
     if not args.all:
-        q += " WHERE status NOT IN ('done', 'cancelled')"
+        q += " AND status NOT IN ('done', 'cancelled')"
     rows = []
     for j in conn.execute(q + " ORDER BY id"):
         c = jobs.item_counts(conn, j["id"])
@@ -1069,10 +1135,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_node_add)
     s = node.add_parser("list", help="list nodes")
     s.set_defaults(func=cmd_node_list)
+    s = node.add_parser("remove", help="take a node out of the index (its files are not touched)")
+    s.add_argument("node")
+    s.add_argument("--force", action="store_true",
+                   help="also a node of a server that is online (it keeps announcing it)")
+    s.set_defaults(func=cmd_node_remove)
+
     s = node.add_parser("set", help="change node settings")
     s.add_argument("node")
     s.add_argument("--priority", type=int, help="higher = preferred replication target")
     s.add_argument("--target", choices=["yes", "no"], help="may receive replication copies")
+    s.add_argument("--mirrored", choices=["yes", "no"],
+                   help="the drive is mirrored (RAID 1, ...): its copies count as two")
+    s.add_argument("--backup-first", dest="backup_first", choices=["yes", "no"],
+                   help="the node exists for backups: planning fills it before other nodes")
     s.add_argument("--rename", metavar="NAME")
     s.set_defaults(func=cmd_node_set)
 
@@ -1109,12 +1185,29 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)
 
+    s = sub.add_parser("tolerate", help="allow several versions of a file or directory (no decisions)")
+    s.add_argument("vpath", help="a file or directory of the virtual tree")
+    s.add_argument("value", choices=["yes", "no", "inherit"])
+    s.set_defaults(func=cmd_tolerate)
+
+    s = sub.add_parser("app", help="applications that use rei-fs for their files")
+    s.add_argument("action", choices=["add", "list", "remove", "token"])
+    s.add_argument("name", nargs="?", help="the application's name")
+    s.add_argument("--mode", choices=["storage", "instance"], default="storage",
+                   help="storage: a directory to fill; instance: its files are kept the same on "
+                        "every node it is registered on")
+    s.add_argument("--node", help="the node (default for a new one: any online node of this server)")
+    s.set_defaults(func=cmd_app)
+
     s = sub.add_parser("archive", help="pack a directory into one squashfs archive, or unpack one")
     s.add_argument("action", choices=["pack", "unpack", "drop", "list"])
     s.add_argument("vpath", nargs="?", help="the directory in the virtual tree, e.g. /src/old-app")
     s.add_argument("--node", help="node to pack on / unpack to (default: one holding everything)")
     s.add_argument("--remove-originals", action="store_true",
                    help="pack: delete the files that went into the archive, after checking it")
+    s.add_argument("--everywhere", action="store_true",
+                   help="pack: also copy the archive to every node that holds the directory and "
+                        "remove the originals there (each file is checked against the archive)")
     s.set_defaults(func=cmd_archive)
 
     s = sub.add_parser("scan", help="scan online owned nodes for changes")

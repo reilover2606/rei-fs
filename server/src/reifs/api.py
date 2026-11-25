@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, archives, audit, auth, relay, db, decisions, index, jobs, nodes, paths, peers,
+from . import (__version__, apps, archives, audit, auth, tolerance, relay, db, decisions, index, jobs, nodes, paths, peers,
                priority, queries, replication, schedules, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
@@ -73,6 +73,7 @@ def file_json(info: queries.FileInfo, full: bool = True) -> dict:
         "mtime": _secs(cur.mtime_ns) if cur else 0,
         "good_copies": info.good_copies,
         "goal": info.goal,
+        "tolerant": info.tolerant,
         "tags": info.tags,
         "issues": sorted(info.issues),
         "flags": flags,
@@ -185,10 +186,24 @@ class Api:
         r("GET", r"/api/nodes", self.list_nodes)
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
+        r("POST", r"/api/nodes/(?P<node>[^/]+)/remove", self.remove_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
         r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
+        r("POST", r"/api/holders", self.holders)
+        r("GET", r"/api/tolerance", self.tolerance_get)
+        r("POST", r"/api/tolerance", self.tolerance_set)
+        r("GET", r"/api/apps", self.apps_list)
+        r("POST", r"/api/apps", self.apps_add)
+        r("POST", r"/api/apps/remove", self.apps_remove)
+        r("POST", r"/api/apps/token", self.apps_token)
+        r("GET", r"/api/app/info", self.app_info, "app")
+        r("GET", r"/api/app/list", self.app_list, "app")
+        r("GET", r"/api/app/read", self.app_read, "app")
+        r("POST", r"/api/app/write", self.app_write, "app")
+        r("POST", r"/api/app/delete", self.app_delete, "app")
+        r("POST", r"/api/app/sync", self.app_sync, "app")
         r("GET", r"/api/archives", self.archive_list)
         r("POST", r"/api/archives/pack", self.archive_pack)
         r("POST", r"/api/archives/unpack", self.archive_unpack)
@@ -326,7 +341,8 @@ class Api:
             "open_decisions": s.open_decisions, "open_wanted": s.open_wanted,
             "coverage_stale": s.coverage_stale,
             "active_jobs": conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running', 'waiting')"
+                "SELECT COUNT(*) FROM jobs WHERE hidden = 0 AND"
+                " status IN ('pending', 'running', 'waiting')"
             ).fetchone()[0],
             "peers_total": conn.execute("SELECT COUNT(*) FROM servers WHERE paired = 1"
                                         ).fetchone()[0],
@@ -360,6 +376,12 @@ class Api:
                 "case_sensitive": bool(r["case_sensitive"]),
                 "restricted_names": bool(r["restricted_names"]), "priority": r["priority"],
                 "replication_target": bool(r["replication_target"]),
+                "mirrored": bool(r["mirrored"]), "backup_first": bool(r["backup_first"]),
+                # a node of a server that is not answering while another server has its name:
+                # most likely what is left of a server that was reset
+                "leftover": r["owner_id"] != me and not r["owner_online"] and bool(conn.execute(
+                    "SELECT 1 FROM servers s WHERE s.name = ? AND s.id != ? AND s.is_self = 0"
+                    " AND s.online = 1", (r["owner"], r["owner_id"])).fetchone()),
                 "root": r["root_path"] or "", "last_scan": r["last_scan"] or "",
             })
         foreign = [{"node_id": f["node_id"], "name": f["name"], "path": f["path"],
@@ -383,6 +405,10 @@ class Api:
             if "replication_target" in body:
                 conn.execute("UPDATE nodes SET replication_target = ? WHERE id = ?",
                              (int(bool(body["replication_target"])), row["id"]))
+            for flag in ("mirrored", "backup_first"):
+                if flag in body:
+                    conn.execute(f"UPDATE nodes SET {flag} = ? WHERE id = ?",
+                                 (int(bool(body[flag])), row["id"]))
             index.log_node(conn, row["id"])
         self._poke()
         return {"ok": True}
@@ -439,6 +465,16 @@ class Api:
             self.syncer.request_poke()
         return {"ok": True, "path": str(root)}
 
+    def remove_node(self, conn, q, body, node, **_):
+        try:
+            out = nodes.remove_node(conn, unquote(node), force=bool(body.get("force")))
+        except nodes.NodeError as e:
+            raise ApiError(409, str(e)) from None
+        self._poke()
+        if self.syncer:
+            self.syncer.request_daemon_update()
+        return {"ok": True, **out}
+
     def adopt_node(self, conn, q, body, node, **_):
         name = nodes.adopt_node(conn, unquote(node))
         if self.worker:
@@ -463,9 +499,142 @@ class Api:
                            "due": bool(body.get("due")),
                            "new_only": bool(body.get("new_only"))})
         if local or not remote:
-            self._need_worker().request_scan(local or None, bool(body.get("verify")),
-                                             full=not body.get("due"),
-                                             new_only=bool(body.get("new_only")))
+            if body.get("due"):    # the automatic kind: not worth a job
+                self._need_worker().request_scan(local or None, bool(body.get("verify")),
+                                                 full=False, new_only=bool(body.get("new_only")))
+                return {"ok": True, "queued": True}
+            # A scan the user asks for is a job: it shows in the job list and can be cancelled.
+            params = {"verify": bool(body.get("verify")), "new_only": bool(body.get("new_only")),
+                      "full": True}
+            names = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM nodes")}
+            targets = local or [loc.node_id for loc in nodes.discover(conn, self.cfg).online]
+            fresh = [n for n in targets if jobs.active_tool_item(conn, "scan", "/", n) is None]
+            job_id = None
+            if fresh:
+                kind = "verify" if params["verify"] else "new files of" if params["new_only"] else ""
+                with db.transaction(conn):
+                    job_id = jobs.create_tool_job(
+                        conn, "scan", f"scan {kind + ' ' if kind else ''}"
+                        + ", ".join(names.get(n, n) for n in fresh),
+                        [("scan", "/", n, params) for n in fresh])
+                self._need_worker().request_jobs()
+            return {"ok": True, "queued": True, "job_id": job_id}
+        return {"ok": True, "queued": True}
+
+    def tolerance_get(self, conn, q, body, **_):
+        try:
+            return tolerance.get(conn, q.get("path", "/"))
+        except paths.VPathError as e:
+            raise ApiError(400, str(e)) from None
+
+    def tolerance_set(self, conn, q, body, **_):
+        value = body.get("tolerant")
+        if value is not None:
+            value = bool(value)
+        try:
+            return tolerance.set_tolerance(conn, str(body.get("path", "")), value)
+        except tolerance.ToleranceError as e:
+            raise ApiError(400, str(e)) from None
+
+    def holders(self, conn, q, body, **_):
+        """Which nodes hold a (present) copy of the selected files: for the copy and move menus."""
+        try:
+            ids = [fid for fid, _ in jobs.select_files(conn, list(body.get("paths", [])),
+                                                       body.get("tag") or None)]
+        except (jobs.JobError, paths.VPathError) as e:
+            raise ApiError(400, str(e)) from None
+        have: dict[str, int] = {}
+        for i in range(0, len(ids), 800):
+            part = ids[i:i + 800]
+            for r in conn.execute(
+                    "SELECT node_id, COUNT(*) FROM copies WHERE state = 'present' AND file_id IN"
+                    f" ({','.join('?' * len(part))}) GROUP BY node_id", part):
+                have[r[0]] = have.get(r[0], 0) + r[1]
+        return {"total": len(ids),
+                "nodes": [{"name": r["name"], "have": have.get(r["id"], 0)}
+                          for r in conn.execute("SELECT id, name FROM nodes ORDER BY name")]}
+
+    # --- applications -----------------------------------------------------------------
+
+    def apps_list(self, conn, q, body, **_):
+        return {"apps": apps.list_apps(conn)}
+
+    def apps_add(self, conn, q, body, **_):
+        try:
+            info, token = apps.register(conn, self.cfg, str(body.get("name", "")).strip(),
+                                        str(body.get("mode", "")), body.get("node") or None)
+        except (apps.AppError, nodes.NodeError, priority.PriorityError) as e:
+            raise ApiError(400, str(e)) from None
+        if info["mode"] == "instance" and self.worker:
+            self.worker.request_sync(full=True)
+        self._poke()
+        return {**info, "token": token}
+
+    def apps_remove(self, conn, q, body, **_):
+        try:
+            apps.remove(conn, str(body.get("name", "")), body.get("node") or None)
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+        self._poke()
+        return {"ok": True}
+
+    def apps_token(self, conn, q, body, **_):
+        try:
+            return {"token": apps.regenerate_token(conn, str(body.get("name", "")),
+                                                   body.get("node") or None)}
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def _access(self, conn, app) -> "apps.Access":
+        try:
+            return apps.Access(conn, self.cfg, app)
+        except apps.AppError as e:
+            raise ApiError(503, str(e)) from None
+
+    def app_info(self, conn, q, body, app=None, **_):
+        acc = self._access(conn, app)
+        return {**apps.describe(conn, self.cfg, app), "pending": acc.pending(),
+                "synchronized": acc.pending() == 0}
+
+    def app_list(self, conn, q, body, app=None, **_):
+        try:
+            return {"entries": self._access(conn, app).listing(q.get("path", "/"))}
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def app_read(self, conn, q, body, app=None, **_):
+        try:
+            return self._access(conn, app).read(q.get("path", ""), int(q.get("offset", 0)),
+                                                int(q.get("length", apps.MAX_READ)))
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def app_write(self, conn, q, body, app=None, **_):
+        try:
+            return self._access(conn, app).write(str(body.get("path", "")), body.get("data", ""),
+                                                 bool(body.get("append")),
+                                                 body.get("done", True) is not False)
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+        finally:
+            if self.worker and app is not None and app["mode"] == "instance":
+                self.worker.request_sync()
+
+    def app_delete(self, conn, q, body, app=None, **_):
+        try:
+            return self._access(conn, app).delete(str(body.get("path", "")))
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def app_sync(self, conn, q, body, app=None, **_):
+        """Look at the directory now (a file was written straight into it) and propagate."""
+        eff = priority.Prefs(priority.load(conn)).effective(app["vpath"])
+        with db.transaction(conn):
+            conn.execute("DELETE FROM scan_state WHERE node_id = ? AND priority = ?",
+                         (app["node_id"], eff))
+        if self.worker:
+            self.worker.request_scan([app["node_id"]], full=False)
+            self.worker.request_sync(full=app["mode"] == "instance")
         return {"ok": True, "queued": True}
 
     # --- packed directories -----------------------------------------------------------
@@ -482,16 +651,23 @@ class Api:
             vdir = paths.normalize(body.get("vpath", ""))
             archives.check_packable(conn, vdir)
             target = archives.choose_node(conn, self.cfg, vdir, body.get("node") or None)
+            flags = {"remove_originals": bool(body.get("remove_originals")),
+                     "everywhere": bool(body.get("everywhere"))}
             if target["owner_id"] != nodes.self_id(conn):
                 return peers.forward(conn, target["owner_id"], "POST", "/api/archives/pack",
-                                     {"vpath": vdir, "node": target["id"],
-                                      "remove_originals": bool(body.get("remove_originals"))})
+                                     {"vpath": vdir, "node": target["id"], **flags})
             archives._need_tools()
+            job_id = jobs.active_tool_item(conn, "pack", vdir, target["id"])
+            if job_id is None:
+                with db.transaction(conn):
+                    job_id = jobs.create_tool_job(
+                        conn, "pack", f"pack {vdir} on {target['name']}"
+                        + (" and everywhere it is held" if flags["everywhere"] else ""),
+                        [("pack", vdir, target["id"], flags)])
         except (archives.ArchiveError, paths.VPathError, nodes.NodeError) as e:
             raise ApiError(400, str(e)) from None
-        self._need_worker().request_archive("pack", vdir, target["id"],
-                                            bool(body.get("remove_originals")))
-        return {"ok": True, "queued": True, "node": target["name"]}
+        self._need_worker().request_jobs()
+        return {"ok": True, "queued": True, "job_id": job_id, "node": target["name"]}
 
     def archive_unpack(self, conn, q, body, **_):
         try:
@@ -510,10 +686,16 @@ class Api:
                 return peers.forward(conn, held[0]["owner_id"], "POST", "/api/archives/unpack",
                                      {"vpath": vdir, "node": held[0]["id"]})
             archives._need_tools()
+            node_id = body.get("node") or mine[0]["id"]
+            job_id = jobs.active_tool_item(conn, "unpack", vdir, node_id)
+            if job_id is None:
+                with db.transaction(conn):
+                    job_id = jobs.create_tool_job(conn, "unpack", f"unpack {vdir}",
+                                                  [("unpack", vdir, node_id, {})])
         except (archives.ArchiveError, paths.VPathError, nodes.NodeError) as e:
             raise ApiError(400, str(e)) from None
-        self._need_worker().request_archive("unpack", vdir, body.get("node") or mine[0]["id"])
-        return {"ok": True, "queued": True, "node": mine[0]["name"]}
+        self._need_worker().request_jobs()
+        return {"ok": True, "queued": True, "job_id": job_id, "node": mine[0]["name"]}
 
     def archive_drop(self, conn, q, body, **_):
         try:
@@ -576,7 +758,8 @@ class Api:
                 child = paths.join(vdir, e.name)
                 d = {"name": e.name, "dir": True, "files": e.files, "here": e.here,
                      "priority": prefs.prefs.get(child, here),
-                     "set_here": child in prefs.prefs}
+                     "set_here": child in prefs.prefs,
+                     "tolerant": tolerance.is_tolerant(conn, child)}
                 if e.packed:
                     d.update(packed=True, archive=e.packed["archive"], bytes=e.packed["bytes"])
                 out.append(d)
@@ -693,9 +876,9 @@ class Api:
     # --- jobs ------------------------------------------------------------------------
 
     def list_jobs(self, conn, q, body, caller=None, **_):
-        sql = "SELECT * FROM jobs"
+        sql = "SELECT * FROM jobs WHERE hidden = 0"      # the synchronizer's jobs are not listed
         if q.get("all") != "1":
-            sql += " WHERE status NOT IN ('done', 'cancelled')"
+            sql += " AND status NOT IN ('done', 'cancelled')"
         sql += " ORDER BY id DESC LIMIT 200"
         items = [job_json(conn, j) for j in conn.execute(sql).fetchall()]
         path = "/api/jobs" + ("?all=1" if q.get("all") == "1" else "")
@@ -1204,8 +1387,14 @@ class Api:
             conn = db.open_existing(self.cfg.db_path, timeout=self.busy_timeout)
             # Who is calling: the client (bearer token) or a paired server.
             header = headers.get("Authorization")
-            token, caller = None, None
-            if self.check_token(header):
+            token, caller, app = None, None, None
+            if access == "app":
+                # An application's token reaches the app endpoints and nothing else.
+                app = apps.authenticate(conn, header)
+                if app is None:
+                    return 401, {"error": "not a valid application token"}
+                caller = "app"
+            elif self.check_token(header):
                 token, caller = header[7:].strip(), "client"
             else:
                 caller = peers.authenticate(conn, header)  # peer server id
@@ -1227,7 +1416,7 @@ class Api:
                 except peers.PeerError as e:
                     return (e.status if 400 <= e.status < 500 else 502), {"error": str(e)}
 
-            return 200, fn(conn, query, body, token=token, caller=caller,
+            return 200, fn(conn, query, body, token=token, caller=caller, app=app,
                            client_ip=client_ip, **match.groupdict())
         except ApiError as e:
             return e.status, {"error": str(e)}

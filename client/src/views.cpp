@@ -104,6 +104,8 @@ Element file_details(const json& f) {
   };
   if (!f.value("tags", json::array()).empty())
     rows.push_back(label_value("tags", join(f["tags"])));
+  if (f.value("tolerant", false))
+    rows.push_back(label_value("versions", text("several versions are fine (no conflicts asked)")));
   if (!f.value("issues", json::array()).empty())
     rows.push_back(label_value("non-portable", paragraph(join(f["issues"])) | color(Color::Yellow)));
   if (!f.value("flags", json::array()).empty())
@@ -167,14 +169,31 @@ void tag_paths(Context& ctx, std::vector<std::string> paths, bool recursive, boo
 void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::string& tag,
                     bool move) {
   if (paths.empty() && tag.empty()) return;
-  ctx.get("/api/nodes", [&ctx, paths, tag, move](json out) {
-    std::vector<std::string> nodes;
+  // The nodes, and how many of the selected files each one holds, decide what is offered.
+  ctx.run(
+      false,
+      [paths, tag](Api& a) {
+        json body = {{"paths", paths}};
+        if (!tag.empty()) body["tag"] = tag;
+        return json{{"nodes", a.get("/api/nodes")["nodes"]}, {"holders", a.post("/api/holders", body)}};
+      },
+      [&ctx, paths, tag, move](json out) {
+    int total = out["holders"].value("total", 0);
+    std::map<std::string, int> have;
+    for (const auto& h : out["holders"]["nodes"]) have[h.value("name", "")] = h.value("have", 0);
+    struct Choice {
+      std::string name, label;
+      int have;
+    };
+    std::vector<Choice> all;
     for (const auto& n : out["nodes"]) {
-      std::string label = n.value("name", "");
+      std::string name = n.value("name", "");
+      std::string label = name;
+      if (total > 0) label += "  (" + std::to_string(have[name]) + " of " + std::to_string(total) + ")";
       if (!n.value("online", false)) label += " (offline)";
-      nodes.push_back(label);
+      all.push_back({name, label, have[name]});
     }
-    if (nodes.empty()) return;
+    if (all.empty()) return;
     auto create = [&ctx, paths, tag, move](const std::string& from, const std::string& to) {
       json body = {{"kind", move ? "move" : "copy"}, {"paths", paths}, {"to", to}};
       if (!tag.empty()) body["tag"] = tag;
@@ -204,20 +223,34 @@ void transfer_paths(Context& ctx, std::vector<std::string> paths, const std::str
     std::string what = !tag.empty() ? "files tagged '" + tag + "'"
                        : paths.size() == 1 ? paths[0]
                                            : std::to_string(paths.size()) + " items";
+    // `skip`: a node left out of the list; `need_files`: only nodes holding something.
+    auto pick = [&ctx, all](const std::string& title, const std::string& skip, bool need_files,
+                            bool not_full, int total, std::function<void(const std::string&)> done) {
+      std::vector<std::string> labels, names;
+      for (const auto& c : all) {
+        if (c.name == skip) continue;
+        if (need_files && c.have == 0) continue;
+        if (not_full && total > 0 && c.have >= total) continue;   // it has them all already
+        labels.push_back(c.label);
+        names.push_back(c.name);
+      }
+      if (labels.empty()) {
+        ctx.notify(need_files ? "no node holds any of these files"
+                              : "no other node to put them on");
+        return;
+      }
+      ctx.dialogs->ask_choice(title, labels, [names, done](int i) { done(names[i]); });
+    };
     if (!move) {
-      ctx.dialogs->ask_choice("Copy " + what + " to which node?", nodes,
-                              [create, nodes](int i) { create("", strip_offline(nodes[i])); });
+      pick("Copy " + what + " to which node?  (files held / selected)", "", false, true, total,
+           [create](const std::string& to) { create("", to); });
       return;
     }
-    ctx.dialogs->ask_choice(
-        "Move " + what + " FROM which node? (its copies get marked for deletion)", nodes,
-        [&ctx, create, nodes, what](int i) {
-          std::string from = strip_offline(nodes[i]);
-          ctx.dialogs->ask_choice("Move " + what + " from " + from + " TO which node?", nodes,
-                                  [create, nodes, from](int j) {
-                                    create(from, strip_offline(nodes[j]));
-                                  });
-        });
+    pick("Move " + what + " FROM which node? (its copies get marked for deletion)", "", true, false,
+         total, [&ctx, create, what, pick, total](const std::string& from) {
+           pick("Move " + what + " from " + from + " TO which node?", from, false, false, total,
+                [create, from](const std::string& to) { create(from, to); });
+         });
   });
 }
 
@@ -432,12 +465,12 @@ class OverviewView : public View {
     if (e == Event::Home) return scroll_ = 0.f, true;
     if (e == Event::End) return scroll_ = 1.f, true;
     if (key(e, "s")) {
-      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan queued"); });
+      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan: see the Jobs tab (c cancels it)"); });
       return true;
     }
     if (key(e, "w")) {
       ctx_.send("/api/scan", {{"new_only", true}},
-                [this](json) { ctx_.notify("scan for new files queued"); });
+                [this](json) { ctx_.notify("scan for new files: see the Jobs tab (c cancels it)"); });
       return true;
     }
     if (key(e, "j")) {
@@ -780,6 +813,9 @@ class TreeView : public View {
       if (dir_priority_ != 2) heading += std::string("  [") + priority_name(dir_priority_) + "]";
       if (more_files_ > 0)
         heading += "   (" + std::to_string(more_files_) + " more files not listed; use Search)";
+      if (!filter_.empty())
+        heading += "   [showing names with '" + filter_ + "': " + std::to_string(entries_.size()) +
+                   " of " + std::to_string(all_entries_.size()) + "; Esc clears]";
       if (!inside_.empty()) heading += "   [inside " + inside_ + ": read-only, from the archive's list]";
       if (!picked_.empty())
         heading += "   [" + std::to_string(picked_.size()) + " picked up: p puts them here]";
@@ -794,7 +830,7 @@ class TreeView : public View {
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  S: schedule sync  "
            "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  "
-           "z: pack/unpack  Z: drop archive  r: refresh";
+           "z: pack/unpack  Z: drop archive  V: several versions ok  /: filter this folder  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -812,6 +848,8 @@ class TreeView : public View {
     path_ = dir.empty() ? "/" : dir;
     want_ = select;
     selected_ = 0;
+    filter_.clear();
+    all_entries_ = json::array();
     entries_ = json::array();
     labels_.clear();
     detail_ = text("");
@@ -827,7 +865,8 @@ class TreeView : public View {
         [this, requested, name](json out) {
           if (requested != path_) return;   // the user has gone elsewhere meanwhile
           loading_ = false;
-          entries_ = out["entries"];
+          all_entries_ = out["entries"];
+          entries_ = filtered(all_entries_);
           dir_priority_ = out.value("priority", 2);
           this_node_ = out.value("this_node", "");
           inside_ = out.value("inside_archive", "");
@@ -846,6 +885,29 @@ class TreeView : public View {
             refresh_selecting("");
           }
         });
+  }
+
+  // The entries whose name contains the typed filter (case-insensitive); all of them if none.
+  json filtered(const json& all) const {
+    if (filter_.empty()) return all;
+    json out = json::array();
+    std::string needle = lower(filter_);
+    for (const auto& e : all)
+      if (lower(e.value("name", "")).find(needle) != std::string::npos) out.push_back(e);
+    return out;
+  }
+  static std::string lower(std::string s) {
+    for (auto& c : s)
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return s;
+  }
+  void set_filter(const std::string& f) {
+    filter_ = f;
+    std::string keep = current_name();
+    entries_ = filtered(all_entries_);
+    rebuild_labels();
+    selected_ = reselect(entries_, keep, [](const json& e) { return e.value("name", ""); }, 0);
+    load_detail();
   }
 
   // Does this entry (a file) or something below it (a folder) have a copy on this server's node?
@@ -947,7 +1009,10 @@ class TreeView : public View {
                       text(std::string("update priority: ") + priority_name(e->value("priority", 2)) +
                            (e->value("set_here", false) ? "" : " (inherited)")),
                       here_line(*e),
+                      text(std::string("versions: ") + (e->value("tolerant", false)
+                               ? "several are fine (no conflicts asked)" : "conflicts are decided")),
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
+                      text("V: several versions are fine here (no conflict decisions)") | dim,
                       text("x: pick up to move it in the tree  n: rename") | dim,
                       text("u: update priority (how often it is scanned)") | dim,
                       text("f: fetch it to this machine (the fetch folder)") | dim,
@@ -973,6 +1038,8 @@ class TreeView : public View {
     const json* e = current();
     if (!e || !e->value("dir", false)) return;
     path_ = child_path(e->value("name", ""));
+    filter_.clear();
+    all_entries_ = json::array();
     selected_ = 0;
     entries_ = json::array();
     labels_.clear();
@@ -986,6 +1053,8 @@ class TreeView : public View {
     auto pos = path_.rfind('/');
     std::string child = path_.substr(pos + 1);
     path_ = pos == 0 ? "/" : path_.substr(0, pos);
+    filter_.clear();
+    all_entries_ = json::array();
     entries_ = json::array();
     labels_.clear();
     detail_ = text("");
@@ -1007,7 +1076,7 @@ class TreeView : public View {
       return true;
     }
     if (!inside_.empty()) {   // what is listed from an archive cannot be acted on
-      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z"})
+      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z", "V"})
         if (key(e, k)) {
           ctx_.notify("inside the packed directory " + inside_ +
                       ": read-only (go up to it; z there unpacks it)");
@@ -1016,6 +1085,15 @@ class TreeView : public View {
     }
     if (key(e, "p") && !picked_.empty()) {   // put the picked-up items here
       move_items({picked_.begin(), picked_.end()}, path_, "");
+      return true;
+    }
+    if (e == Event::Escape && !filter_.empty()) {
+      set_filter("");
+      return true;
+    }
+    if (key(e, "/")) {   // find among the entries of this folder
+      ctx_.dialogs->ask_text("Show only the entries of " + path_ + " whose name contains:",
+                             filter_, [this](const std::string& f) { set_filter(f); });
       return true;
     }
     if (e == Event::Escape && !picked_.empty()) {
@@ -1039,8 +1117,7 @@ class TreeView : public View {
     }
     if (key(e, "u")) {   // update priority of the selected directory (or of this one)
       const json* sel = current();
-      std::string dir_path = sel && sel->value("dir", false)
-                                 ? child_path(sel->value("name", "")) : path_;
+      std::string dir_path = sel ? child_path(sel->value("name", "")) : path_;   // a file too
       set_priority(dir_path);
       return true;
     }
@@ -1067,6 +1144,25 @@ class TreeView : public View {
     if (key(e, "x")) {   // pick up / put down this item
       if (!picked_.erase(target)) picked_.insert(target);
       rebuild_labels();
+      return true;
+    }
+    if (key(e, "V")) {   // tolerate several versions of this file or everything below this folder
+      ctx_.dialogs->ask_choice(
+          "Several versions of " + target + (dir ? " (everything below it)" : "") + ":\n"
+          "where the copies of a file differ, tolerate it: no decision is asked and nothing is "
+          "overwritten.",
+          {"tolerate several versions", "decide conflicts (the default)", "inherit from the parent"},
+          [this, target](int i) {
+            json value = i == 2 ? json(nullptr) : json(i == 0);
+            ctx_.send("/api/tolerance", {{"path", target}, {"tolerant", value}},
+                      [this, target](json out) {
+                        ctx_.notify(target + ": " +
+                                    (out.value("tolerant", false) ? "several versions are fine"
+                                                                  : "conflicting versions are decided") +
+                                    (out.value("inherited", false) ? " (inherited)" : ""));
+                        refresh();
+                      });
+          });
       return true;
     }
     bool packed = cur->value("packed", false);
@@ -1123,15 +1219,18 @@ class TreeView : public View {
     ctx_.dialogs->ask_choice(
         "Pack " + target + " into one squashfs archive (" + target + ".sqsh)?\n"
         "It then shows as a single entry; search looks inside only with 'deep search'.\n"
-        "The directory must be on one node of a server with the squashfs tools.",
-        {"pack, keep the original files", "pack, then remove the original files"},
+        "The job is in the Jobs tab and can be cancelled there.",
+        {"pack on every node that holds it: pack on one, copy the archive to the others, then "
+         "remove the original files (each is checked against the archive first)",
+         "pack here only, keep the original files",
+         "pack here only, then remove the original files"},
         [this, target](int i) {
-          ctx_.send("/api/archives/pack", {{"vpath", target}, {"remove_originals", i == 1}},
-                    [this, target](json out) {
-                      ctx_.notify("packing " + target + " on " + out.value("node", "") +
-                                  " in the background (see the status line)");
-                      follow_ = 5;
-                    });
+          json body = {{"vpath", target}, {"everywhere", i == 0}, {"remove_originals", i == 2}};
+          ctx_.send("/api/archives/pack", body, [this, target](json out) {
+            ctx_.notify("packing " + target + " on " + out.value("node", "") +
+                        ": job #" + std::to_string(out.value("job_id", 0)) + " in the Jobs tab");
+            follow_ = 5;
+          });
         });
   }
 
@@ -1141,8 +1240,8 @@ class TreeView : public View {
         "then marked for deletion (you confirm that in the Marked tab).",
         [this, target] {
           ctx_.send("/api/archives/unpack", {{"vpath", target}}, [this, target](json out) {
-            ctx_.notify("unpacking " + target + " on " + out.value("node", "") +
-                        " in the background (see the status line)");
+            ctx_.notify("unpacking " + target + " on " + out.value("node", "") + ": job #" +
+                        std::to_string(out.value("job_id", 0)) + " in the Jobs tab");
             follow_ = 5;
           });
         });
@@ -1151,8 +1250,9 @@ class TreeView : public View {
   void set_priority(const std::string& dir_path) {
     ctx_.dialogs->ask_choice(
         "Update priority of " + dir_path + " (applies to everything below it):\n"
-        "how often it is scanned for changes; archival is only scanned when you ask.",
-        {"0  synchronous (live; for programs saving continuously)", "1  frequent",
+        "how often it is scanned for changes; archival is only scanned when you ask.\n"
+        "A file can have its own setting too.",
+        {"0  synchronous (a change is copied to the other nodes holding it at once)", "1  frequent",
          "2  infrequent (default)", "3  archival (never changes)", "inherit from the parent"},
         [this, dir_path](int i) {
           json value = i == 4 ? json(nullptr) : json(i);
@@ -1184,7 +1284,9 @@ class TreeView : public View {
   std::string path_ = "/";
   std::string want_;   // entry to select when the next listing arrives
   bool loading_ = false;
-  json entries_ = json::array();
+  json entries_ = json::array();       // what is listed (after the filter)
+  json all_entries_ = json::array();   // the whole folder
+  std::string filter_;                 // "/": only names containing this
   std::vector<std::string> labels_;
   int selected_ = 0;
   Element detail_ = text("");
@@ -2019,7 +2121,7 @@ class NodesView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  c: check completeness  m: move root  n: add drive  "
-           "R: rename  p: priority  t: backup target  o: adopt";
+           "R: rename  p: priority  t: backup target  B: backup first  M: mirrored drive  X: remove  o: adopt";
   }
 
   void refresh() override {
@@ -2081,8 +2183,13 @@ class NodesView : public View {
         files += items_[i].value("files", 0);
         bytes += items_[i].value("bytes", std::int64_t{0});
       }
+      bool leftover = false;
+      for (int i : owned[id]) leftover = leftover || items_[i].value("leftover", false);
       std::string tag = info.value("self", false)       ? "this server"
-                        : info.value("online", true) ? "online" : "UNREACHABLE";
+                        : info.value("online", true) ? "online"
+                        : leftover ? "UNREACHABLE: an old server of the same name is online; "
+                                     "X removes its nodes"
+                                   : "UNREACHABLE";
       labels_.push_back("▾ " + info.value("name", "") + "  (" + tag + ")  " +
                         std::to_string(owned[id].size()) + " node(s), " + std::to_string(files) +
                         " files, " + human_size(bytes));
@@ -2218,6 +2325,8 @@ class NodesView : public View {
         label_value("Windows names", yes(n.value("restricted_names", false))),
         label_value("priority", std::to_string(n.value("priority", 0))),
         label_value("backup target", yes(n.value("replication_target", false))),
+        label_value("backup first", yes(n.value("backup_first", false))),
+        label_value("mirrored drive", yes(n.value("mirrored", false)) ),
         label_value("last scan", n.value("last_scan", "").substr(0, 19)),
     });
   }
@@ -2225,7 +2334,7 @@ class NodesView : public View {
   bool on_event(const Event& e) {
     if (key(e, "r")) return refresh(), true;
     if (key(e, "S")) {
-      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan of all nodes queued"); });
+      ctx_.send("/api/scan", {}, [this](json) { ctx_.notify("scan of all nodes: see the Jobs tab (c cancels it)"); });
       return true;
     }
     if (key(e, "n")) {
@@ -2279,7 +2388,8 @@ class NodesView : public View {
     if (name.empty() && !on_server) return false;
     // Scanning keys also work on a server's row (all the nodes it owns); the rest need one node.
     if (name.empty() && !(key(e, " ") || key(e, "s") || key(e, "w") || key(e, "v"))) {
-      if (key(e, "R") || key(e, "c") || key(e, "m") || key(e, "p") || key(e, "t")) {
+      if (key(e, "R") || key(e, "c") || key(e, "m") || key(e, "p") || key(e, "t") ||
+          key(e, "X") || key(e, "B") || key(e, "M")) {
         ctx_.error("select a node (a branch), not a server");
         return true;
       }
@@ -2310,7 +2420,7 @@ class NodesView : public View {
     if (key(e, "s")) {
       auto targets = scan_targets(name);
       ctx_.send("/api/scan", {{"nodes", targets}}, [this, targets](json) {
-        ctx_.notify("scan of " + joined(targets) + " queued");
+        ctx_.notify("scan of " + joined(targets) + ": see the Jobs tab (c cancels it)");
         marked_.clear();
         rebuild_labels();
       });
@@ -2378,7 +2488,7 @@ class NodesView : public View {
     if (key(e, "w")) {   // discover new files only
       auto targets = scan_targets(name);
       ctx_.send("/api/scan", {{"nodes", targets}, {"new_only", true}}, [this, targets](json) {
-        ctx_.notify("scan for new files on " + joined(targets) + " queued");
+        ctx_.notify("scan for new files on " + joined(targets) + ": see the Jobs tab");
         marked_.clear();
         rebuild_labels();
       });
@@ -2413,6 +2523,37 @@ class NodesView : public View {
                                ctx_.send("/api/nodes/" + url_encode(name), {{"priority", n}},
                                          [this](json) { refresh(); });
                              });
+      return true;
+    }
+    if (key(e, "X")) {   // take the node out of the index (nothing on its drive is touched)
+      ctx_.dialogs->confirm(
+          "Remove the node " + name + " from the index?\nIts drive and files are NOT touched; "
+          "rei-fs forgets what it knew of them (copies, jobs and schedules of the node). A node "
+          "of this server is removed on every server; a node of another server only here, and "
+          "only while that server is not answering (the last one also forgets the server).",
+          [this, name] {
+            ctx_.send("/api/nodes/" + url_encode(name) + "/remove", json::object(), [this, name](json out) {
+              ctx_.notify("removed " + name + " (" + std::to_string(out.value("copies_forgotten", 0)) +
+                          " copies forgotten)" +
+                          (out["server_forgotten"].is_string()
+                               ? "; server " + out.value("server_forgotten", "") + " forgotten too"
+                               : ""));
+              refresh();
+            });
+          });
+      return true;
+    }
+    if (key(e, "B") || key(e, "M")) {   // flags: backup first / mirrored drive
+      std::string flag = key(e, "B") ? "backup_first" : "mirrored";
+      bool now = items_[node_index()].value(flag, false);
+      ctx_.send("/api/nodes/" + url_encode(name), {{flag, !now}}, [this, flag, now, name](json) {
+        ctx_.notify(name + (flag == "mirrored"
+                                ? (now ? ": no longer a mirrored drive"
+                                       : ": mirrored drive (its copies count as two)")
+                                : (now ? ": no longer filled first by backups"
+                                       : ": backups fill it first")));
+        refresh();
+      });
       return true;
     }
     if (key(e, "t")) {
@@ -2758,6 +2899,142 @@ std::string due_text(double next_due) {
   return "in " + std::to_string(static_cast<int>(secs / 86400)) + " days";
 }
 
+// --- Applications -------------------------------------------------------------------
+
+class AppsView : public View {
+ public:
+  explicit AppsView(Context& ctx) : ctx_(ctx) {
+    menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
+    root_ = Renderer(menu_, [this] {
+      return vbox({paragraph(" Applications use rei-fs for their files through the API. A storage "
+                             "app gets a directory on a node to fill. The instances of an app "
+                             "registered on several nodes keep their directory the same "
+                             "everywhere (it is made synchronous).") | dim,
+                   with_detail(list_panel(std::to_string(items_.size()) + " registration(s)",
+                                          menu_, labels_.size(), "none yet: n registers one"),
+                               detail()) | flex});
+    });
+    root_ |= CatchEvent([this](Event e) { return on_event(e); });
+  }
+  std::string title() const override { return "Apps"; }
+  Component component() override { return root_; }
+  std::string help() const override { return "n: register an app  t: new token  x: unregister  r: refresh"; }
+
+  void refresh() override {
+    ctx_.get("/api/apps", [this](json out) {
+      items_ = out["apps"];
+      labels_.clear();
+      for (const auto& a : items_)
+        labels_.push_back(fit(a.value("name", ""), 22) + fit(a.value("mode", ""), 10) +
+                          fit(a.value("node", ""), 16) + fit(a.value("dir", ""), 26) +
+                          (a.value("online", false) ? "" : "offline"));
+      selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
+    }, "apps");
+    ctx_.get("/api/nodes", [this](json out) { nodes_ = out["nodes"]; }, "apps-nodes");
+  }
+
+ private:
+  Element detail() {
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return text("");
+    const json& a = items_[selected_];
+    Elements rows = {text(a.value("name", "")) | bold, separator(),
+                     label_value("mode", a.value("mode", "")),
+                     label_value("node", a.value("node", "") + " (server " + a.value("server", "") + ")"),
+                     label_value("directory", a.value("dir", "")),
+                     label_value("token", a.value("has_token", false) ? "issued here"
+                                                                      : "issued on its own server")};
+    int same = 0;
+    for (const auto& o : items_)
+      if (o.value("name", "") == a.value("name", "")) ++same;
+    if (a.value("mode", "") == "instance") rows.push_back(label_value("instances", std::to_string(same)));
+    rows.push_back(text(""));
+    rows.push_back(text("the app presents its token as 'Authorization: Bearer ...'") | dim);
+    rows.push_back(text("on /api/app/list, read, write, delete, sync, info") | dim);
+    return vbox(rows);
+  }
+
+  bool on_event(const Event& e) {
+    if (key(e, "r")) return refresh(), true;
+    if (key(e, "n")) {
+      register_app();
+      return true;
+    }
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return false;
+    json a = items_[selected_];
+    json who = {{"name", a.value("name", "")}, {"node", a.value("node", "")}};
+    if (!a.value("mine", false)) who["server"] = server_of(a.value("node", ""));
+    if (key(e, "t")) {
+      ctx_.dialogs->confirm("Make a new token for " + a.value("name", "") +
+                                "? The old one stops working.", [this, who] {
+        ctx_.send("/api/apps/token", who, [this](json out) {
+          ctx_.dialogs->info("New token (shown once)", out.value("token", ""));
+        });
+      });
+      return true;
+    }
+    if (key(e, "x")) {
+      ctx_.dialogs->confirm("Unregister " + a.value("name", "") + " on " + a.value("node", "") +
+                                "? Its directory and files stay as they are.", [this, who] {
+        ctx_.send("/api/apps/remove", who, [this](json) { refresh(); });
+      });
+      return true;
+    }
+    return false;
+  }
+
+  std::string server_of(const std::string& node) const {
+    for (const auto& n : nodes_)
+      if (n.value("name", "") == node) return n.value("owner_id", "");
+    return "";
+  }
+
+  void register_app() {
+    ctx_.dialogs->ask_text("Name of the application (letters, digits . _ -):", "",
+                           [this](const std::string& name) {
+      if (name.empty()) return;
+      ctx_.dialogs->ask_choice(
+          "How does " + name + " use rei-fs?",
+          {"storage: a directory on a node to fill with whatever it wants",
+           "instance: its files are kept the same on every node it is registered on"},
+          [this, name](int m) {
+            std::string mode = m == 0 ? "storage" : "instance";
+            std::vector<std::string> labels = {"any node (one is chosen)"};
+            std::vector<json> choices = {json(nullptr)};
+            for (const auto& n : nodes_) {
+              if (!n.value("online", false)) continue;
+              labels.push_back(n.value("name", "") + "  (" + n.value("owner", "") + ")");
+              choices.push_back(n);
+            }
+            ctx_.dialogs->ask_choice(
+                "On which node?", labels, [this, name, mode, choices](int i) {
+                  json body = {{"name", name}, {"mode", mode}};
+                  if (!choices[i].is_null()) {
+                    body["node"] = choices[i].value("name", "");
+                    // A node of another server is registered there.
+                    if (choices[i].value("owner", "") != "self")
+                      body["server"] = choices[i].value("owner_id", "");
+                  }
+                  ctx_.send("/api/apps", body, [this, name](json out) {
+                    ctx_.dialogs->info(
+                        "Registered " + name,
+                        "node: " + out.value("node", "") + "\ndirectory: " + out.value("dir", "") +
+                            (out["path"].is_string() ? "\non disk: " + out.value("path", "") : "") +
+                            "\n\ntoken (shown once, keep it):\n" + out.value("token", ""));
+                    refresh();
+                  });
+                });
+          });
+    });
+  }
+
+  Context& ctx_;
+  json items_ = json::array();
+  json nodes_ = json::array();
+  std::vector<std::string> labels_;
+  int selected_ = 0;
+  Component menu_, root_;
+};
+
 class SchedulesView : public View {
  public:
   explicit SchedulesView(Context& ctx) : ctx_(ctx) {
@@ -2905,6 +3182,7 @@ std::vector<std::shared_ptr<View>> make_views(Context& ctx) {
       std::make_shared<WantedView>(ctx),    std::make_shared<JobsView>(ctx),
       std::make_shared<NodesView>(ctx),     std::make_shared<MarkedView>(ctx),
       std::make_shared<ServersView>(ctx),   std::make_shared<SchedulesView>(ctx),
+      std::make_shared<AppsView>(ctx),
   };
 }
 

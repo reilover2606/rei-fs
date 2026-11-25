@@ -222,6 +222,32 @@ def create_relay_job(conn: sqlite3.Connection, rid: str, node_id: str, vpath: st
     return job_id
 
 
+def create_tool_job(conn: sqlite3.Connection, kind: str, description: str,
+                    items: list[tuple], hidden: bool = False) -> int:
+    """A job of operations that are not transfers (scan, pack, unpack, clean): each item is
+    ``(op, vpath, node_id, params)`` and runs on a node of this server. The caller holds the
+    transaction."""
+    job_id = _new_job(conn, kind, description)
+    if hidden:
+        conn.execute("UPDATE jobs SET hidden = 1 WHERE id = ?", (job_id,))
+    ts = db.now()
+    conn.executemany(
+        "INSERT INTO job_items(job_id, op, vpath, dst_node, size, params, updated)"
+        " VALUES (?, ?, ?, ?, 0, ?, ?)",
+        [(job_id, op, vpath, node_id, json.dumps(params), ts)
+         for op, vpath, node_id, params in items])
+    return job_id
+
+
+def active_tool_item(conn: sqlite3.Connection, op: str, vpath: str, node_id: str) -> int | None:
+    """The job already about to do the same thing, if any."""
+    r = conn.execute(
+        "SELECT i.job_id FROM job_items i JOIN jobs j ON j.id = i.job_id WHERE i.op = ?"
+        " AND i.vpath = ? AND i.dst_node = ? AND i.state IN ('pending', 'running')"
+        " AND j.status IN ('pending', 'running', 'waiting')", (op, vpath, node_id)).fetchone()
+    return r[0] if r else None
+
+
 def _new_job(conn: sqlite3.Connection, kind: str, description: str) -> int:
     return conn.execute(
         "INSERT INTO jobs(kind, description, created) VALUES (?, ?, ?)",
@@ -355,6 +381,8 @@ def refresh_status(conn: sqlite3.Connection, job_id: int, after_run: bool = Fals
     finished = db.now() if status in ("done", "failed") else None
     conn.execute("UPDATE jobs SET status = ?, finished = ? WHERE id = ?",
                  (status, finished, job_id))
+    if status == "failed":      # a synchronizer job that failed is worth looking at
+        conn.execute("UPDATE jobs SET hidden = 0 WHERE id = ?", (job_id,))
     return status
 
 

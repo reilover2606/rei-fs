@@ -363,7 +363,7 @@ def test_update_priority_through_the_api(server):
     assert tree["priority"] == 2
     assert [(e["name"], e["priority"], e["set_here"]) for e in tree["entries"] if e["dir"]] == \
         [("docs", 3, True)]
-    client.post("/api/priority", {"path": "/docs/a.txt", "priority": 1}, expect=400)
+    assert client.post("/api/priority", {"path": "/docs/a.txt", "priority": 1})["priority"] == 1  # a file too
     client.post("/api/priority", {"path": "/docs", "priority": 9}, expect=400)
     assert client.post("/api/priority", {"path": "/docs", "priority": None})["priority"] == 2
     client.post("/api/scan", {"due": True})        # an automatic-style scan is accepted
@@ -499,3 +499,52 @@ def test_pack_search_deep_and_unpack_over_the_api(server):
     wait(lambda: not any(e.get("packed") for e in client.get("/api/tree?path=/")["entries"]),
          "unpacked")
     assert client.get("/api/find?q=a.txt")["total"] == 1
+
+
+def test_holders_say_which_nodes_have_the_selected_files(server):
+    env, client, _ = server
+    login(client)
+    out = client.post("/api/holders", {"paths": ["/docs", "/top.txt"]})
+    have = {n["name"]: n["have"] for n in out["nodes"]}
+    assert out["total"] == 3 and have["ssd"] == 0 and max(have.values()) == 3
+    client.post("/api/holders", {"paths": ["/nope"]}, expect=400)
+
+
+def test_node_flags_and_tolerance_over_the_api(server):
+    env, client, _ = server
+    login(client)
+    client.post("/api/nodes/ssd", {"mirrored": True, "backup_first": True})
+    ssd = {n["name"]: n for n in client.get("/api/nodes")["nodes"]}["ssd"]
+    assert ssd["mirrored"] and ssd["backup_first"]
+    out = client.post("/api/tolerance", {"path": "/docs", "tolerant": True})
+    assert out["tolerant"] and not out["inherited"]
+    entry = [e for e in client.get("/api/tree?path=/")["entries"] if e["name"] == "docs"][0]
+    assert entry["tolerant"]
+    assert client.get("/api/file?path=/docs/a.txt")["tolerant"]
+
+
+def test_an_app_token_reaches_the_app_endpoints_and_nothing_else(server):
+    import base64
+    env, client, _ = server
+    login(client)
+    out = client.post("/api/apps", {"name": "demo", "mode": "storage", "node": "ssd"})
+    token = out["token"]
+    assert out["dir"] == "/apps/demo" and any(a["name"] == "demo" for a in client.get("/api/apps")["apps"])
+    client.token = token
+    info = client.get("/api/app/info")
+    assert info["name"] == "demo" and info["mode"] == "storage"
+    data = base64.b64encode(b"hi").decode()
+    assert client.post("/api/app/write", {"path": "a.txt", "data": data})["size"] == 2
+    got = client.get("/api/app/read?path=a.txt")
+    assert base64.b64decode(got["data"]) == b"hi" and got["eof"]
+    assert [e["name"] for e in client.get("/api/app/list")["entries"]] == ["a.txt"]
+    client.post("/api/app/write", {"path": "../x", "data": data}, expect=400)
+    client.get("/api/nodes", expect=401)                     # not an admin token
+    client.post("/api/scan", {}, expect=401)
+    client.token = "reifsapp_nonsense"
+    client.get("/api/app/info", expect=401)
+    login(client)
+    client.get("/api/app/info", expect=401)                  # and a login is not an app token
+    client.post("/api/apps/remove", {"name": "demo"})
+    client.token = token
+    client.get("/api/app/info", expect=401)                  # the token died with the registration

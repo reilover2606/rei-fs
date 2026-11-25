@@ -20,7 +20,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import archives, db, index, peers, priority, relay, replication, runner, scanner, schedules, sync
+from . import (archives, db, index, peers, priority, relay, replication, runner, scanner,
+               schedules, sync, synchronous)
 from .config import Config
 from .control import Stopped
 from .locking import LockError, ServerLock
@@ -36,6 +37,8 @@ RELAY_POLL_SECONDS = 5
 SCHEDULE_CHECK_SECONDS = 15   # how often scheduled syncs are looked at (a late node is caught up)
 HOUSEKEEPING_SECONDS = 600
 SYNC_SECONDS = 30
+FOLLOWUP_SECONDS = 15   # directories packed everywhere: copy the archive, remove the originals
+SYNC_CHECK_SECONDS = 3   # synchronous files: look at the change log this often
 PLAN_SECONDS = 600     # replication planning, at least this often
 PLAN_CHECK_SECONDS = 60  # ...and when the log changed (local or peer facts)
 RETRY_SECONDS = 5      # while a paired server is unreachable
@@ -99,10 +102,9 @@ class Worker:
     def request_plan(self) -> None:
         self._enqueue(("plan",))
 
-    def request_archive(self, op: str, vdir: str, node: str | None,
-                        remove_originals: bool = False) -> None:
-        """Pack a directory into an archive, or unpack one."""
-        self._enqueue(("archive", op, vdir, node, remove_originals))
+    def request_sync(self, full: bool = False) -> None:
+        """Bring the copies of synchronous files up to date (a full pass looks at all of them)."""
+        self._enqueue(("sync", full))
 
     def request_stop(self) -> None:
         """Interrupt the current operation and drop queued ones."""
@@ -153,6 +155,10 @@ class Worker:
         last_housekeeping = never
         last_plan = never
         last_plan_check = never
+        last_sync_check = never
+        last_followup = never
+        last_full_sync = never
+        synced_at_seq = None
         planned_at_seq = None
         online: set[str] | None = None
         try:
@@ -161,7 +167,11 @@ class Worker:
                     now = time.monotonic()
                     # Which directories are due depends on their update priority;
                     # looking is cheap (nothing is read when nothing is due).
-                    if self.cfg.scan.interval_minutes > 0 and now - last_scan >= SCAN_CHECK_SECONDS:
+                    live = (self.cfg.scan.synchronous_seconds > 0
+                            and synchronous.any_synchronous(conn))
+                    # Synchronous directories are looked at every few seconds, the rest every 30.
+                    if self.cfg.scan.interval_minutes > 0 and now - last_scan >= (
+                            self.cfg.scan.synchronous_seconds if live else SCAN_CHECK_SECONDS):
                         last_scan = now
                         if self._scan_due(conn, online):
                             self.request_scan(full=False)
@@ -183,6 +193,21 @@ class Worker:
                     if now - last_housekeeping >= HOUSEKEEPING_SECONDS:
                         last_housekeeping = now
                         relay.cleanup(conn, self.cfg)   # staged files nobody collected
+                    if live and now - last_sync_check >= SYNC_CHECK_SECONDS:
+                        last_sync_check = now
+                        seq = conn.execute("SELECT MAX(seq) FROM changes").fetchone()[0]
+                        if now - last_full_sync >= synchronous.FULL_PASS_SECONDS:
+                            last_full_sync = now
+                            synced_at_seq = seq
+                            self.request_sync(full=True)
+                        elif seq != synced_at_seq:
+                            synced_at_seq = seq
+                            self.request_sync()
+                    if now - last_followup >= FOLLOWUP_SECONDS:
+                        last_followup = now
+                        if conn.execute("SELECT 1 FROM archive_todo LIMIT 1").fetchone():
+                            if archives.followup(conn, self.cfg):
+                                self.request_jobs()
                     if now - last_jobs >= JOBS_SECONDS:
                         last_jobs = now
                         if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
@@ -237,6 +262,7 @@ class Worker:
                 log.info("node %s came online; scanning it", node_id)
                 self.request_scan([node_id], full=False)
                 self.request_jobs()
+                self.request_sync(full=True)    # synchronous files it missed while away
                 self._schedule_now = True
         if self.syncer is not None and current != previous:
             self.syncer.request_daemon_update()
@@ -245,11 +271,15 @@ class Worker:
 
     def _run(self, conn, task: tuple) -> None:
         kind = task[0]
-        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups",
-                 "archive": "packing" if kind == "archive" and task[1] == "pack"
-                 else "unpacking"}[kind]
-        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups",
-                      "archive": state}[kind])
+        if kind == "sync":        # frequent and quiet: no activity, no result line
+            try:
+                if synchronous.run(conn, self.cfg, full=task[1]):
+                    self.request_jobs()
+            except Exception as e:  # noqa: BLE001
+                log.warning("synchronizing failed: %s", e)
+            return
+        state = {"scan": "scanning", "jobs": "running jobs", "plan": "planning backups"}[kind]
+        db.set_label({"scan": "scan", "jobs": "running jobs", "plan": "planning backups"}[kind])
         self._set(state=state, detail="", since=db.now())
         if kind == "plan":
             started = time.monotonic()
@@ -276,27 +306,7 @@ class Worker:
         stop = self.stop_requested.is_set
         try:
             with ServerLock(self.cfg.home):
-                if kind == "archive":
-                    op, vdir, node, remove = task[1:]
-                    if op == "pack":
-                        res = archives.pack(conn, self.cfg, vdir, node, remove,
-                                            progress=self._progress, stop=stop)
-                        msg = (f"packed {vdir}: {res['files']:,} files into "
-                               f"{res['archive_bytes'] / 1e6:.1f} MB")
-                        msg += (f"; {res['originals_removed']:,} original files removed"
-                                if remove else "; the original files were kept")
-                        if res["database_reclaimed"]:
-                            msg += (f"; {res['database_reclaimed'] / 1e6:.1f} MB of database "
-                                    "space given back")
-                    else:
-                        res = archives.unpack(conn, self.cfg, vdir, node,
-                                              progress=self._progress, stop=stop)
-                        msg = f"unpacked {vdir}: {res['files']:,} files"
-                    self._set(last_result=msg, last_error="")
-                    self.request_plan()
-                    if self.syncer is not None:
-                        self.syncer.request_poke()
-                elif kind == "scan":
+                if kind == "scan":
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
                         progress=self._scan_progress, stop=stop, full=task[3],
@@ -304,10 +314,13 @@ class Worker:
                     summary = "; ".join(
                         f"{r.node_name}: +{r.stats.added} ~{r.stats.changed} "
                         f"-{r.stats.missing}" for r in results)
-                    self._set(last_result=f"scan done ({summary or 'no online node'})",
-                              last_error="")
+                    if task[3] or any(r.stats.added or r.stats.changed or r.stats.missing
+                                      for r in results):   # quiet automatic scans stay quiet
+                        self._set(last_result=f"scan done ({summary or 'no online node'})",
+                                  last_error="")
                     if any(r.stats.added or r.stats.changed for r in results):
                         self.request_jobs()
+                        self.request_sync()
                     self.request_plan()
                     if self.syncer is not None:
                         self.syncer.request_poke()
@@ -323,8 +336,6 @@ class Worker:
                         self.syncer.request_poke()
         except Stopped:
             self._set(last_result=f"{kind} stopped on request")
-        except archives.ArchiveError as e:
-            self._set(last_error=str(e))
         except LockError as e:
             self._set(last_error=str(e))
         except Exception as e:  # noqa: BLE001 - report, keep serving

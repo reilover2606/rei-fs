@@ -29,7 +29,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import archives, db, index, jobs, nodes, paths, peers, priority, schedules, vdirs
+from . import archives, db, index, jobs, nodes, paths, peers, priority, schedules, tolerance, vdirs
 
 MODES = ("merge", "preserve")
 
@@ -294,10 +294,15 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
         for old, new in plan.dir_moves:   # directories made by the user move at once
             vdirs.move(conn, old, new)
             priority.move(conn, old, new)   # and their update priority
+            tolerance.move(conn, old, new)  # and whether several versions are fine
             schedules.rewrite_paths(conn, old, new)   # and the scheduled syncs of it
             for peer in peers.paired_peers(conn):     # schedules live on the server owning the backup
                 index.queue_peer_call(conn, peer["id"], "/api/peer/dir-moved",
                                       {"old": old, "new": new})
+        tolerant = tolerance.load(conn)
+        for m in plan.moves:   # a file marked tolerant keeps the mark when it is moved
+            if m.old in tolerant:
+                tolerance.move(conn, m.old, m.new)
         for fid, node_id, _ in marks:
             hash_ = conn.execute("SELECT hash FROM copies WHERE file_id = ? AND node_id = ?",
                                  (fid, node_id)).fetchone()

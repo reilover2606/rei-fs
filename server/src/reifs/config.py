@@ -71,6 +71,9 @@ class ScanSection:
     # automatic scan off; archival (3) is only scanned the first time and on request.
     interval_minutes: int = 60
     synchronous_minutes: int = 1
+    # Synchronous directories are looked at this often (seconds) and changes in them are
+    # propagated at once; 0 uses synchronous_minutes.
+    synchronous_seconds: int = 5
     frequent_minutes: int = 10
     archival_minutes: int = 0
     # A scan that finds at least this many files vanished from (or moved out of)
@@ -79,6 +82,12 @@ class ScanSection:
     ignore_hidden_dirs: bool = True
     ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
 
+
+    def seconds(self, priority: int) -> int:
+        """Seconds between automatic scans of a priority class (0 = never again)."""
+        if priority == 0 and self.synchronous_seconds > 0:
+            return self.synchronous_seconds
+        return self.minutes(priority) * 60
 
     def minutes(self, priority: int) -> int:
         return (self.synchronous_minutes, self.frequent_minutes, self.interval_minutes,
@@ -241,6 +250,9 @@ fetch_dir = {s(self.storage.fetch_dir)}
 # yourself always covers everything.
 interval_minutes = {self.scan.interval_minutes}
 synchronous_minutes = {self.scan.synchronous_minutes}
+# Synchronous directories are scanned this often, in seconds, and what changes in them is
+# copied to the other nodes holding them at once (0: use synchronous_minutes).
+synchronous_seconds = {self.scan.synchronous_seconds}
 frequent_minutes = {self.scan.frequent_minutes}
 archival_minutes = {self.scan.archival_minutes}
 # Files that vanish or move together (a deleted or moved folder) are decided as one.

@@ -595,6 +595,122 @@ It can be packed into one squashfs archive, `<dir>.sqsh`, next to where the dire
   forgotten when those servers next scan. The squashfs tools exist on Linux only: a Windows
   node stores and copies the archive like any file but cannot pack or unpack.
 
+### 5.17 Tolerated versions and node flags
+
+* **Several versions are fine** (Tree: `V`; `reifs tolerate PATH yes|no|inherit`). A file or directory
+  can be marked tolerant (table `tolerance`, replicated like the directory priorities: the nearest
+  setting decides, 0 switches an inherited one off, NULL inherits). For such a file differing
+  copies are not a conflict: no `divergent` decision is raised (and open ones go when the mark is set),
+  every present copy counts as a good copy (a stale one is no longer "stale"), and so nothing is planned
+  to overwrite them. The mark moves with the path when it is moved or renamed.
+* **Mirrored drive** (`nodes.mirrored`, Nodes tab `M`, `reifs node set --mirrored yes`): a copy on
+  it counts as two towards the goal, everywhere good copies are counted (coverage figures, the
+  under-replicated filter, the file view and the backup planner, which also counts a mirrored
+  destination as two).
+* **Backup first** (`nodes.backup_first`, Nodes tab `B`, `--backup-first yes`): a node that exists for
+  backups. When the planner picks a destination, online backup-first nodes come before the priority
+  order, so they are filled (until their free space is used) before backing up elsewhere.
+* Both flags are announced with the node, so every server plans with the same figures.
+
+### 5.18 Synchronous paths and applications
+
+**Synchronous.** A file or directory whose update priority is "synchronous" (`u` in the Tree; files
+can have a setting of their own) is kept the same on every node that holds it. The node is scanned
+every `[scan] synchronous_seconds` (5) instead of every minute, and a worker task
+(`synchronous.run`) follows the change log: when a copy changed, the newest version (mtime, ties by
+hash) is copied over the older copies of the nodes that hold the path (for a directory: that have
+a file below it, or that an application instance is registered on). It is not asked
+about: no `divergent` decision is raised for such files. The jobs are *hidden*
+(`jobs.hidden`): they are not in the job list or the active-job count unless one fails. Only a
+present, older copy whose content is still the one judged stale is overwritten; a missing copy is
+not brought back and nothing is ever deleted. Each server makes jobs for the nodes it owns. A
+tolerant path (5.17) is left alone. A full pass runs every five minutes and when a node comes back.
+
+**Applications** (`apps.py`; Apps tab, `-`; `reifs app add|list|remove|token`). A registration is a
+name, a mode and a node; it returns a *token* (kept only as a hash) that the application sends as
+`Authorization: Bearer reifsapp_...`. The token reaches the `/api/app/...` endpoints and nothing else
+(and a login or a peer's credentials do not work there). Registrations are replicated (without the
+token), so every server knows the groups.
+
+* *storage*: `/apps/<name>` on a node of this server (named, or chosen among the online ones with
+  room) to fill with whatever the app wants. An ordinary directory of the tree: scanned (frequent
+  unless set otherwise), backed up, replicated.
+* *instance*: the same name registered on several nodes forms a group; `/apps/<name>` is made
+  synchronous, and a node registered while still empty receives the files at once.
+
+The app may use the HTTP endpoints or, running on the node's machine, read and write the directory
+itself (its path is in `info`) and call `sync` to have it looked at now:
+
+| endpoint | |
+|---|---|
+| `GET /api/app/info` | name, mode, node, directory, path on disk, the group's instances, pending items |
+| `GET /api/app/list?path=` | entries of a subdirectory |
+| `GET /api/app/read?path=&offset=&length=` | base64 `data` of up to 4 MiB, `eof` |
+| `POST /api/app/write {path, data, append?, done?}` | base64 `data`; `append` with `done: false` for chunks; indexed at once when `done` |
+| `POST /api/app/delete {path}` | the app removes a file of its own directory |
+| `POST /api/app/sync` | rescan the directory now and propagate |
+
+Paths are relative to the app's directory; `..` and symlinks that lead out are refused.
+
+### 5.19 Packing everywhere, and scans, packing and unpacking as jobs
+
+**Jobs.** A scan the user asks for, a pack and an unpack are jobs (`jobs.kind` `scan`, `pack`,
+`unpack`; item operations `scan`, `pack`, `unpack`, `clean`; `job_items.params` holds the
+options). They show in the Jobs tab with their progress in the item's message and can be cancelled
+there (`c`) at any moment. The runner looks for the cancellation about once a second, and the
+tools look between their steps, and each leaves nothing half-done: a stopped scan marks nothing
+missing, packing removes its `.part` file and registers nothing, unpacking removes its scratch
+folder and, once it starts moving the extracted files into place, finishes that (a few renames)
+first, and removing originals stops between two files (what is gone was checked). Cancelling after
+the archive is registered ends only the optional removal. The scans the server starts by itself
+(a due directory, a node coming back) stay plain tasks, out of the list.
+
+**Pack everywhere** (Tree `z`, first choice; `reifs archive pack --everywhere`). The server asked
+packs on its own node if one holds the directory, otherwise the request goes to the server of
+another online node that holds all of it. When the archive is registered the record says which
+other nodes held the directory (`archives.targets`, `cleanup`). Every server that owns such a node
+then owes two things (`archive_todo`, advanced every 15 seconds by `archives.followup`): copy the
+archive to the node (an ordinary visible copy job), and, once the node has it, remove the
+original files there (a `clean` job). Each file is removed only if its size and content hash match
+the archive's member list (the member lists carry a 64-bit hash of every file): a file that was
+changed since, or is not in the archive, stays, and the job says how many. The index forgets the
+loose copies, empty folders go, and the server's database is given its free space back
+(`db.reclaim`). A node that is offline is done when it is back.
+
+### 5.20 Removing a node
+
+A node can be taken out of the index (Nodes tab `X`; `reifs node remove NAME [--force]`;
+`nodes.remove_node`). Its drive and files are never touched: rei-fs forgets its copies,
+decisions, proposals, jobs, schedules and application registrations, the change-log
+pointers to it, and files that no other node holds. The database's free space is given back.
+
+* A node of this server is announced as removed (a `node` entry with `removed`), so every server
+  forgets it. Adding the folder again gives the same node back (its ID file keeps the id).
+* A node of another server can be removed here only while that server is not answering (or with
+  `--force`): that is how what is left of a server that was reset (new database, new identity,
+  same name) is cleaned up. The other servers must do the same on their side. When it was the last
+  node of such a server, the server is forgotten too; what a third server still forwards of its log
+  is not applied again (the progress vector is kept).
+* The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
+* The server's own node cannot be removed.
+
+### 5.20 Removing a node
+
+A node can be taken out of the index (Nodes tab `X`; `reifs node remove NAME [--force]`;
+`nodes.remove_node`). Its drive and files are never touched: rei-fs forgets its copies,
+decisions, proposals, jobs, schedules and application registrations, the change-log
+pointers to it, and files that no other node holds. The database's free space is given back.
+
+* A node of this server is announced as removed (a `node` entry with `removed`), so every server
+  forgets it. Adding the folder again gives the same node back (its ID file keeps the id).
+* A node of another server can be removed here only while that server is not answering (or with
+  `--force`): that is how what is left of a server that was reset (new database, new identity,
+  same name) is cleaned up. The other servers must do the same on their side. When it was the last
+  node of such a server, the server is forgotten too; what a third server still forwards of its log
+  is not applied again (the progress vector is kept).
+* The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
+* The server's own node cannot be removed.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

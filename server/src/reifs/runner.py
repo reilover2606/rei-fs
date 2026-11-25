@@ -16,9 +16,11 @@ in ``<dst>/.rei-fs/partial`` so even a half-copied large file resumes.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
+import time
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,15 +28,19 @@ from typing import Callable
 
 import uuid
 
-from . import db, fsops, index, jobs, paths, peers, relay, transfer
+from . import archives, db, fsops, index, jobs, paths, peers, relay, scanner, transfer
 from .config import Config
-from .control import StopFn, check
+from .control import StopFn, Stopped, check
 from .hashing import hash_file
 from .nodes import discover
 
 log = logging.getLogger(__name__)
 ProgressFn = Callable[[str], None]
 MAX_MESSAGES = 200
+
+
+TOOL_OPS = ("scan", "pack", "unpack", "clean")
+CANCEL_LOOK_SECONDS = 1.0     # how often a running tool looks whether its job was cancelled
 
 
 @dataclass
@@ -165,6 +171,9 @@ class _Runner:
         try:
             for item in items:
                 check(self.stop)
+                if item["op"] in TOOL_OPS:
+                    self._tool(item, rep)
+                    continue
                 if item["op"] == "rename":
                     self._rename(item, rep)
                     continue
@@ -619,6 +628,97 @@ class _Runner:
             self._transient(p.item, rep, msg)
 
     # --- rename within a node ---------------------------------------------------
+
+    # --- scan, pack, unpack, remove originals ----------------------------------------
+
+    def _tool(self, item, rep: JobReport) -> None:
+        """Operations on a node of this server that are not transfers. They can be cancelled
+        from the job list at any moment: the cancellation is looked for about once a second
+        (and by the tools between their steps), and each tool leaves nothing half-done
+        behind: a scan that is stopped marks nothing missing, packing removes its partial
+        file, unpacking removes its scratch folder, removing originals stops between two files."""
+        conn = self.conn
+        state = conn.execute("SELECT state FROM job_items WHERE id = ?", (item["id"],)).fetchone()
+        if state is None or state[0] != "pending":
+            return                        # cancelled while it was waiting its turn
+        node_id, vdir, op = item["dst_node"], item["vpath"], item["op"]
+        if node_id not in self.roots:
+            self._wait(item, rep, f"node {self._name(node_id)} is offline")
+            return
+        params = json.loads(item["params"] or "{}")
+        with db.transaction(conn):
+            self._set(item, "running", "starting")
+        cancelled = [False]
+        last_say, last_look = [0.0], [0.0]
+
+        def say(msg: str) -> None:
+            self.progress(msg)            # the activity line (and a global stop)
+            now = time.monotonic()
+            if now - last_say[0] >= 1.0:
+                last_say[0] = now
+                try:
+                    conn.execute("UPDATE job_items SET message = ? WHERE id = ?",
+                                 (msg[:200], item["id"]))
+                except sqlite3.OperationalError:
+                    pass
+
+        def stop() -> bool:
+            if self.stop is not None and self.stop():
+                return True
+            now = time.monotonic()
+            if now - last_look[0] >= CANCEL_LOOK_SECONDS:
+                last_look[0] = now
+                r = conn.execute(
+                    "SELECT j.status, i.state FROM job_items i JOIN jobs j ON j.id = i.job_id"
+                    " WHERE i.id = ?", (item["id"],)).fetchone()
+                if r is not None and "cancelled" in (r[0], r[1]):
+                    cancelled[0] = True
+            return cancelled[0]
+
+        try:
+            if op == "pack":
+                res = archives.pack(conn, self.cfg, vdir, node_id,
+                                    bool(params.get("remove_originals")), say, stop,
+                                    everywhere=bool(params.get("everywhere")))
+                msg = f"packed {res['files']:,} files into {res['archive_bytes'] / 1e6:.1f} MB"
+                if res["originals_removed"] or res["originals_left"]:
+                    msg += (f"; {res['originals_removed']:,} originals removed"
+                            + (f", {res['originals_left']:,} left (they differ)"
+                               if res["originals_left"] else ""))
+                if res["targets"]:
+                    msg += f"; being copied to {res['targets']} other node(s)"
+            elif op == "unpack":
+                res = archives.unpack(conn, self.cfg, vdir, node_id, say, stop)
+                msg = f"unpacked {res['files']:,} files"
+            elif op == "clean":
+                res = archives.cleanup_node(conn, self.cfg, vdir, node_id, say, stop)
+                msg = f"{res['removed']:,} originals removed" + (
+                    f", {res['left']:,} left (they differ from the archive)" if res["left"] else "")
+            else:
+                def scan_progress(s, current: str) -> None:
+                    say(f"{s.node}: {s.seen:,} files seen, {s.hashed:,} hashed"
+                        + (f", {current}" if current else ""))
+                _, results = scanner.scan_all(
+                    conn, self.cfg, [node_id], verify=bool(params.get("verify")),
+                    progress=scan_progress, stop=stop, full=bool(params.get("full", True)),
+                    new_only=bool(params.get("new_only")))
+                msg = "; ".join(f"{r.stats.seen:,} files, +{r.stats.added} ~{r.stats.changed} "
+                                f"-{r.stats.missing}" + (f", {len(r.errors)} error(s)"
+                                                         if r.errors else "") for r in results)
+            with db.transaction(conn):
+                self._set(item, "done", msg)
+            rep.done += 1
+        except Stopped:
+            if not cancelled[0]:
+                raise                     # the server is stopping: the item is redone later
+            with db.transaction(conn):
+                self._set(item, "cancelled", "cancelled")
+            rep.note(vdir, "cancelled")
+        except archives.ArchiveError as e:
+            with db.transaction(conn):
+                self._set(item, "failed", str(e)[:300])
+            rep.failed += 1
+            rep.note(vdir, f"failed: {e}")
 
     def _rename(self, item, rep: JobReport) -> None:
         conn, node = self.conn, item["dst_node"]
