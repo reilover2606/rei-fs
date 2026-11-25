@@ -178,17 +178,47 @@ def rename_node(conn: sqlite3.Connection, node: str, new_name: str) -> str:
     return new_name
 
 
+TX_ROWS = 500   # rows deleted per transaction: the write lock is never held for long
+
+
+def _delete_in_pieces(conn: sqlite3.Connection, table: str, key: str, where: str, args: tuple) -> None:
+    """DELETE FROM table WHERE <where>, TX_ROWS rows per transaction."""
+    while True:
+        with db.transaction(conn, "removing a node"):
+            n = conn.execute(
+                f"DELETE FROM {table} WHERE {key} IN"
+                f" (SELECT {key} FROM {table} WHERE {where} LIMIT {TX_ROWS})", args).rowcount
+        if n < TX_ROWS:
+            return
+
+
 def delete_rows(conn: sqlite3.Connection, node_id: str) -> int:
     """Forget a node in the database: its copies, decisions, proposals, jobs, schedules and
     the change-log pointers to it go, and files that no node holds any more with them.
-    The caller holds the transaction. Nothing is touched on any disk."""
-    fids = [r[0] for r in conn.execute("SELECT file_id FROM copies WHERE node_id = ?",
-                                       (node_id,))]
-    conn.execute("DELETE FROM changes WHERE ref_node = ?", (node_id,))
-    conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))      # the rest cascades
-    for fid in fids:
-        index.drop_file_if_orphan(conn, fid)
-    return len(fids)
+    Done in pieces of TX_ROWS rows (each its own transaction, unless the caller already holds
+    one). Nothing is touched on any disk."""
+    forgotten = 0
+    while True:
+        fids = [r[0] for r in conn.execute(
+            "SELECT file_id FROM copies WHERE node_id = ? LIMIT ?", (node_id, TX_ROWS))]
+        if not fids:
+            break
+        marks = ",".join("?" * len(fids))
+        with db.transaction(conn, "removing a node"):
+            conn.execute(f"DELETE FROM copies WHERE node_id = ? AND file_id IN ({marks})",
+                         (node_id, *fids))
+            conn.execute(f"DELETE FROM changes WHERE ref_node = ? AND ref_file IN ({marks})",
+                         (node_id, *fids))
+            for fid in fids:
+                index.drop_file_if_orphan(conn, fid)
+        forgotten += len(fids)
+    _delete_in_pieces(conn, "decisions", "id", "node_id = ?", (node_id,))
+    _delete_in_pieces(conn, "wanted", "id", "src_node = ? OR dst_node = ?", (node_id, node_id))
+    _delete_in_pieces(conn, "job_items", "id", "dst_node = ?", (node_id,))
+    _delete_in_pieces(conn, "changes", "seq", "ref_node = ?", (node_id,))
+    with db.transaction(conn, "removing a node"):
+        conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))   # the little that is left cascades
+    return forgotten
 
 
 def remove_node(conn: sqlite3.Connection, node: str, force: bool = False) -> dict:
@@ -209,14 +239,15 @@ def remove_node(conn: sqlite3.Connection, node: str, force: bool = False) -> dic
     if row["owner_id"] != me and not force and owner is not None and owner["online"]:
         raise NodeError(f"node {row['name']!r} belongs to server {owner['name']!r}, which is "
                         "online: remove it from there")
-    with db.transaction(conn, "removing a node"):
-        if row["owner_id"] == me:
+    if row["owner_id"] == me:
+        with db.transaction(conn, "removing a node"):
             index.append_change(conn, "node", {"id": row["id"], "name": row["name"],
                                                "owner_id": me, "removed": True})
-        copies = delete_rows(conn, row["id"])
-        forgot = None
-        if row["owner_id"] != me and not conn.execute(
-                "SELECT 1 FROM nodes WHERE owner_id = ?", (row["owner_id"],)).fetchone():
+    copies = delete_rows(conn, row["id"])       # in pieces: other writers are not kept waiting
+    forgot = None
+    if row["owner_id"] != me and not conn.execute(
+            "SELECT 1 FROM nodes WHERE owner_id = ?", (row["owner_id"],)).fetchone():
+        with db.transaction(conn, "removing a node"):
             forgot = forget_server_rows(conn, row["owner_id"])
     db.reclaim(conn)
     return {"name": row["name"], "copies_forgotten": copies, "server_forgotten": forgot}

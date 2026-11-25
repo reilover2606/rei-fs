@@ -693,6 +693,10 @@ pointers to it, and files that no other node holds. The database's free space is
   is not applied again (the progress vector is kept).
 * The Nodes tab says "UNREACHABLE: an old server of the same name is online" for such leftovers.
 * The server's own node cannot be removed.
+* Like packing and removing originals, it works in pieces of 500 rows per transaction
+  (`nodes.TX_ROWS`, `archives.TX_ROWS`), so the write lock is held for a moment at a time and the API
+  and the sync with other servers are not kept waiting. A member list is written, and later deleted,
+  the same way; the archive is announced first and, if the list cannot be completed, taken back.
 
 ### 5.20 Removing a node
 

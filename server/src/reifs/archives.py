@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 SUFFIX = ".sqsh"
 CHUNK = 1000                 # members per change-log entry
+TX_ROWS = 500                # rows changed per transaction: the write lock is never held for long
 MEMBER_LIMIT = 200_000       # a directory with more files than this is refused (the list is kept)
 
 ProgressFn = Callable[[str], None]
@@ -94,10 +95,24 @@ def _log_pack(conn: sqlite3.Connection, row: sqlite3.Row,
         "op": "pack", "dir": row["dir_path"], "file": archive_vpath(row["dir_path"]),
         "files": row["files"], "bytes": row["bytes"], "updated": row["updated"],
         "updated_by": me, "cleanup": row["cleanup"], "targets": json.loads(row["targets"])})
+    _log_members(conn, row, members)
+
+
+def _log_members(conn: sqlite3.Connection, row: sqlite3.Row,
+                 members: list[tuple[str, int, int]]) -> None:
     for i in range(0, len(members), CHUNK):
         index.append_change(conn, "archive", {
             "op": "members", "dir": row["dir_path"], "updated": row["updated"],
-            "updated_by": me, "entries": [[p, s, h] for p, s, h in members[i:i + CHUNK]]})
+            "updated_by": index.self_id(conn),
+            "entries": [[p, s, h] for p, s, h in members[i:i + CHUNK]]})
+
+
+def forget_copies(conn: sqlite3.Connection, pairs: list[tuple[int, str]]) -> None:
+    """Stop tracking these (file, node) copies, a few hundred per transaction."""
+    for i in range(0, len(pairs), TX_ROWS):
+        with db.transaction(conn, "forgetting copies"):
+            for fid, node_id in pairs[i:i + TX_ROWS]:
+                index.forget_copy(conn, fid, node_id)
 
 
 def _log_remove(conn: sqlite3.Connection, vdir: str, ts: int) -> None:
@@ -137,8 +152,7 @@ def apply_change(conn: sqlite3.Connection, d: dict) -> None:
     elif op == "remove" and row is not None:
         conn.execute("UPDATE archives SET present = 0, updated = ?, updated_by = ? WHERE id = ?",
                      (*stamp, row["id"]))
-        conn.execute("DELETE FROM archive_members WHERE archive_id = ?", (row["id"],))
-        conn.execute("DELETE FROM archive_todo WHERE dir_path = ?", (d["dir"],))
+        conn.execute("DELETE FROM archive_todo WHERE dir_path = ?", (d["dir"],))   # members: purge_members
 
 
 def _todo(conn: sqlite3.Connection, vdir: str, targets: list[str]) -> None:
@@ -333,6 +347,7 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
     if dst.exists():
         raise ArchiveError(f"{dst} exists already")
     part = dst.with_name(dst.name + ".part")
+    purge_members(conn)         # old lists of archives that are gone: not in the way of this one
     say(f"packing {vdir}: listing the files")
     members = _hashed_walk(src, stop, lambda m: say(f"packing {vdir}: {m}"))
     if not members:
@@ -370,6 +385,8 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
         "SELECT DISTINCT c.node_id FROM files f JOIN dirs d ON d.id = f.dir_id"
         f" JOIN copies c ON c.file_id = f.id WHERE {cond}", args)} - {target["id"]}) \
         if everywhere else []
+    # In short transactions (a directory can hold hundreds of thousands of files): the archive
+    # and its first entry, then the member list in pieces, then the loose files are forgotten.
     with db.transaction(conn, "packing a directory"):
         fid = index.ensure_file(conn, archive_vpath(vdir))
         ts = db.now()
@@ -380,21 +397,29 @@ def pack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = No
                      (vdir, fid, len(members), total, ts, me, int(everywhere),
                       json.dumps(targets)))
         row = get(conn, vdir)
-        conn.executemany("INSERT INTO archive_members(archive_id, path, size, hash)"
-                         " VALUES (?, ?, ?, ?)", [(row["id"], p, s, h) for p, s, h in members])
         index.record_copy(conn, fid, target["id"], st.st_size, st.st_mtime_ns, digest)
-        _log_pack(conn, row, members)
+        _log_pack(conn, row, [])               # the entry that announces it
         if everywhere:
             _todo(conn, vdir, targets)
-        # The loose files are not tracked any more: the archive stands for them.
-        cond, args = paths.subtree_sql(vdir, "d.path")
-        loose = conn.execute(
-            "SELECT f.id AS fid, c.node_id AS nid FROM files f JOIN dirs d ON d.id = f.dir_id"
-            f" JOIN copies c ON c.file_id = f.id WHERE {cond}", args).fetchall()
-        mine = index.owned_node_ids(conn)
-        for r in loose:
-            if r["nid"] in mine:
-                index.forget_copy(conn, r["fid"], r["nid"])
+    try:
+        for i in range(0, len(members), TX_ROWS):
+            part = members[i:i + TX_ROWS]
+            with db.transaction(conn, "packing a directory: member list"):
+                conn.executemany("INSERT INTO archive_members(archive_id, path, size, hash)"
+                                 " VALUES (?, ?, ?, ?)", [(row["id"], p, s, h) for p, s, h in part])
+                _log_members(conn, row, part)
+    except BaseException:
+        # A member list that is only part of it is worse than none: take the archive back
+        # (its file stays, as a plain file).
+        with db.transaction(conn, "packing a directory: undoing"):
+            _retire(conn, row)
+        raise
+    cond, args = paths.subtree_sql(vdir, "d.path")
+    mine = index.owned_node_ids(conn)
+    loose = [(r["fid"], r["nid"]) for r in conn.execute(
+        "SELECT f.id AS fid, c.node_id AS nid FROM files f JOIN dirs d ON d.id = f.dir_id"
+        f" JOIN copies c ON c.file_id = f.id WHERE {cond}", args).fetchall() if r["nid"] in mine]
+    forget_copies(conn, loose)       # the loose files are not tracked any more
     say(f"packing {vdir}: giving the database's free space back")
     reclaimed = db.reclaim(conn)
     removed = kept = 0
@@ -470,11 +495,9 @@ def cleanup_node(conn: sqlite3.Connection, cfg: Config, vdir: str, node_id: str,
     if src.is_dir():
         removed, left = remove_verified(src, members, stop)
     cond, args = paths.subtree_sql(vdir, "d.path")
-    with db.transaction(conn, "forgetting the originals"):
-        for r in conn.execute(
-                "SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id JOIN copies c"
-                f" ON c.file_id = f.id WHERE c.node_id = ? AND {cond}", (node_id, *args)).fetchall():
-            index.forget_copy(conn, r[0], node_id)
+    forget_copies(conn, [(r[0], node_id) for r in conn.execute(
+        "SELECT f.id FROM files f JOIN dirs d ON d.id = f.dir_id JOIN copies c"
+        f" ON c.file_id = f.id WHERE c.node_id = ? AND {cond}", (node_id, *args)).fetchall()])
     reclaimed = db.reclaim(conn)
     return {"dir": vdir, "removed": removed, "left": left, "database_reclaimed": reclaimed}
 
@@ -541,12 +564,29 @@ def _mark_archive_for_deletion(conn: sqlite3.Connection, fid: int) -> None:
 
 def _retire(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
     ts = db.now()
+    # The member list of a retired archive is deleted afterwards, in pieces (purge_members).
     conn.execute("UPDATE archives SET present = 0, updated = ?, updated_by = ? WHERE id = ?",
                  (ts, index.self_id(conn), row["id"]))
-    conn.execute("DELETE FROM archive_members WHERE archive_id = ?", (row["id"],))
     conn.execute("DELETE FROM archive_todo WHERE dir_path = ?", (row["dir_path"],))
     _log_remove(conn, row["dir_path"], ts)
     _mark_archive_for_deletion(conn, row["file_id"])
+
+
+def purge_members(conn: sqlite3.Connection) -> int:
+    """Delete the member lists of archives that are gone, TX_ROWS rows per transaction."""
+    total = 0
+    for (aid,) in conn.execute("SELECT DISTINCT a.id FROM archives a JOIN archive_members m"
+                               " ON m.archive_id = a.id WHERE a.present = 0").fetchall():
+        while True:
+            with db.transaction(conn, "forgetting an archive's file list"):
+                n = conn.execute(
+                    "DELETE FROM archive_members WHERE archive_id = ? AND path IN"
+                    " (SELECT path FROM archive_members WHERE archive_id = ? LIMIT ?)",
+                    (aid, aid, TX_ROWS)).rowcount
+            total += n
+            if n < TX_ROWS:
+                break
+    return total
 
 
 def drop(conn: sqlite3.Connection, vdir: str) -> dict:
@@ -557,6 +597,7 @@ def drop(conn: sqlite3.Connection, vdir: str) -> dict:
         raise ArchiveError(f"{vdir} is not a packed directory")
     with db.transaction(conn, "dropping an archive"):
         _retire(conn, row)
+    purge_members(conn)
     db.reclaim(conn)
     return {"dir": vdir, "archive": archive_vpath(vdir)}
 
@@ -623,6 +664,7 @@ def unpack(conn: sqlite3.Connection, cfg: Config, vdir: str, node: str | None = 
         shutil.rmtree(tmp, ignore_errors=True)
     with db.transaction(conn, "unpacking a directory"):
         _retire(conn, row)
+    purge_members(conn)
     say(f"unpacked {vdir}; indexing the files")
     from . import scanner
     scanner.scan_all(conn, cfg, [nid], progress=None, stop=stop, full=True)

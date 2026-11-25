@@ -72,3 +72,23 @@ def test_a_node_of_a_server_that_is_online_is_refused_unless_forced(env):
     with pytest.raises(nodes.NodeError, match="online"):
         nodes.remove_node(env.conn, "box")
     assert nodes.remove_node(env.conn, "box", force=True)["name"] == "box"
+
+
+def commits(conn):
+    seen = []
+    conn.set_trace_callback(lambda sql: seen.append(sql) if sql.strip().upper().startswith("COMMIT") else None)
+    return seen
+
+
+def test_removing_a_big_node_is_done_in_pieces(env, monkeypatch):
+    monkeypatch.setattr(nodes, "TX_ROWS", 3)
+    _, ssd = env.add_node("ssd")
+    for i in range(10):
+        write(ssd / "d" / f"f{i}.txt", str(i), mtime=1_000_000)
+    env.scan()
+    seen = commits(env.conn)
+    out = nodes.remove_node(env.conn, "ssd")
+    assert out["copies_forgotten"] == 10
+    assert len(seen) >= 4                                   # 10 copies, 3 at a time, and the rest
+    assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert env.conn.execute("SELECT COUNT(*) FROM copies").fetchone()[0] == 0

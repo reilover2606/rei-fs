@@ -208,6 +208,10 @@ class Worker:
                         if conn.execute("SELECT 1 FROM archive_todo LIMIT 1").fetchone():
                             if archives.followup(conn, self.cfg):
                                 self.request_jobs()
+                        if conn.execute("SELECT 1 FROM archives a JOIN archive_members m"
+                                        " ON m.archive_id = a.id WHERE a.present = 0 LIMIT 1"
+                                        ).fetchone():
+                            archives.purge_members(conn)   # a removal came from another server
                     if now - last_jobs >= JOBS_SECONDS:
                         last_jobs = now
                         if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
