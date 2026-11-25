@@ -20,7 +20,9 @@ import fnmatch
 import json
 import os
 import sqlite3
+import logging
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -32,7 +34,9 @@ from .hashing import hash_file
 from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
 
 BATCH_FILES = 500
-VERSION_CHUNK = 500         # files whose versions are compared per transaction
+log = logging.getLogger("reifs.scanner")
+VERSION_CHUNK = 500
+RECONCILE_CHUNK = 500       # vanished (or no longer indexed) copies handled per transaction         # files whose versions are compared per transaction
 BATCH_SECONDS = 1.0
 REPORT_SECONDS = 0.3        # progress callback at least this often
 BIG_FILE = 16 << 20         # announce files from this size on before hashing them
@@ -317,9 +321,10 @@ def scan_node(
     # --- phase 2: vanished copies, renames, pruning ---------------------------
     stats.skipped_dirs = len(walker.skipped)
     vanished, to_forget = _find_vanished(root, existing, seen, walker, ignorer)
-    with db.transaction(conn, "scan: reconciling changes"):
-        prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched,
-                                    root, cfg.scan.group_decisions_min)
+    # Done in pieces, each its own short transaction (thousands of files can go at once: a
+    # packed directory, a deleted folder).
+    prune = _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touched,
+                                root, cfg.scan.group_decisions_min)
     # Looking at the versions of every file the scan touched (all of them, on a first scan) is
     # done a few hundred at a time: it is the long part, and the lock must not be held for it.
     pending = sorted(touched)
@@ -452,61 +457,106 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
     """Update the index for vanished copies (inside a transaction, database
     work only). Returns the virtual directories to prune afterwards."""
     node_id = node["id"]
-    for vpath in to_forget:
-        # Still on disk but not indexed any more: stop tracking it quietly.
-        index.forget_copy(conn, existing[vpath]["file_id"], node_id)
-        stats.forgotten += 1
+    started = time.monotonic()
+    for i in range(0, len(to_forget), RECONCILE_CHUNK):
+        with db.transaction(conn, "scan: forgetting files that are no longer indexed"):
+            for vpath in to_forget[i:i + RECONCILE_CHUNK]:
+                # Still on disk but not indexed any more: stop tracking it quietly.
+                index.forget_copy(conn, existing[vpath]["file_id"], node_id)
+                stats.forgotten += 1
 
     # Rename candidates: copies that appeared since the last completed scan.
-    pool: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    pool: dict[tuple[str, int], _Candidates] = {}
     for r in conn.execute(
         "SELECT f.vpath, c.file_id, c.hash, c.size FROM copies c JOIN vfiles f"
         " ON f.id = c.file_id WHERE c.node_id = ? AND c.first_scan > ? AND c.state = 'present'",
         (node_id, node["last_scan_id"] or 0),
     ):
-        pool.setdefault((r["hash"], r["size"]), []).append((r["vpath"], r["file_id"]))
+        pool.setdefault((r["hash"], r["size"]), _Candidates()).add(r["vpath"], r["file_id"])
 
     prune: set[str] = set()
     new_missing: list[tuple[int, str]] = []
     new_renames: list[int] = []
-    for vpath in vanished:
-        row = existing[vpath]
-        fid = row["file_id"]
-        prune.add(paths.parent(vpath))
-        if row["marked_delete"]:
-            index.forget_copy(conn, fid, node_id)  # the user deleted it as asked
-            stats.deleted_marked += 1
-            continue
-        if row["state"] == "missing":
-            continue
-        candidates = pool.get((row["hash"], row["size"]))
-        if candidates:
-            base = paths.basename(vpath)
-            pick = next((c for c in candidates if paths.basename(c[0]) == base), candidates[0])
-            candidates.remove(pick)
-            rid = _handle_rename(conn, node_id, fid, vpath, pick[1], pick[0])
-            if rid is not None:
-                new_renames.append(rid)
-            stats.renamed += 1
-            continue
-        conn.execute(
-            "UPDATE copies SET state = 'missing' WHERE file_id = ? AND node_id = ?",
-            (fid, node_id),
-        )
-        index.log_change(conn, node_id, vpath, "missing", fid=fid)
-        others = conn.execute(
-            "SELECT COUNT(*) FROM copies WHERE file_id = ? AND node_id != ? AND state = 'present'",
-            (fid, node_id),
-        ).fetchone()[0]
-        did = index.add_decision(conn, "missing", fid, node_id,
-                                 {"vpath": vpath, "other_copies": others})
-        new_missing.append((did, vpath))
-        stats.missing += 1
-        touched.add(fid)
-
-    _group_missing(conn, node_id, root, new_missing, group_min)
-    _group_renames(conn, node_id, new_renames, group_min)
+    for i in range(0, len(vanished), RECONCILE_CHUNK):
+        with db.transaction(conn, "scan: reconciling changes"):
+            for vpath in vanished[i:i + RECONCILE_CHUNK]:
+                _reconcile_one(conn, node_id, existing[vpath], vpath, pool, stats, touched,
+                               prune, new_missing, new_renames)
+    with db.transaction(conn, "scan: grouping decisions"):
+        _group_missing(conn, node_id, root, new_missing, group_min)
+        _group_renames(conn, node_id, new_renames, group_min)
+    took = time.monotonic() - started
+    if took > 5:
+        log.info("scan: reconciled %d vanished and %d no longer indexed copies of %s in %.1f s",
+                 len(vanished), len(to_forget), node["name"], took)
     return prune
+
+
+class _Candidates:
+    """The new copies with one content: the one with the same file name is preferred when a
+    vanished copy is matched to one. Taking is O(1) however many files are identical (thousands
+    of empty or boilerplate files were a quadratic search)."""
+
+    def __init__(self) -> None:
+        self.order: list[tuple[str, int]] = []
+        self.by_name: dict[str, deque[tuple[str, int]]] = {}
+        self.used: set[tuple[str, int]] = set()
+        self.next = 0
+
+    def add(self, vpath: str, fid: int) -> None:
+        c = (vpath, fid)
+        self.order.append(c)
+        self.by_name.setdefault(paths.basename(vpath), deque()).append(c)
+
+    def take(self, name: str) -> tuple[str, int] | None:
+        same = self.by_name.get(name)
+        while same:
+            c = same.popleft()
+            if c not in self.used:
+                self.used.add(c)
+                return c
+        while self.next < len(self.order):
+            c = self.order[self.next]
+            self.next += 1
+            if c not in self.used:
+                self.used.add(c)
+                return c
+        return None
+
+
+def _reconcile_one(conn, node_id: str, row, vpath: str, pool, stats, touched, prune,
+                   new_missing, new_renames) -> None:
+    """One copy that is no longer on the disk."""
+    fid = row["file_id"]
+    prune.add(paths.parent(vpath))
+    if row["marked_delete"]:
+        index.forget_copy(conn, fid, node_id)  # the user deleted it as asked
+        stats.deleted_marked += 1
+        return
+    if row["state"] == "missing":
+        return
+    candidates = pool.get((row["hash"], row["size"]))
+    pick = candidates.take(paths.basename(vpath)) if candidates else None
+    if pick is not None:
+        rid = _handle_rename(conn, node_id, fid, vpath, pick[1], pick[0])
+        if rid is not None:
+            new_renames.append(rid)
+        stats.renamed += 1
+        return
+    conn.execute(
+        "UPDATE copies SET state = 'missing' WHERE file_id = ? AND node_id = ?",
+        (fid, node_id),
+    )
+    index.log_change(conn, node_id, vpath, "missing", fid=fid)
+    others = conn.execute(
+        "SELECT COUNT(*) FROM copies WHERE file_id = ? AND node_id != ? AND state = 'present'",
+        (fid, node_id),
+    ).fetchone()[0]
+    did = index.add_decision(conn, "missing", fid, node_id,
+                             {"vpath": vpath, "other_copies": others})
+    new_missing.append((did, vpath))
+    stats.missing += 1
+    touched.add(fid)
 
 
 def _handle_rename(conn, node_id: str, old_fid: int, old_vpath: str,
