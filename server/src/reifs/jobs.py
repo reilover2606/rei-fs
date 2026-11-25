@@ -355,6 +355,8 @@ def refresh_status(conn: sqlite3.Connection, job_id: int, after_run: bool = Fals
     finished = db.now() if status in ("done", "failed") else None
     conn.execute("UPDATE jobs SET status = ?, finished = ? WHERE id = ?",
                  (status, finished, job_id))
+    if status == "failed":      # a synchronizer job that failed is worth looking at
+        conn.execute("UPDATE jobs SET hidden = 0 WHERE id = ?", (job_id,))
     return status
 
 

@@ -64,6 +64,12 @@ class Prefs:
     def effective(self, vdir: str) -> int:
         return self.source(vdir)[0]
 
+    def effective_file(self, vpath: str) -> int:
+        """A file has its own setting, or the one of its directory."""
+        if vpath in self.prefs:
+            return self.prefs[vpath]
+        return self.effective(paths.parent(vpath))
+
 
 def get(conn: sqlite3.Connection, vdir: str) -> dict:
     vdir = paths.normalize(vdir)
@@ -78,8 +84,6 @@ def set_priority(conn: sqlite3.Connection, vpath: str, priority: int | None) -> 
         vpath = paths.normalize(vpath)
     except paths.VPathError as e:
         raise PriorityError(str(e)) from None
-    if index.file_id(conn, vpath) is not None:
-        raise PriorityError(f"{vpath} is a file; the priority belongs to a directory")
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO dirprefs(vpath, priority, updated, updated_by) VALUES (?, ?, ?, ?)"
@@ -124,8 +128,8 @@ def due_classes(conn: sqlite3.Connection, cfg: Config, node_id: str,
         "SELECT priority, scanned FROM scan_state WHERE node_id = ?", (node_id,))}
     due = set()
     for p in classes_in_use(prefs):
-        minutes = cfg.scan.minutes(p)
-        if p not in last or (minutes > 0 and now - last[p] >= minutes * 60):
+        seconds = cfg.scan.seconds(p)
+        if p not in last or (seconds > 0 and now - last[p] >= seconds):
             due.add(p)
     return due
 
@@ -165,4 +169,18 @@ class Schedule:
         return self.due is None or priority in self.due or vdir in self.hot
 
     def covers_file(self, vpath: str) -> bool:
-        return self.wants(self.prefs.effective(paths.parent(vpath)))
+        return self.wants(self.prefs.effective_file(vpath))
+
+
+def sync_root(conn: sqlite3.Connection, vpath: str) -> str | None:
+    """The path whose "synchronous" setting covers this file (or directory), if it is
+    synchronous: the nearest setting along the path decides."""
+    parts = paths.split(vpath)
+    cands = ["/" + "/".join(parts[:i]) for i in range(len(parts), 0, -1)] + ["/"]
+    rows = {r[0]: r[1] for r in conn.execute(
+        f"SELECT vpath, priority FROM dirprefs WHERE priority IS NOT NULL AND vpath IN"
+        f" ({','.join('?' * len(cands))})", cands)}
+    for c in cands:
+        if c in rows:
+            return c if rows[c] == SYNCHRONOUS else None
+    return None

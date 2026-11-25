@@ -568,6 +568,10 @@ class App {
         dialogs_.confirm("Quit rei-fs?", [this] { screen_.Exit(); });
         return true;
       }
+      if (c == "-" && views_.size() > 10) {   // the eleventh tab
+        switch_to(10);
+        return true;
+      }
       if (c == "[" || c == "]") {   // scroll the key list at the bottom
         help_offset_ = std::max(0, help_offset_ + (c == "]" ? 24 : -24));
         return true;
@@ -584,7 +588,7 @@ class App {
           pos = end + 2;
         }
         dialogs_.info("Keys",
-                      "1-9, 0        switch tab\n"
+                      "1-9, 0, -     switch tab (0 is the tenth, - the eleventh)\n"
                       "arrows        move, Enter opens / chooses\n"
                       "r             refresh the current tab\n"
                       "[ ]           scroll the key list at the bottom\n"
@@ -598,7 +602,7 @@ class App {
   Element render_main(Component tabs) {
     Elements header;
     for (size_t i = 0; i < views_.size(); ++i) {
-      auto label = text(" " + std::to_string((i + 1) % 10) + " " + views_[i]->title() + " ");
+      auto label = text(" " + (i >= 10 ? std::string("-") : std::to_string((i + 1) % 10)) + " " + views_[i]->title() + " ");
       header.push_back(static_cast<int>(i) == tab_ ? label | inverted | bold : label);
     }
     json st = ctx_.status();

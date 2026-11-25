@@ -28,8 +28,10 @@ def test_priority_is_inherited_by_subdirectories(env):
     assert priority.get(env.conn, "/a/x")["priority"] == 3
     priority.set_priority(env.conn, "/a/b", None)                 # inherit again
     assert priority.get(env.conn, "/a/b")["priority"] == 3
-    with pytest.raises(priority.PriorityError):
-        priority.set_priority(env.conn, "/a/f.txt", 1)            # a file
+    # a file can have a setting of its own, which wins over its directory's
+    priority.set_priority(env.conn, "/a/f.txt", 0)
+    prefs = priority.Prefs(priority.load(env.conn))
+    assert prefs.effective_file("/a/f.txt") == 0 and prefs.effective_file("/a/g.txt") == 3
     with pytest.raises(priority.PriorityError):
         priority.parse(7)
     assert [priority.parse(v) for v in ("0", 1, "Archival", None, "inherit")] == [0, 1, 3, None, None]

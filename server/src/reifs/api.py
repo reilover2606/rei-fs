@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, archives, audit, auth, tolerance, relay, db, decisions, index, jobs, nodes, paths, peers,
+from . import (__version__, apps, archives, audit, auth, tolerance, relay, db, decisions, index, jobs, nodes, paths, peers,
                priority, queries, replication, schedules, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
@@ -193,6 +193,16 @@ class Api:
         r("POST", r"/api/holders", self.holders)
         r("GET", r"/api/tolerance", self.tolerance_get)
         r("POST", r"/api/tolerance", self.tolerance_set)
+        r("GET", r"/api/apps", self.apps_list)
+        r("POST", r"/api/apps", self.apps_add)
+        r("POST", r"/api/apps/remove", self.apps_remove)
+        r("POST", r"/api/apps/token", self.apps_token)
+        r("GET", r"/api/app/info", self.app_info, "app")
+        r("GET", r"/api/app/list", self.app_list, "app")
+        r("GET", r"/api/app/read", self.app_read, "app")
+        r("POST", r"/api/app/write", self.app_write, "app")
+        r("POST", r"/api/app/delete", self.app_delete, "app")
+        r("POST", r"/api/app/sync", self.app_sync, "app")
         r("GET", r"/api/archives", self.archive_list)
         r("POST", r"/api/archives/pack", self.archive_pack)
         r("POST", r"/api/archives/unpack", self.archive_unpack)
@@ -330,7 +340,8 @@ class Api:
             "open_decisions": s.open_decisions, "open_wanted": s.open_wanted,
             "coverage_stale": s.coverage_stale,
             "active_jobs": conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running', 'waiting')"
+                "SELECT COUNT(*) FROM jobs WHERE hidden = 0 AND"
+                " status IN ('pending', 'running', 'waiting')"
             ).fetchone()[0],
             "peers_total": conn.execute("SELECT COUNT(*) FROM servers WHERE paired = 1"
                                         ).fetchone()[0],
@@ -509,6 +520,89 @@ class Api:
         return {"total": len(ids),
                 "nodes": [{"name": r["name"], "have": have.get(r["id"], 0)}
                           for r in conn.execute("SELECT id, name FROM nodes ORDER BY name")]}
+
+    # --- applications -----------------------------------------------------------------
+
+    def apps_list(self, conn, q, body, **_):
+        return {"apps": apps.list_apps(conn)}
+
+    def apps_add(self, conn, q, body, **_):
+        try:
+            info, token = apps.register(conn, self.cfg, str(body.get("name", "")).strip(),
+                                        str(body.get("mode", "")), body.get("node") or None)
+        except (apps.AppError, nodes.NodeError, priority.PriorityError) as e:
+            raise ApiError(400, str(e)) from None
+        if info["mode"] == "instance" and self.worker:
+            self.worker.request_sync(full=True)
+        self._poke()
+        return {**info, "token": token}
+
+    def apps_remove(self, conn, q, body, **_):
+        try:
+            apps.remove(conn, str(body.get("name", "")), body.get("node") or None)
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+        self._poke()
+        return {"ok": True}
+
+    def apps_token(self, conn, q, body, **_):
+        try:
+            return {"token": apps.regenerate_token(conn, str(body.get("name", "")),
+                                                   body.get("node") or None)}
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def _access(self, conn, app) -> "apps.Access":
+        try:
+            return apps.Access(conn, self.cfg, app)
+        except apps.AppError as e:
+            raise ApiError(503, str(e)) from None
+
+    def app_info(self, conn, q, body, app=None, **_):
+        acc = self._access(conn, app)
+        return {**apps.describe(conn, self.cfg, app), "pending": acc.pending(),
+                "synchronized": acc.pending() == 0}
+
+    def app_list(self, conn, q, body, app=None, **_):
+        try:
+            return {"entries": self._access(conn, app).listing(q.get("path", "/"))}
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def app_read(self, conn, q, body, app=None, **_):
+        try:
+            return self._access(conn, app).read(q.get("path", ""), int(q.get("offset", 0)),
+                                                int(q.get("length", apps.MAX_READ)))
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def app_write(self, conn, q, body, app=None, **_):
+        try:
+            return self._access(conn, app).write(str(body.get("path", "")), body.get("data", ""),
+                                                 bool(body.get("append")),
+                                                 body.get("done", True) is not False)
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+        finally:
+            if self.worker and app is not None and app["mode"] == "instance":
+                self.worker.request_sync()
+
+    def app_delete(self, conn, q, body, app=None, **_):
+        try:
+            return self._access(conn, app).delete(str(body.get("path", "")))
+        except apps.AppError as e:
+            raise ApiError(400, str(e)) from None
+
+    def app_sync(self, conn, q, body, app=None, **_):
+        """Look at the directory now (a file was written straight into it) and propagate."""
+        eff = priority.Prefs(priority.load(conn)).effective(app["vpath"])
+        with db.transaction(conn):
+            conn.execute("DELETE FROM scan_state WHERE node_id = ? AND priority = ?",
+                         (app["node_id"], eff))
+        if self.worker:
+            self.worker.request_scan([app["node_id"]], full=False)
+            self.worker.request_sync(full=app["mode"] == "instance")
+        return {"ok": True, "queued": True}
 
     # --- packed directories -----------------------------------------------------------
 
@@ -736,9 +830,9 @@ class Api:
     # --- jobs ------------------------------------------------------------------------
 
     def list_jobs(self, conn, q, body, caller=None, **_):
-        sql = "SELECT * FROM jobs"
+        sql = "SELECT * FROM jobs WHERE hidden = 0"      # the synchronizer's jobs are not listed
         if q.get("all") != "1":
-            sql += " WHERE status NOT IN ('done', 'cancelled')"
+            sql += " AND status NOT IN ('done', 'cancelled')"
         sql += " ORDER BY id DESC LIMIT 200"
         items = [job_json(conn, j) for j in conn.execute(sql).fetchall()]
         path = "/api/jobs" + ("?all=1" if q.get("all") == "1" else "")
@@ -1247,8 +1341,14 @@ class Api:
             conn = db.open_existing(self.cfg.db_path, timeout=self.busy_timeout)
             # Who is calling: the client (bearer token) or a paired server.
             header = headers.get("Authorization")
-            token, caller = None, None
-            if self.check_token(header):
+            token, caller, app = None, None, None
+            if access == "app":
+                # An application's token reaches the app endpoints and nothing else.
+                app = apps.authenticate(conn, header)
+                if app is None:
+                    return 401, {"error": "not a valid application token"}
+                caller = "app"
+            elif self.check_token(header):
                 token, caller = header[7:].strip(), "client"
             else:
                 caller = peers.authenticate(conn, header)  # peer server id
@@ -1270,7 +1370,7 @@ class Api:
                 except peers.PeerError as e:
                     return (e.status if 400 <= e.status < 500 else 502), {"error": str(e)}
 
-            return 200, fn(conn, query, body, token=token, caller=caller,
+            return 200, fn(conn, query, body, token=token, caller=caller, app=app,
                            client_ip=client_ip, **match.groupdict())
         except ApiError as e:
             return e.status, {"error": str(e)}

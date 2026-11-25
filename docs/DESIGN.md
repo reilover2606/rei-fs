@@ -612,6 +612,46 @@ It can be packed into one squashfs archive, `<dir>.sqsh`, next to where the dire
   order, so they are filled (until their free space is used) before backing up elsewhere.
 * Both flags are announced with the node, so every server plans with the same figures.
 
+### 5.18 Synchronous paths and applications
+
+**Synchronous.** A file or directory whose update priority is "synchronous" (`u` in the Tree; files
+can have a setting of their own) is kept the same on every node that holds it. The node is scanned
+every `[scan] synchronous_seconds` (5) instead of every minute, and a worker task
+(`synchronous.run`) follows the change log: when a copy changed, the newest version (mtime, ties by
+hash) is copied over the older copies of the nodes that hold the path (for a directory: that have
+a file below it, or that an application instance is registered on). It is not asked
+about: no `divergent` decision is raised for such files. The jobs are *hidden*
+(`jobs.hidden`): they are not in the job list or the active-job count unless one fails. Only a
+present, older copy whose content is still the one judged stale is overwritten; a missing copy is
+not brought back and nothing is ever deleted. Each server makes jobs for the nodes it owns. A
+tolerant path (5.17) is left alone. A full pass runs every five minutes and when a node comes back.
+
+**Applications** (`apps.py`; Apps tab, `-`; `reifs app add|list|remove|token`). A registration is a
+name, a mode and a node; it returns a *token* (kept only as a hash) that the application sends as
+`Authorization: Bearer reifsapp_...`. The token reaches the `/api/app/...` endpoints and nothing else
+(and a login or a peer's credentials do not work there). Registrations are replicated (without the
+token), so every server knows the groups.
+
+* *storage*: `/apps/<name>` on a node of this server (named, or chosen among the online ones with
+  room) to fill with whatever the app wants. An ordinary directory of the tree: scanned (frequent
+  unless set otherwise), backed up, replicated.
+* *instance*: the same name registered on several nodes forms a group; `/apps/<name>` is made
+  synchronous, and a node registered while still empty receives the files at once.
+
+The app may use the HTTP endpoints or, running on the node's machine, read and write the directory
+itself (its path is in `info`) and call `sync` to have it looked at now:
+
+| endpoint | |
+|---|---|
+| `GET /api/app/info` | name, mode, node, directory, path on disk, the group's instances, pending items |
+| `GET /api/app/list?path=` | entries of a subdirectory |
+| `GET /api/app/read?path=&offset=&length=` | base64 `data` of up to 4 MiB, `eof` |
+| `POST /api/app/write {path, data, append?, done?}` | base64 `data`; `append` with `done: false` for chunks; indexed at once when `done` |
+| `POST /api/app/delete {path}` | the app removes a file of its own directory |
+| `POST /api/app/sync` | rescan the directory now and propagate |
+
+Paths are relative to the app's directory; `..` and symlinks that lead out are refused.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

@@ -16,8 +16,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (__version__, archives, auth, tolerance, db, decisions, index, jobs, nodes, peers, queries,
-               replication, runner, scanner, tags)
+from . import (__version__, apps, archives, auth, tolerance, db, decisions, index, jobs, nodes, peers, queries,
+               priority, replication, runner, scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
 from .locking import LockError, ServerLock
@@ -171,6 +171,38 @@ def cmd_tolerate(args) -> None:
         raise CliError(str(e)) from None
     state = "several versions are fine" if res["tolerant"] else "conflicting versions are decided"
     print(f"{res['path']}: {state}" + ("" if not res["inherited"] else f" (from {res['set_on']})"))
+
+
+def cmd_app(args) -> None:
+    cfg, conn = open_server(args.home)
+    act = args.action
+    try:
+        if act == "list":
+            rows = apps.list_apps(conn)
+            if not rows:
+                print("No applications registered.")
+            print(table([[a["name"], a["mode"], a["node"], a["dir"], a["server"],
+                          "online" if a["online"] else "offline"] for a in rows],
+                        ["NAME", "MODE", "NODE", "DIRECTORY", "SERVER", "STATE"]) if rows else "",
+                  end="")
+            return
+        if not args.name:
+            raise CliError(f"usage: reifs app {act} NAME")
+        if act == "add":
+            info, token = apps.register(conn, cfg, args.name, args.mode, args.node)
+            print(f"Registered {info['name']!r} ({info['mode']}) on node {info['node']}.")
+            print(f"  directory: {info['dir']}" + (f"   on disk: {info['path']}" if info["path"] else ""))
+            if len(info["instances"]) > 1:
+                print("  instances: " + ", ".join(i["node"] for i in info["instances"]))
+            print(f"  token: {token}")
+            print("Keep the token: it is not shown again (reifs app token NAME makes a new one).")
+        elif act == "remove":
+            apps.remove(conn, args.name, args.node)
+            print(f"Unregistered {args.name!r}; its directory and files were left as they are.")
+        else:
+            print(apps.regenerate_token(conn, args.name, args.node))
+    except (apps.AppError, nodes.NodeError, priority.PriorityError) as e:
+        raise CliError(str(e)) from None
 
 
 def cmd_archive(args) -> None:
@@ -489,9 +521,9 @@ def cmd_jobs(args) -> None:
         else:
             _show_job(conn, job_id, args.all)
         return
-    q = "SELECT * FROM jobs"
+    q = "SELECT * FROM jobs WHERE hidden = 0"
     if not args.all:
-        q += " WHERE status NOT IN ('done', 'cancelled')"
+        q += " AND status NOT IN ('done', 'cancelled')"
     rows = []
     for j in conn.execute(q + " ORDER BY id"):
         c = jobs.item_counts(conn, j["id"])
@@ -1135,6 +1167,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("vpath", help="a file or directory of the virtual tree")
     s.add_argument("value", choices=["yes", "no", "inherit"])
     s.set_defaults(func=cmd_tolerate)
+
+    s = sub.add_parser("app", help="applications that use rei-fs for their files")
+    s.add_argument("action", choices=["add", "list", "remove", "token"])
+    s.add_argument("name", nargs="?", help="the application's name")
+    s.add_argument("--mode", choices=["storage", "instance"], default="storage",
+                   help="storage: a directory to fill; instance: its files are kept the same on "
+                        "every node it is registered on")
+    s.add_argument("--node", help="the node (default for a new one: any online node of this server)")
+    s.set_defaults(func=cmd_app)
 
     s = sub.add_parser("archive", help="pack a directory into one squashfs archive, or unpack one")
     s.add_argument("action", choices=["pack", "unpack", "drop", "list"])

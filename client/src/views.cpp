@@ -1117,8 +1117,7 @@ class TreeView : public View {
     }
     if (key(e, "u")) {   // update priority of the selected directory (or of this one)
       const json* sel = current();
-      std::string dir_path = sel && sel->value("dir", false)
-                                 ? child_path(sel->value("name", "")) : path_;
+      std::string dir_path = sel ? child_path(sel->value("name", "")) : path_;   // a file too
       set_priority(dir_path);
       return true;
     }
@@ -1248,8 +1247,9 @@ class TreeView : public View {
   void set_priority(const std::string& dir_path) {
     ctx_.dialogs->ask_choice(
         "Update priority of " + dir_path + " (applies to everything below it):\n"
-        "how often it is scanned for changes; archival is only scanned when you ask.",
-        {"0  synchronous (live; for programs saving continuously)", "1  frequent",
+        "how often it is scanned for changes; archival is only scanned when you ask.\n"
+        "A file can have its own setting too.",
+        {"0  synchronous (a change is copied to the other nodes holding it at once)", "1  frequent",
          "2  infrequent (default)", "3  archival (never changes)", "inherit from the parent"},
         [this, dir_path](int i) {
           json value = i == 4 ? json(nullptr) : json(i);
@@ -2872,6 +2872,142 @@ std::string due_text(double next_due) {
   return "in " + std::to_string(static_cast<int>(secs / 86400)) + " days";
 }
 
+// --- Applications -------------------------------------------------------------------
+
+class AppsView : public View {
+ public:
+  explicit AppsView(Context& ctx) : ctx_(ctx) {
+    menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
+    root_ = Renderer(menu_, [this] {
+      return vbox({paragraph(" Applications use rei-fs for their files through the API. A storage "
+                             "app gets a directory on a node to fill. The instances of an app "
+                             "registered on several nodes keep their directory the same "
+                             "everywhere (it is made synchronous).") | dim,
+                   with_detail(list_panel(std::to_string(items_.size()) + " registration(s)",
+                                          menu_, labels_.size(), "none yet: n registers one"),
+                               detail()) | flex});
+    });
+    root_ |= CatchEvent([this](Event e) { return on_event(e); });
+  }
+  std::string title() const override { return "Apps"; }
+  Component component() override { return root_; }
+  std::string help() const override { return "n: register an app  t: new token  x: unregister  r: refresh"; }
+
+  void refresh() override {
+    ctx_.get("/api/apps", [this](json out) {
+      items_ = out["apps"];
+      labels_.clear();
+      for (const auto& a : items_)
+        labels_.push_back(fit(a.value("name", ""), 22) + fit(a.value("mode", ""), 10) +
+                          fit(a.value("node", ""), 16) + fit(a.value("dir", ""), 26) +
+                          (a.value("online", false) ? "" : "offline"));
+      selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
+    }, "apps");
+    ctx_.get("/api/nodes", [this](json out) { nodes_ = out["nodes"]; }, "apps-nodes");
+  }
+
+ private:
+  Element detail() {
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return text("");
+    const json& a = items_[selected_];
+    Elements rows = {text(a.value("name", "")) | bold, separator(),
+                     label_value("mode", a.value("mode", "")),
+                     label_value("node", a.value("node", "") + " (server " + a.value("server", "") + ")"),
+                     label_value("directory", a.value("dir", "")),
+                     label_value("token", a.value("has_token", false) ? "issued here"
+                                                                      : "issued on its own server")};
+    int same = 0;
+    for (const auto& o : items_)
+      if (o.value("name", "") == a.value("name", "")) ++same;
+    if (a.value("mode", "") == "instance") rows.push_back(label_value("instances", std::to_string(same)));
+    rows.push_back(text(""));
+    rows.push_back(text("the app presents its token as 'Authorization: Bearer ...'") | dim);
+    rows.push_back(text("on /api/app/list, read, write, delete, sync, info") | dim);
+    return vbox(rows);
+  }
+
+  bool on_event(const Event& e) {
+    if (key(e, "r")) return refresh(), true;
+    if (key(e, "n")) {
+      register_app();
+      return true;
+    }
+    if (selected_ < 0 || selected_ >= static_cast<int>(items_.size())) return false;
+    json a = items_[selected_];
+    json who = {{"name", a.value("name", "")}, {"node", a.value("node", "")}};
+    if (!a.value("mine", false)) who["server"] = server_of(a.value("node", ""));
+    if (key(e, "t")) {
+      ctx_.dialogs->confirm("Make a new token for " + a.value("name", "") +
+                                "? The old one stops working.", [this, who] {
+        ctx_.send("/api/apps/token", who, [this](json out) {
+          ctx_.dialogs->info("New token (shown once)", out.value("token", ""));
+        });
+      });
+      return true;
+    }
+    if (key(e, "x")) {
+      ctx_.dialogs->confirm("Unregister " + a.value("name", "") + " on " + a.value("node", "") +
+                                "? Its directory and files stay as they are.", [this, who] {
+        ctx_.send("/api/apps/remove", who, [this](json) { refresh(); });
+      });
+      return true;
+    }
+    return false;
+  }
+
+  std::string server_of(const std::string& node) const {
+    for (const auto& n : nodes_)
+      if (n.value("name", "") == node) return n.value("owner_id", "");
+    return "";
+  }
+
+  void register_app() {
+    ctx_.dialogs->ask_text("Name of the application (letters, digits . _ -):", "",
+                           [this](const std::string& name) {
+      if (name.empty()) return;
+      ctx_.dialogs->ask_choice(
+          "How does " + name + " use rei-fs?",
+          {"storage: a directory on a node to fill with whatever it wants",
+           "instance: its files are kept the same on every node it is registered on"},
+          [this, name](int m) {
+            std::string mode = m == 0 ? "storage" : "instance";
+            std::vector<std::string> labels = {"any node (one is chosen)"};
+            std::vector<json> choices = {json(nullptr)};
+            for (const auto& n : nodes_) {
+              if (!n.value("online", false)) continue;
+              labels.push_back(n.value("name", "") + "  (" + n.value("owner", "") + ")");
+              choices.push_back(n);
+            }
+            ctx_.dialogs->ask_choice(
+                "On which node?", labels, [this, name, mode, choices](int i) {
+                  json body = {{"name", name}, {"mode", mode}};
+                  if (!choices[i].is_null()) {
+                    body["node"] = choices[i].value("name", "");
+                    // A node of another server is registered there.
+                    if (choices[i].value("owner", "") != "self")
+                      body["server"] = choices[i].value("owner_id", "");
+                  }
+                  ctx_.send("/api/apps", body, [this, name](json out) {
+                    ctx_.dialogs->info(
+                        "Registered " + name,
+                        "node: " + out.value("node", "") + "\ndirectory: " + out.value("dir", "") +
+                            (out["path"].is_string() ? "\non disk: " + out.value("path", "") : "") +
+                            "\n\ntoken (shown once, keep it):\n" + out.value("token", ""));
+                    refresh();
+                  });
+                });
+          });
+    });
+  }
+
+  Context& ctx_;
+  json items_ = json::array();
+  json nodes_ = json::array();
+  std::vector<std::string> labels_;
+  int selected_ = 0;
+  Component menu_, root_;
+};
+
 class SchedulesView : public View {
  public:
   explicit SchedulesView(Context& ctx) : ctx_(ctx) {
@@ -3019,6 +3155,7 @@ std::vector<std::shared_ptr<View>> make_views(Context& ctx) {
       std::make_shared<WantedView>(ctx),    std::make_shared<JobsView>(ctx),
       std::make_shared<NodesView>(ctx),     std::make_shared<MarkedView>(ctx),
       std::make_shared<ServersView>(ctx),   std::make_shared<SchedulesView>(ctx),
+      std::make_shared<AppsView>(ctx),
   };
 }
 

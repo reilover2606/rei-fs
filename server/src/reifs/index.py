@@ -9,7 +9,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-from . import db, paths, tolerance
+from . import db, paths, priority, tolerance
 
 # --- files -------------------------------------------------------------------
 
@@ -371,7 +371,8 @@ def evaluate_divergence(conn: sqlite3.Connection, fid: int) -> None:
         (fid,),
     ).fetchall()
     hashes = {r["hash"] for r in rows}
-    if len(hashes) > 1 and tolerance.is_tolerant(conn, vpath_of(conn, fid)):
+    if len(hashes) > 1 and (tolerance.is_tolerant(conn, vpath_of(conn, fid))
+                            or priority.sync_root(conn, vpath_of(conn, fid)) is not None):
         # Several versions are fine here: no decision is asked (and an old one goes).
         obsolete_decisions(conn, fid, ("divergent",), statuses=("open", "dismissed"))
         return

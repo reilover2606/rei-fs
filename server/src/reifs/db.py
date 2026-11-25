@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -607,6 +607,28 @@ CREATE TABLE tolerance (
 -- Node flags: a mirrored drive counts as two copies; a backup-first node is filled first.
 ALTER TABLE nodes ADD COLUMN mirrored INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE nodes ADD COLUMN backup_first INTEGER NOT NULL DEFAULT 0;
+"""
+
+MIGRATIONS[19] = """
+-- Jobs made by the synchronizer (changes of synchronous files) are frequent: hidden from the
+-- job list unless they fail.
+ALTER TABLE jobs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+-- Applications that use rei-fs (design 5.18): a directory on a node granted to an app
+-- ('storage') or an instance of an app whose directory is kept the same on every node where
+-- it is registered ('instance'). token_hash is only known where the app was registered.
+CREATE TABLE apps (
+    name       TEXT NOT NULL,
+    node_id    TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    mode       TEXT NOT NULL CHECK (mode IN ('storage', 'instance')),
+    vpath      TEXT NOT NULL,
+    token_hash TEXT,
+    present    INTEGER NOT NULL DEFAULT 1,
+    created    INTEGER NOT NULL,
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL,
+    PRIMARY KEY (name, node_id)
+);
+CREATE UNIQUE INDEX apps_token ON apps(token_hash) WHERE token_hash IS NOT NULL;
 """
 
 
