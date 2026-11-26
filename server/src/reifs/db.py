@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import itertools
+import json
 import os
 import re
 import shutil
@@ -1699,6 +1700,91 @@ def probe_lock(path: Path | str) -> bool:
         return False
     finally:
         conn.close()
+
+
+# --- bulk deletion without the indexes that are ordered by a hash ----------------------------
+#
+# The index of the copies by hash, and the one of the files by the number of their path, are
+# ordered randomly by design: every row deleted from the table is a change in a different place
+# of each of them. In a database bigger than memory on a spinning disk that is a seek or two per
+# row (a few dozen rows a second); with them out of the way the deletion is sequential. So a bulk
+# deletion drops them, and builds them again at the end in one sorted pass.
+
+HASH_INDEXES = ("copies_hash", "files_vhash")
+_bulk_lock = threading.Lock()
+_bulk_depth = 0
+deferred_case: list[str] | None = None   # while dropped: paths whose case flags are checked after
+
+
+def _drop_hash_indexes(conn: sqlite3.Connection) -> None:
+    global deferred_case
+    with transaction(conn, "preparing a bulk deletion"):
+        rows = conn.execute(
+            f"SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+            f" AND name IN ({','.join('?' * len(HASH_INDEXES))})", HASH_INDEXES).fetchall()
+        if not rows:
+            return
+        # Written down first: a crash in the middle is repaired when the server starts.
+        set_meta(conn, "dropped_indexes", json.dumps([r["sql"] for r in rows]))
+        for r in rows:
+            conn.execute(f"DROP INDEX {r['name']}")
+    deferred_case = []
+
+
+def _restore_hash_indexes(conn: sqlite3.Connection) -> None:
+    global deferred_case
+    raw = get_meta(conn, "dropped_indexes")
+    if raw:
+        with transaction(conn, "building the indexes again"):
+            for sql in json.loads(raw):
+                conn.execute(sql.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+            conn.execute("DELETE FROM meta WHERE key = 'dropped_indexes'")
+    pending, deferred_case = deferred_case or [], None
+    if pending:
+        from . import index
+
+        for i in range(0, len(pending), 500):
+            with transaction(conn, "checking case collisions"):
+                for vpath in pending[i:i + 500]:
+                    index.refresh_case_flags(conn, vpath)
+
+
+class without_hash_indexes:
+    """``with without_hash_indexes(conn):`` around a bulk deletion (see above). Nested or
+    concurrent uses share one dropping and one rebuilding."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def __enter__(self):
+        global _bulk_depth
+        with _bulk_lock:
+            first = _bulk_depth == 0
+            _bulk_depth += 1
+        if first:
+            try:
+                _drop_hash_indexes(self.conn)
+            except BaseException:
+                with _bulk_lock:
+                    _bulk_depth -= 1
+                raise
+        return self.conn
+
+    def __exit__(self, *exc) -> None:
+        global _bulk_depth
+        with _bulk_lock:
+            _bulk_depth -= 1
+            last = _bulk_depth == 0
+        if last:
+            _restore_hash_indexes(self.conn)
+
+
+def repair_dropped_indexes(conn: sqlite3.Connection) -> bool:
+    """After a crash in the middle of a bulk deletion: build the indexes again."""
+    if _bulk_depth == 0 and get_meta(conn, "dropped_indexes"):
+        _restore_hash_indexes(conn)
+        return True
+    return False
 
 
 class _FairLock:

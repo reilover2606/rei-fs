@@ -96,5 +96,5 @@ def test_the_speed_test_runs_and_leaves_nothing_behind(tmp_path):
     lines = []
     speedtest.run(tmp_path / "x.db", quick=True, out=lines.append, cache_mb=8)
     text = "\n".join(lines)
-    assert "random 4 KiB reads" in text and "delete" in text and "Verdict" in text
+    assert "random 4 KiB reads" in text and "hash index dropped" in text and "hours" in text
     assert sorted(p.name for p in tmp_path.iterdir()) == ["x.db"]

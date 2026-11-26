@@ -148,6 +148,8 @@ class Worker:
 
     def _main(self) -> None:
         conn = db.open_existing(self.cfg.db_path)
+        if db.repair_dropped_indexes(conn):    # a bulk deletion was cut short by a crash
+            log.info("the indexes taken out for a bulk deletion were built again")
         if self.cfg.database.cache_mb > 0:     # scans, jobs and resets run on this connection
             conn.execute(f"PRAGMA cache_size = -{self.cfg.database.cache_mb * 1024}")
         # -inf: everything runs once right away. (Not 0.0: monotonic time

@@ -760,6 +760,24 @@ under real load.
 * **By hand:** `reifs db vacuum` (a full rebuild; needs about the file's size in free disk space
   and the server not to be using the database).
 
+### 5.22b Why forgetting a million copies took hours on a spinning disk
+
+The index of the copies by hash (`copies_hash`) and the one of the files by the number of their
+path (`files_vhash`) are ordered *randomly* by design. Deleting a row from a table changes each of its
+indexes where that row sits, so every copy forgotten touched pages all over a database of many
+gigabytes: a seek or two per row, which on a spinning disk (100-200 a second) is a few dozen rows
+a second, and with SQLite's default 2 MB cache nothing of it stays in memory. (Measured on a SATA SSD
+in a test; the speed test, `reifs db speed`, shows what a given disk does.)
+
+So a forgetting of 100,000 copies or more (`nodes.BIG_FORGET`: reset, removing a node) takes those two
+indexes out for its duration (`db.without_hash_indexes`) and builds them again at the end in one
+sorted pass, which is mostly sequential. The deletion itself is as before (500 rows per
+transaction); the rebuilding at the end is a long transaction (about a minute per few million
+rows). While they are out: what is written meanwhile still works; the case-collision flags of files
+added meanwhile are checked afterwards (`deferred_case`); the names of the dropped indexes are
+recorded in `meta`, and a server that is killed in the middle builds them again when it starts
+(`db.repair_dropped_indexes`). The worker's page cache is `[database] cache_mb` (128).
+
 ### 5.22 Resetting a node, and opaque directories
 
 **Reset node** (Nodes tab `Z`; `reifs node reset NAME`; faster since: big files are hashed by

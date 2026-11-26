@@ -75,6 +75,9 @@ def ensure_file(conn: sqlite3.Connection, vpath: str) -> int:
 def refresh_case_flags(conn: sqlite3.Connection, vpath: str) -> None:
     """Flag the files whose path differs from another's only in case. They are found by the
     number of the casefolded path (indexed) and then compared for real."""
+    if db.deferred_case is not None:    # the hash indexes are out for a bulk deletion: later
+        db.deferred_case.append(vpath)
+        return
     key = paths.key(vpath)
     rows = [r for r in conn.execute("SELECT id, vpath, issues FROM vfiles WHERE vhash = ?",
                                     (db.key_hash(vpath),)).fetchall() if paths.key(r["vpath"]) == key]
