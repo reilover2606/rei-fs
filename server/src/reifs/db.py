@@ -1527,9 +1527,20 @@ def reclaim(conn: sqlite3.Connection, seconds: float = 20.0, chunk: int = 4000) 
         left = conn.execute("PRAGMA freelist_count").fetchone()[0]
         if not left:
             break
-        conn.execute(f"PRAGMA incremental_vacuum({chunk})").fetchall()
+        # Each step is a write transaction like any other (in the queue, in the lock statistics).
+        with transaction(conn, "giving the database's free space back"):
+            conn.execute(f"PRAGMA incremental_vacuum({chunk})").fetchall()
     conn.execute("PRAGMA wal_checkpoint(PASSIVE)")      # the file itself shrinks at a checkpoint
     return (start - conn.execute("PRAGMA freelist_count").fetchone()[0]) * page
+
+
+def reclaim_due(conn: sqlite3.Connection, min_percent: int = 10, min_bytes: int = 32 << 20) -> bool:
+    """Is enough of the file free room to be worth giving back?"""
+    if not is_incremental(conn):
+        return False
+    page = conn.execute("PRAGMA page_size").fetchone()[0]
+    free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    return free * page >= min_bytes and free_space_ratio(conn) * 100 >= min_percent
 
 
 def make_incremental(conn: sqlite3.Connection, path: Path | str) -> None:

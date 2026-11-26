@@ -745,9 +745,26 @@ be atomic in WAL mode, and the gain is for writers that, with the queue, already
 second. It is the next step if `lock_stats` still shows the small writers waiting behind the index
 under real load.
 
+### 5.22a When the database is compacted
+
+* **Periodically (new):** every `[database] vacuum_hours` (6; 0 = never) the worker looks at the
+  file, and if at least `min_free_percent` (10) of it, and 32 MiB, is free room left by deleted rows,
+  it gives that back to the disk (`db.reclaim`: `PRAGMA incremental_vacuum` in steps of 4,000
+  pages, each a write transaction in the lock queue, with a checkpoint at the end; up to two
+  minutes a time, the rest at the next round). It is not a rebuild of the file, so it needs no extra
+  disk space and no exclusive access.
+* **After an operation that frees a lot:** packing, dropping an archive, removing the originals on
+  another node, removing or resetting a node.
+* **Once, to make this possible:** a database made by an older version is rebuilt (`VACUUM`) when the
+  server starts (`db.make_incremental`), and after the upgrade to version 16.
+* **By hand:** `reifs db vacuum` (a full rebuild; needs about the file's size in free disk space
+  and the server not to be using the database).
+
 ### 5.22 Resetting a node, and opaque directories
 
-**Reset node** (Nodes tab `Z`; `reifs node reset NAME`). After a big deletion the usual way takes
+**Reset node** (Nodes tab `Z`; `reifs node reset NAME`; faster since: big files are hashed by
+`[scan] hash_threads` (4) threads, files below 256 KiB inline because a thread costs more than they do;
+orphaned files are dropped in bulk; decisions and proposals are found by node through indexes). After a big deletion the usual way takes
 long three times over: a scan that finds a million files gone, a million decisions raised, and as
 many to answer. A reset skips it: the index forgets everything it knows of the node, in pieces of
 500 rows per transaction, and **no decision is raised** for what is gone (`nodes.reset_node`); the

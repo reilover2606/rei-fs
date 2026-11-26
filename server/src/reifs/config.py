@@ -26,7 +26,7 @@ DEFAULT_IGNORE = [
 
 
 SECTIONS = ("server", "storage", "scan", "discovery", "rsync", "transfers", "replication",
-            "ssh")
+            "ssh", "database")
 PATH_STYLES = ("auto", "native", "cygwin", "msys")
 
 
@@ -149,6 +149,14 @@ class TransfersSection:
 
 
 @dataclass
+class DatabaseSection:
+    # Free space inside the database file is given back to the disk now and then: every this
+    # many hours, if at least min_free_percent of the file (and 32 MiB) is free pages. 0 = never.
+    vacuum_hours: int = 6
+    min_free_percent: int = 10
+
+
+@dataclass
 class Config:
     home: Path
     server: ServerSection = field(default_factory=ServerSection)
@@ -159,6 +167,7 @@ class Config:
     transfers: TransfersSection = field(default_factory=TransfersSection)
     replication: ReplicationSection = field(default_factory=ReplicationSection)
     ssh: SshSection = field(default_factory=SshSection)
+    database: DatabaseSection = field(default_factory=DatabaseSection)
 
     @property
     def config_path(self) -> Path:
@@ -291,6 +300,13 @@ batch_mb = {self.transfers.batch_mb}
 min_free_mb = {self.transfers.min_free_mb}
 # Transient failures before an item is marked failed.
 max_attempts = {self.transfers.max_attempts}
+
+[database]
+# The database file keeps the room left by deleted rows for reuse. Every vacuum_hours hours, if
+# at least min_free_percent of the file (and 32 MiB) is such free room, it is given back to the
+# disk, a little at a time while the server works. 0 = never (reifs db vacuum does it by hand).
+vacuum_hours = {self.database.vacuum_hours}
+min_free_percent = {self.database.min_free_percent}
 
 [replication]
 # Good copies every file should have, on different nodes.
