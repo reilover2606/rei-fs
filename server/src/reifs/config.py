@@ -26,7 +26,7 @@ DEFAULT_IGNORE = [
 
 
 SECTIONS = ("server", "storage", "scan", "discovery", "rsync", "transfers", "replication",
-            "ssh")
+            "ssh", "database")
 PATH_STYLES = ("auto", "native", "cygwin", "msys")
 
 
@@ -74,6 +74,9 @@ class ScanSection:
     # Synchronous directories are looked at this often (seconds) and changes in them are
     # propagated at once; 0 uses synchronous_minutes.
     synchronous_seconds: int = 5
+    # Files are read and hashed by this many threads at once (a first scan, or after a reset,
+    # reads every byte). 1 = one at a time: better for a spinning disk.
+    hash_threads: int = 4
     frequent_minutes: int = 10
     archival_minutes: int = 0
     # A scan that finds at least this many files vanished from (or moved out of)
@@ -146,6 +149,18 @@ class TransfersSection:
 
 
 @dataclass
+class DatabaseSection:
+    # Free space inside the database file is given back to the disk now and then: every this
+    # many hours, if at least min_free_percent of the file (and 32 MiB) is free pages. 0 = never.
+    vacuum_hours: int = 6
+    min_free_percent: int = 10
+    # Memory the server's background worker (scans, jobs, resets) lets SQLite keep of the
+    # database. Big jobs touch pages all over a big database; with this much of it in memory
+    # they do not each cost a disk seek. The default of SQLite is 2 MB.
+    cache_mb: int = 128
+
+
+@dataclass
 class Config:
     home: Path
     server: ServerSection = field(default_factory=ServerSection)
@@ -156,6 +171,7 @@ class Config:
     transfers: TransfersSection = field(default_factory=TransfersSection)
     replication: ReplicationSection = field(default_factory=ReplicationSection)
     ssh: SshSection = field(default_factory=SshSection)
+    database: DatabaseSection = field(default_factory=DatabaseSection)
 
     @property
     def config_path(self) -> Path:
@@ -253,6 +269,9 @@ synchronous_minutes = {self.scan.synchronous_minutes}
 # Synchronous directories are scanned this often, in seconds, and what changes in them is
 # copied to the other nodes holding them at once (0: use synchronous_minutes).
 synchronous_seconds = {self.scan.synchronous_seconds}
+# How many files are read and hashed at once. More is faster on SSDs and network drives
+# (a first scan reads everything); use 1 for a spinning disk.
+hash_threads = {self.scan.hash_threads}
 frequent_minutes = {self.scan.frequent_minutes}
 archival_minutes = {self.scan.archival_minutes}
 # Files that vanish or move together (a deleted or moved folder) are decided as one.
@@ -285,6 +304,17 @@ batch_mb = {self.transfers.batch_mb}
 min_free_mb = {self.transfers.min_free_mb}
 # Transient failures before an item is marked failed.
 max_attempts = {self.transfers.max_attempts}
+
+[database]
+# The database file keeps the room left by deleted rows for reuse. Every vacuum_hours hours, if
+# at least min_free_percent of the file (and 32 MiB) is such free room, it is given back to the
+# disk, a little at a time while the server works. 0 = never (reifs db vacuum does it by hand).
+vacuum_hours = {self.database.vacuum_hours}
+min_free_percent = {self.database.min_free_percent}
+# Memory for the page cache of the background worker (SQLite's own default is 2 MB). A reset or a
+# first scan of a database bigger than the cache is much faster with more (reifs db speed shows
+# what your disk does).
+cache_mb = {self.database.cache_mb}
 
 [replication]
 # Good copies every file should have, on different nodes.

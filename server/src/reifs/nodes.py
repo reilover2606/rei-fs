@@ -213,8 +213,7 @@ def forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=None
                          (node_id, *fids))
             conn.execute(f"DELETE FROM changes WHERE ref_node = ? AND ref_file IN ({marks})",
                          (node_id, *fids))
-            for fid in fids:
-                index.drop_file_if_orphan(conn, fid)
+            index.drop_orphans(conn, fids)
         forgotten += len(fids)
         if say:
             say(f"forgetting what the index knew of the node: {forgotten:,} copies")

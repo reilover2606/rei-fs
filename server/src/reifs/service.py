@@ -102,9 +102,10 @@ class Worker:
     def request_plan(self) -> None:
         self._enqueue(("plan",))
 
-    def request_housekeeping(self) -> None:
-        """Forget what the index holds below opaque directories, and old member lists."""
-        self._enqueue(("housekeeping",))
+    def request_housekeeping(self, reclaim: bool = False) -> None:
+        """Forget what the index holds below opaque directories, and old member lists;
+        with ``reclaim``, also give the database's free room back to the disk."""
+        self._enqueue(("housekeeping", reclaim))
 
     def request_sync(self, full: bool = False) -> None:
         """Bring the copies of synchronous files up to date (a full pass looks at all of them)."""
@@ -147,6 +148,8 @@ class Worker:
 
     def _main(self) -> None:
         conn = db.open_existing(self.cfg.db_path)
+        if self.cfg.database.cache_mb > 0:     # scans, jobs and resets run on this connection
+            conn.execute(f"PRAGMA cache_size = -{self.cfg.database.cache_mb * 1024}")
         # -inf: everything runs once right away. (Not 0.0: monotonic time
         # counts from boot, so on a machine booted less than an hour ago the
         # first hourly scan would otherwise wait.)
@@ -161,6 +164,7 @@ class Worker:
         last_plan_check = never
         last_sync_check = never
         last_followup = never
+        last_vacuum = time.monotonic()      # the first look comes after the first period
         last_full_sync = never
         synced_at_seq = None
         planned_at_seq = None
@@ -218,6 +222,11 @@ class Worker:
                                         " ON m.archive_id = a.id WHERE a.present = 0 LIMIT 1"
                                         ).fetchone():
                             archives.purge_members(conn)   # a removal came from another server
+                    vh = self.cfg.database.vacuum_hours
+                    if vh > 0 and now - last_vacuum >= vh * 3600:
+                        last_vacuum = now
+                        if db.reclaim_due(conn, self.cfg.database.min_free_percent):
+                            self.request_housekeeping(reclaim=True)
                     if now - last_jobs >= JOBS_SECONDS:
                         last_jobs = now
                         if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending', 'waiting')"
@@ -288,6 +297,12 @@ class Worker:
                               since=db.now())
                     opaque.forget_indexed(conn, say=self._progress, stop=self.stop_requested.is_set)
                 archives.purge_members(conn)
+                if task[1]:
+                    self._set(state="tidying", detail="giving the database's free space back",
+                              since=db.now())
+                    freed = db.reclaim(conn, seconds=120)
+                    if freed:
+                        log.info("database: %.0f MB of free room given back", freed / 1e6)
             except Stopped:
                 pass
             except Exception as e:  # noqa: BLE001

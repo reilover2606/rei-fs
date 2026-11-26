@@ -88,6 +88,32 @@ def refresh_case_flags(conn: sqlite3.Connection, vpath: str) -> None:
             )
 
 
+def drop_orphans(conn: sqlite3.Connection, fids: list[int]) -> int:
+    """``drop_file_if_orphan`` for many files at once, with a few statements instead of a few
+    per file (what makes forgetting a million copies take minutes, not hours). The caller holds
+    the transaction. Returns how many files went."""
+    if not fids:
+        return 0
+    marks = ",".join("?" * len(fids))
+    gone = conn.execute(
+        f"SELECT f.id, f.dir_id, f.issues, f.vhash FROM files f WHERE f.id IN ({marks})"
+        " AND NOT EXISTS (SELECT 1 FROM copies c WHERE c.file_id = f.id)", fids).fetchall()
+    if not gone:
+        return 0
+    # A file that clashed in case with another: that one no longer does (rare, and looked at
+    # by path, so before the rows are deleted).
+    clashing = [r["vpath"] for r in conn.execute(
+        f"SELECT vpath FROM vfiles WHERE id IN ({','.join('?' * len(gone))})"
+        " AND issues LIKE ?", [r["id"] for r in gone] + [f"%{paths.ISSUE_CASE}%"])]
+    ids = [r["id"] for r in gone]
+    conn.execute(f"DELETE FROM files WHERE id IN ({','.join('?' * len(ids))})", ids)
+    for did in {r["dir_id"] for r in gone}:
+        prune_dirs(conn, did)
+    for vpath in clashing:
+        refresh_case_flags(conn, vpath)
+    return len(ids)
+
+
 def drop_file_if_orphan(conn: sqlite3.Connection, fid: int) -> bool:
     """Forget a file once no copy of it is tracked anywhere."""
     if conn.execute("SELECT 1 FROM copies WHERE file_id = ?", (fid,)).fetchone():
