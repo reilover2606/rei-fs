@@ -108,9 +108,12 @@ def sqlite_deletes(folder: Path, rows: int, cache_mb: int | None, drop_hash_inde
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.close()
         size = path.stat().st_size
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))   # fsync wants write access on Windows
         try:
-            os.fsync(fd)
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
             _drop_cache(fd)                 # what a big database is: not in memory
         finally:
             os.close(fd)

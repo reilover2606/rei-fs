@@ -104,7 +104,7 @@ def test_the_speed_test_does_not_need_pread(tmp_path, monkeypatch):
     """Windows has no os.pread."""
     import os
     from reifs import speedtest
-    monkeypatch.delattr(os, "pread")
+    monkeypatch.delattr(os, "pread", raising=False)
     (tmp_path / "x.db").write_bytes(b"0" * 100)
     lines = []
     speedtest.run(tmp_path / "x.db", quick=True, out=lines.append, cache_mb=4)
