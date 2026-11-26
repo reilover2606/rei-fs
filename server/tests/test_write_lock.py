@@ -98,3 +98,14 @@ def test_the_speed_test_runs_and_leaves_nothing_behind(tmp_path):
     text = "\n".join(lines)
     assert "random 4 KiB reads" in text and "hash index dropped" in text and "hours" in text
     assert sorted(p.name for p in tmp_path.iterdir()) == ["x.db"]
+
+
+def test_the_speed_test_does_not_need_pread(tmp_path, monkeypatch):
+    """Windows has no os.pread."""
+    import os
+    from reifs import speedtest
+    monkeypatch.delattr(os, "pread", raising=False)
+    (tmp_path / "x.db").write_bytes(b"0" * 100)
+    lines = []
+    speedtest.run(tmp_path / "x.db", quick=True, out=lines.append, cache_mb=4)
+    assert any("random 4 KiB reads" in l for l in lines)
