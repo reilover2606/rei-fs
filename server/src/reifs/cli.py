@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (__version__, apps, archives, auth, tolerance, db, decisions, index, jobs, nodes, peers, queries,
+from . import (__version__, apps, archives, auth, opaque, tolerance, db, decisions, index, jobs, nodes, peers, queries,
                priority, replication, runner, scanner, tags)
 from .config import ConfigError, default_home
 from .hashing import short
@@ -147,6 +147,20 @@ def cmd_node_set(args) -> None:
     print(f"Updated node {args.rename or node['name']!r}.")
 
 
+def cmd_node_reset(args) -> None:
+    cfg, conn = open_server(args.home)
+    try:
+        with ServerLock(cfg.home):
+            n = nodes.reset_node(conn, args.node,
+                                 lambda m: print("\r" + m[:100].ljust(100), end="", file=sys.stderr))
+            print(f"\nForgot {n:,} copies; scanning {args.node} from scratch...")
+            _, results = scanner.scan_all(conn, cfg, [nodes.get_node(conn, args.node)["id"]])
+    except nodes.NodeError as e:
+        raise CliError(str(e)) from None
+    for r in results:
+        print(f"{r.node_name}: {r.stats.seen:,} files seen, +{r.stats.added:,} added")
+
+
 def cmd_node_remove(args) -> None:
     _, conn = open_server(args.home)
     try:
@@ -170,6 +184,20 @@ def cmd_discover(args) -> None:
         print(f"moved    {name:20} now at {root}")
     for name, owner, path in d.foreign:
         print(f"foreign  {name:20} {path} (owned by server {owner})")
+
+
+def cmd_opaque(args) -> None:
+    _, conn = open_server(args.home)
+    value = {"yes": True, "no": False, "inherit": None}[args.value]
+    try:
+        res = opaque.set_opaque(conn, args.vpath, value)
+    except opaque.OpaqueError as e:
+        raise CliError(str(e)) from None
+    state = ("opaque: one row for the whole directory" if res["opaque"] else "indexed as usual")
+    print(f"{res['path']}: {state}" + ("" if not res["inherited"] else f" (from {res['set_on']})"))
+    if res["opaque"]:
+        print("The files indexed below it now are replaced by one row (done by the running server, "
+              "then the next scan counts them).")
 
 
 def cmd_tolerate(args) -> None:
@@ -1135,6 +1163,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_node_add)
     s = node.add_parser("list", help="list nodes")
     s.set_defaults(func=cmd_node_list)
+    s = node.add_parser("reset", help="forget everything the index knows of a node, then scan it "
+                                      "from scratch (no decisions about what is gone)")
+    s.add_argument("node")
+    s.set_defaults(func=cmd_node_reset)
+
     s = node.add_parser("remove", help="take a node out of the index (its files are not touched)")
     s.add_argument("node")
     s.add_argument("--force", action="store_true",
@@ -1184,6 +1217,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discover", help="find which owned nodes are attached")
     s.set_defaults(func=cmd_discover)
+
+    s = sub.add_parser("opaque", help="stop indexing what is inside a directory (names are found "
+                                      "by a deep search, read from the disk)")
+    s.add_argument("vpath", help="a directory of the virtual tree")
+    s.add_argument("value", choices=["yes", "no", "inherit"])
+    s.set_defaults(func=cmd_opaque)
 
     s = sub.add_parser("tolerate", help="allow several versions of a file or directory (no decisions)")
     s.add_argument("vpath", help="a file or directory of the virtual tree")

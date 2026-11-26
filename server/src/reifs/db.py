@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 22
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -680,6 +680,560 @@ CREATE UNIQUE INDEX apps_token ON apps(token_hash) WHERE token_hash IS NOT NULL;
 """
 
 MIGRATIONS[20] = _migration_20
+
+MIGRATIONS: dict[int, "str | Callable"] = {
+    2: """
+-- Transfer jobs (milestone 2). Items refer to files by vpath so they survive
+-- re-keying of files.
+CREATE TABLE jobs (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK (kind IN ('copy', 'move', 'wanted')),
+    description TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'running', 'waiting', 'done', 'failed', 'cancelled')),
+    created     TEXT NOT NULL,
+    started     TEXT,
+    finished    TEXT
+);
+
+CREATE TABLE job_items (
+    id          INTEGER PRIMARY KEY,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    op          TEXT NOT NULL CHECK (op IN ('copy', 'overwrite', 'rename')),
+    vpath       TEXT NOT NULL,
+    new_vpath   TEXT,                       -- rename target
+    src_node    TEXT REFERENCES nodes(id) ON DELETE SET NULL,  -- NULL: any current copy
+    dst_node    TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    size        INTEGER NOT NULL DEFAULT 0,
+    mark_source INTEGER NOT NULL DEFAULT 0, -- move: mark the source copy for deletion
+    allow_hash  TEXT,                       -- destination content we may overwrite
+    wanted_id   INTEGER REFERENCES wanted(id) ON DELETE SET NULL,
+    state       TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'running', 'done', 'failed', 'skipped',
+                                 'conflict', 'cancelled')),
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    message     TEXT,
+    updated     TEXT NOT NULL
+);
+CREATE INDEX job_items_job ON job_items(job_id, state);
+""",
+    3: """
+-- Pairing and peers (milestone 4).
+ALTER TABLE servers ADD COLUMN fingerprint TEXT;      -- pinned certificate of the peer
+ALTER TABLE servers ADD COLUMN token_out TEXT;        -- token we present to the peer
+ALTER TABLE servers ADD COLUMN token_in_hash TEXT;    -- sha256 of the token the peer presents
+ALTER TABLE servers ADD COLUMN rsync_port INTEGER;    -- the peer's rsync daemon
+ALTER TABLE servers ADD COLUMN rsync_user TEXT;       -- our credentials on that daemon
+ALTER TABLE servers ADD COLUMN rsync_password TEXT;
+ALTER TABLE servers ADD COLUMN rsync_in_user TEXT;    -- the peer's credentials on ours
+ALTER TABLE servers ADD COLUMN rsync_in_password TEXT;
+ALTER TABLE servers ADD COLUMN pull_cursor INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN online INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN last_sync TEXT;
+ALTER TABLE servers ADD COLUMN last_error TEXT;
+
+ALTER TABLE nodes ADD COLUMN owner_since TEXT NOT NULL DEFAULT '';
+UPDATE nodes SET owner_since = COALESCE(last_seen, '2000-01-01T00:00:00+00:00');
+
+CREATE TABLE pair_requests (
+    id          INTEGER PRIMARY KEY,
+    direction   TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    server_id   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    nonce       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'accepted', 'rejected', 'failed')),
+    message     TEXT,
+    created     TEXT NOT NULL
+);
+
+-- The change log becomes a replicated, typed log. Every entry carries its
+-- origin server and a per-origin sequence number; entries learned from peers
+-- are appended too, so they are forwarded to other peers.
+CREATE TABLE changes_v3 (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_id  TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('copy', 'node', 'tag', 'mark')),
+    data       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    UNIQUE (origin_id, origin_seq)
+);
+INSERT INTO changes_v3(seq, origin_id, origin_seq, kind, data, ts)
+    SELECT seq, (SELECT value FROM meta WHERE key = 'server_id'), seq, 'copy',
+           json_object('node_id', node_id, 'vpath', vpath, 'op', op, 'size', size,
+                       'mtime_ns', mtime_ns, 'hash', hash),
+           ts
+    FROM changes;
+DROP TABLE changes;
+ALTER TABLE changes_v3 RENAME TO changes;
+
+-- Highest origin_seq applied per origin server.
+CREATE TABLE origin_progress (
+    origin_id TEXT PRIMARY KEY,
+    last_seq  INTEGER NOT NULL
+);
+
+-- Calls to peers that must eventually happen (delivered by the sync thread).
+CREATE TABLE outbox (
+    id         INTEGER PRIMARY KEY,
+    server_id  TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created    TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+-- Tags received for a vpath not (yet) in the index.
+CREATE TABLE orphan_tags (
+    vpath      TEXT NOT NULL,
+    tag        TEXT NOT NULL,
+    present    INTEGER NOT NULL,
+    updated    TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    PRIMARY KEY (vpath, tag)
+);
+
+-- Snapshot existing owned nodes and tags into the log so peers learn them.
+INSERT INTO changes(origin_id, origin_seq, kind, data, ts)
+    SELECT m.value,
+           (SELECT IFNULL(MAX(origin_seq), 0) FROM changes) + ROW_NUMBER() OVER (ORDER BY n.id),
+           'node',
+           json_object('id', n.id, 'name', n.name, 'kind', n.kind, 'owner_id', n.owner_id,
+                       'owner_name', (SELECT name FROM servers WHERE id = n.owner_id),
+                       'owner_since', n.owner_since, 'case_sensitive', n.case_sensitive,
+                       'restricted_names', n.restricted_names, 'priority', n.priority,
+                       'replication_target', n.replication_target, 'online', n.online),
+           strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    FROM nodes n JOIN meta m ON m.key = 'server_id' AND n.owner_id = m.value;
+INSERT INTO changes(origin_id, origin_seq, kind, data, ts)
+    SELECT m.value,
+           (SELECT IFNULL(MAX(origin_seq), 0) FROM changes) + ROW_NUMBER() OVER (ORDER BY t.file_id, t.tag),
+           'tag',
+           json_object('vpath', f.vpath, 'tag', t.tag, 'present', t.present,
+                       'updated', t.updated, 'updated_by', t.updated_by),
+           strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    FROM tags t JOIN files f ON f.id = t.file_id JOIN meta m ON m.key = 'server_id';
+""",
+    4: """
+-- Replication (milestone 5): nodes announce their free space so any server
+-- can pick backup destinations; wanted jobs can carry a note (e.g. why
+-- forwarding an approval failed).
+ALTER TABLE nodes ADD COLUMN free_bytes INTEGER;
+ALTER TABLE nodes ADD COLUMN total_bytes INTEGER;
+ALTER TABLE wanted ADD COLUMN message TEXT;
+CREATE INDEX wanted_status ON wanted(status, reason);
+""",
+    5: """
+-- rsync over SSH between servers: what each peer offers, and how we pull
+-- from it ('daemon' or 'ssh'); nodes announce the path served over SSH.
+ALTER TABLE servers ADD COLUMN transport TEXT NOT NULL DEFAULT 'daemon';
+ALTER TABLE servers ADD COLUMN ssh_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE servers ADD COLUMN ssh_host TEXT;
+ALTER TABLE servers ADD COLUMN ssh_port INTEGER;
+ALTER TABLE servers ADD COLUMN ssh_user TEXT;
+ALTER TABLE servers ADD COLUMN ssh_pubkey TEXT;
+ALTER TABLE nodes ADD COLUMN ssh_root TEXT;
+""",
+    6: """
+-- Directories made by the user in the virtual tree. Without this a directory
+-- exists only as the prefix of file paths and vanishes with its last file. Like
+-- tags, an entry is a last-writer-wins record (present = 0 is a tombstone).
+CREATE TABLE vdirs (
+    vpath      TEXT PRIMARY KEY,
+    present    INTEGER NOT NULL,
+    updated    TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE changes_v6 (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_id  TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('copy', 'node', 'tag', 'mark', 'vdir')),
+    data       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    UNIQUE (origin_id, origin_seq)
+);
+INSERT INTO changes_v6(seq, origin_id, origin_seq, kind, data, ts)
+    SELECT seq, origin_id, origin_seq, kind, data, ts FROM changes;
+DROP TABLE changes;
+ALTER TABLE changes_v6 RENAME TO changes;
+""",
+    7: """
+-- Update priority of directories (0 synchronous, 1 frequent, 2 infrequent,
+-- 3 archival). The nearest directory at or above a path that has a value
+-- decides; NULL is a tombstone (inherit again). Replicated like tags.
+CREATE TABLE dirprefs (
+    vpath      TEXT PRIMARY KEY,
+    priority   INTEGER CHECK (priority IS NULL OR priority BETWEEN 0 AND 3),
+    updated    TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+-- When each priority class of a node was last scanned (local, not replicated).
+CREATE TABLE scan_state (
+    node_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    priority INTEGER NOT NULL,
+    scanned  REAL NOT NULL,
+    PRIMARY KEY (node_id, priority)
+);
+
+-- New kinds of log entries need no table change from now on.
+CREATE TABLE changes_v7 (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_id  TEXT NOT NULL,
+    origin_seq INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    UNIQUE (origin_id, origin_seq)
+);
+INSERT INTO changes_v7(seq, origin_id, origin_seq, kind, data, ts)
+    SELECT seq, origin_id, origin_seq, kind, data, ts FROM changes;
+DROP TABLE changes;
+ALTER TABLE changes_v7 RENAME TO changes;
+""",
+    8: """
+-- The status line counts these on every poll: let SQLite count the few rows
+-- instead of reading every copy and file.
+CREATE INDEX copies_marked ON copies(file_id) WHERE marked_delete = 1;
+CREATE INDEX copies_missing ON copies(file_id) WHERE state = 'missing';
+CREATE INDEX files_issues ON files(id) WHERE issues != '';
+""",
+    9: """
+-- A folder that vanished or moved holds thousands of files: their decisions are
+-- gathered under one 'group' decision (their parent) instead of flooding the stack.
+ALTER TABLE decisions ADD COLUMN parent_id INTEGER REFERENCES decisions(id) ON DELETE CASCADE;
+CREATE INDEX decisions_parent ON decisions(parent_id) WHERE parent_id IS NOT NULL;
+""",
+    10: """
+-- Big databases (millions of files): look proposals up by file, and a node's copies by node.
+CREATE INDEX wanted_file ON wanted(file_id);
+DROP INDEX copies_node;
+CREATE INDEX copies_node ON copies(node_id, size);
+""",
+    11: """
+-- What a peer's sync is doing right now ("catching up: N entries"), shown next to its state.
+ALTER TABLE servers ADD COLUMN sync_note TEXT;
+""",
+    12: """
+-- Fetching (a plain download into <server node>/fetch, nothing indexed) and relaying
+-- (a file passed through an intermediate server that both are paired with).
+ALTER TABLE job_items ADD COLUMN fetch INTEGER NOT NULL DEFAULT 0;  -- 1 fetch, 2 relay staging
+ALTER TABLE job_items ADD COLUMN relay_via TEXT;                    -- server relaying it for us
+ALTER TABLE job_items ADD COLUMN relay_id TEXT;                     -- our request on that server
+ALTER TABLE job_items ADD COLUMN serves TEXT;                       -- fetch = 2: the request we stage for
+
+-- On the intermediate server: files it fetches from where it can reach them for another.
+CREATE TABLE relay_requests (
+    id        TEXT PRIMARY KEY,
+    requester TEXT NOT NULL,
+    node_id   TEXT NOT NULL,
+    vpath     TEXT NOT NULL,
+    hash      TEXT NOT NULL,
+    size      INTEGER NOT NULL DEFAULT 0,
+    state     TEXT NOT NULL DEFAULT 'queued'
+              CHECK (state IN ('queued', 'ready', 'failed', 'done')),
+    message   TEXT,
+    created   TEXT NOT NULL,
+    updated   TEXT NOT NULL
+);
+""",
+    13: """
+-- Scheduled syncs: keep a directory of one node copied to another at regular intervals.
+CREATE TABLE schedules (
+    id               INTEGER PRIMARY KEY,
+    name             TEXT NOT NULL UNIQUE,
+    vpath            TEXT NOT NULL,                 -- the directory ('/' for everything)
+    src_node         TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    dst_node         TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    interval_minutes INTEGER NOT NULL CHECK (interval_minutes >= 1),
+    update_changed   INTEGER NOT NULL DEFAULT 1,    -- also replace older copies with newer ones
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created          TEXT NOT NULL,
+    next_due         REAL NOT NULL,                 -- epoch seconds; in the past = run when possible
+    last_run         REAL,
+    last_job_id      INTEGER,
+    last_note        TEXT
+);
+""",
+    14: """
+-- A smaller database (design 5.13).
+-- (1) The change log keeps no copy of what the tables hold: an entry about a copy only
+--     points at it (file, node), and the current state is read when it is sent. At most one
+--     entry per copy is kept.
+ALTER TABLE changes ADD COLUMN ref_file INTEGER;
+ALTER TABLE changes ADD COLUMN ref_node TEXT;
+UPDATE changes SET
+    ref_file = (SELECT id FROM files WHERE vpath = json_extract(changes.data, '$.vpath')),
+    ref_node = json_extract(data, '$.node_id')
+  WHERE kind = 'copy' AND json_extract(data, '$.op') IN ('upsert', 'missing');
+DELETE FROM changes WHERE ref_node IS NOT NULL AND ref_file IS NULL;
+UPDATE changes SET data = '' WHERE ref_file IS NOT NULL;
+CREATE INDEX changes_ref ON changes(ref_node, ref_file) WHERE ref_file IS NOT NULL;
+DELETE FROM changes WHERE ref_file IS NOT NULL AND seq < (
+    SELECT MAX(c2.seq) FROM changes c2
+    WHERE c2.ref_node = changes.ref_node AND c2.ref_file = changes.ref_file);
+-- (2) Hashes are stored as 32 bytes; the 'hash' column is computed from them for reading.
+ALTER TABLE copies ADD COLUMN hash_b BLOB;
+UPDATE copies SET hash_b = hb(hash);
+DROP INDEX copies_hash;
+ALTER TABLE copies DROP COLUMN hash;
+ALTER TABLE copies ADD COLUMN hash TEXT GENERATED ALWAYS AS (hx(hash_b)) VIRTUAL;
+CREATE INDEX copies_hash ON copies(hash_b, size);
+-- (3) Instead of the casefolded path (and its index), a 64-bit number of it.
+ALTER TABLE files ADD COLUMN vhash INTEGER;
+UPDATE files SET vhash = vh(vpath);
+DROP INDEX files_vkey;
+ALTER TABLE files DROP COLUMN vkey;
+CREATE INDEX files_vhash ON files(vhash);
+""",
+}
+
+
+def _migration_15(conn: sqlite3.Connection) -> None:
+    """Directories become rows: ``dirs(id, parent_id, name, path)``, and a file is
+    ``(dir_id, name)`` instead of a full path string (design 5.14). ``vfiles`` is the view
+    that gives the full path back. The directory part of a path used to be stored again in
+    every file's row and in two indexes."""
+    conn.execute("""CREATE TABLE dirs (
+        id        INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES dirs(id),
+        name      TEXT NOT NULL,
+        path      TEXT NOT NULL UNIQUE,      -- '/a/b'; the root is ''
+        UNIQUE (parent_id, name))""")
+    conn.execute("INSERT INTO dirs(id, parent_id, name, path) VALUES (1, NULL, '', '')")
+    found: set[str] = set()
+    for (vpath,) in conn.execute("SELECT vpath FROM files"):
+        d = vpath.rpartition("/")[0]
+        while d and d not in found:
+            found.add(d)
+            d = d.rpartition("/")[0]
+    ids = {"": 1}
+    for d in sorted(found, key=lambda x: (x.count("/"), x)):
+        parent, _, name = d.rpartition("/")
+        cur = conn.execute("INSERT INTO dirs(parent_id, name, path) VALUES (?, ?, ?)",
+                           (ids[parent], name, d))
+        ids[d] = cur.lastrowid
+    conn.create_function("dirid", 1, lambda vp: ids[vp.rpartition("/")[0]], deterministic=True)
+    conn.create_function("basename", 1, lambda vp: vp.rpartition("/")[2], deterministic=True)
+    conn.execute("""CREATE TABLE files_new (
+        id      INTEGER PRIMARY KEY,
+        dir_id  INTEGER NOT NULL REFERENCES dirs(id),
+        name    TEXT NOT NULL,
+        vhash   INTEGER,
+        issues  TEXT NOT NULL DEFAULT '',
+        created TEXT NOT NULL)""")
+    conn.execute("INSERT INTO files_new(id, dir_id, name, vhash, issues, created)"
+                 " SELECT id, dirid(vpath), basename(vpath), vhash, issues, created FROM files")
+    conn.execute("DROP TABLE files")
+    conn.execute("ALTER TABLE files_new RENAME TO files")
+    conn.execute("CREATE UNIQUE INDEX files_dirname ON files(dir_id, name)")
+    conn.execute("CREATE INDEX files_vhash ON files(vhash)")
+    conn.execute("CREATE INDEX files_issues ON files(id) WHERE issues != ''")
+    conn.execute(VFILES_VIEW)
+
+
+VFILES_VIEW = """CREATE VIEW vfiles AS
+    SELECT f.id AS id, f.dir_id AS dir_id, f.name AS name, d.path AS dir_path,
+           d.path || '/' || f.name AS vpath, f.vhash AS vhash, f.issues AS issues,
+           f.created AS created
+    FROM files f JOIN dirs d ON d.id = f.dir_id"""
+
+MIGRATIONS[15] = _migration_15
+
+# Columns that held a time as text and now hold microseconds since the epoch (design 5.15).
+TIME_COLUMNS = {
+    "servers": ("last_seen", "last_sync"),
+    "nodes": ("last_seen", "last_scan", "owner_since"),
+    "copies": ("first_seen", "hashed_at"),
+    "tags": ("updated",),
+    "decisions": ("created", "resolved"),
+    "wanted": ("created",),
+    "scans": ("started", "finished"),
+    "foreign_sightings": ("seen",),
+    "jobs": ("created", "started", "finished"),
+    "job_items": ("updated",),
+    "pair_requests": ("created",),
+    "outbox": ("created",),
+    "orphan_tags": ("updated",),
+    "vdirs": ("updated",),
+    "dirprefs": ("updated",),
+    "changes": ("ts",),
+    "relay_requests": ("created", "updated"),
+    "schedules": ("created",),
+    "files": ("created",),
+}
+
+
+def _migration_16(conn: sqlite3.Connection) -> None:
+    def lenient(text):
+        try:
+            return from_iso(text)
+        except ValueError:
+            return 0       # not a time at all: keep the row, forget the value
+    conn.create_function("us", 1, lenient, deterministic=True)
+    conn.execute("DROP VIEW IF EXISTS vfiles")
+    for table, cols in TIME_COLUMNS.items():
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                           (table,)).fetchone()[0]
+        indexes = [r[0] for r in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
+            " AND sql IS NOT NULL", (table,))]
+        names = [r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})") if r[6] == 0]
+        sql = re.sub(r'^CREATE TABLE\s+("?)\w+\1', f"CREATE TABLE {table}_t16", sql, count=1)
+        for c in cols:
+            sql, n = re.subn(rf"(\b{c}\s+)TEXT\b( NOT NULL)?( DEFAULT '')?",
+                             lambda m: m.group(1) + "INTEGER" + (m.group(2) or "")
+                             + (" DEFAULT 0" if m.group(3) else ""), sql, count=1)
+            assert n == 1, (table, c)
+        conn.execute(sql)
+        sel = ", ".join(f"us({n})" if n in cols else n for n in names)
+        conn.execute(f"INSERT INTO {table}_t16({', '.join(names)}) SELECT {sel} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {table}_t16 RENAME TO {table}")
+        for ix in indexes:
+            conn.execute(ix)
+    conn.execute(VFILES_VIEW)
+
+
+MIGRATIONS[16] = _migration_16
+
+
+def _rebuild_table(conn: sqlite3.Connection, table: str, edits: list[tuple[str, str]]) -> None:
+    """Recreate a table with its definition edited (SQLite cannot change a CHECK in place),
+    keeping its rows and indexes. Python migrations run with foreign keys off."""
+    import re
+
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                       (table,)).fetchone()[0]
+    indexes = [r[0] for r in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL",
+        (table,))]
+    names = [r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})") if r[6] == 0]
+    sql = re.sub(r'^CREATE TABLE\s+("?)\w+\1', f"CREATE TABLE {table}_new", sql, count=1)
+    for old, new in edits:
+        assert old in sql, (table, old)
+        sql = sql.replace(old, new, 1)
+    conn.execute(sql)
+    cols = ", ".join(names)
+    conn.execute(f"INSERT INTO {table}_new({cols}) SELECT {cols} FROM {table}")
+    conn.execute(f"DROP TABLE {table}")
+    conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+    for ix in indexes:
+        conn.execute(ix)
+
+MIGRATIONS[17] = """
+-- Packed directories (design 5.16): a directory kept as one squashfs file. The archive is an
+-- ordinary file of the virtual tree (``<dir>.sqsh``); this table says which directory it stands
+-- for, and ``archive_members`` lists what is inside so that a "deep" search can find it.
+CREATE TABLE archives (
+    id         INTEGER PRIMARY KEY,
+    dir_path   TEXT NOT NULL UNIQUE,         -- the packed directory, '/src/foo'
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    present    INTEGER NOT NULL DEFAULT 1,   -- 0: unpacked or removed (a tombstone for peers)
+    files      INTEGER NOT NULL DEFAULT 0,   -- members
+    bytes      INTEGER NOT NULL DEFAULT 0,   -- their size before packing
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+CREATE TABLE archive_members (
+    archive_id INTEGER NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,                -- relative to the packed directory
+    size       INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, path)
+) WITHOUT ROWID;
+"""
+
+MIGRATIONS[18] = """
+-- Files and directories whose copies may differ (design 5.17): no decision is asked. A
+-- directory's setting is inherited; NULL clears it (like dirprefs).
+CREATE TABLE tolerance (
+    vpath      TEXT PRIMARY KEY,
+    value      INTEGER,
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+-- Node flags: a mirrored drive counts as two copies; a backup-first node is filled first.
+ALTER TABLE nodes ADD COLUMN mirrored INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE nodes ADD COLUMN backup_first INTEGER NOT NULL DEFAULT 0;
+"""
+
+def _migration_20(conn: sqlite3.Connection) -> None:
+    """Scans, packing and unpacking are jobs (design 5.19): new kinds and operations."""
+    _rebuild_table(conn, "jobs", [
+        ("CHECK (kind IN ('copy', 'move', 'wanted'))",
+         "CHECK (kind IN ('copy', 'move', 'wanted', 'scan', 'pack', 'unpack'))")])
+    _rebuild_table(conn, "job_items", [
+        ("CHECK (op IN ('copy', 'overwrite', 'rename'))",
+         "CHECK (op IN ('copy', 'overwrite', 'rename', 'scan', 'pack', 'unpack', 'clean'))")])
+    conn.execute("ALTER TABLE job_items ADD COLUMN params TEXT")
+    # What an archive is for: pack everywhere (the archive is copied to every node that held the
+    # directory, the originals removed there once it is verified).
+    conn.execute("ALTER TABLE archives ADD COLUMN cleanup INTEGER NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE archives ADD COLUMN targets TEXT NOT NULL DEFAULT '[]'")
+    conn.execute("ALTER TABLE archive_members ADD COLUMN hash INTEGER")
+    conn.execute("""CREATE TABLE archive_todo (
+        dir_path TEXT NOT NULL,
+        node_id  TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        stage    TEXT NOT NULL,              -- copy -> clean
+        job_id   INTEGER,
+        updated  INTEGER NOT NULL,
+        PRIMARY KEY (dir_path, node_id))""")
+
+
+MIGRATIONS[19] = """
+-- Jobs made by the synchronizer (changes of synchronous files) are frequent: hidden from the
+-- job list unless they fail.
+ALTER TABLE jobs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+-- Applications that use rei-fs (design 5.18): a directory on a node granted to an app
+-- ('storage') or an instance of an app whose directory is kept the same on every node where
+-- it is registered ('instance'). token_hash is only known where the app was registered.
+CREATE TABLE apps (
+    name       TEXT NOT NULL,
+    node_id    TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    mode       TEXT NOT NULL CHECK (mode IN ('storage', 'instance')),
+    vpath      TEXT NOT NULL,
+    token_hash TEXT,
+    present    INTEGER NOT NULL DEFAULT 1,
+    created    INTEGER NOT NULL,
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL,
+    PRIMARY KEY (name, node_id)
+);
+CREATE UNIQUE INDEX apps_token ON apps(token_hash) WHERE token_hash IS NOT NULL;
+"""
+
+MIGRATIONS[20] = _migration_20
+
+MIGRATIONS[22] = """
+-- An opaque directory is ONE file row (design 5.22), whose content is the whole directory: the
+-- number of files inside it and their size are kept here, per node that holds it, not in the
+-- schema of the files (almost every row there is one file).
+CREATE TABLE collection_stats (
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    files   INTEGER NOT NULL,
+    bytes   INTEGER NOT NULL,
+    PRIMARY KEY (file_id, node_id)
+) WITHOUT ROWID;
+"""
+
+MIGRATIONS[21] = """
+-- Opaque directories (design 5.22): the scanner indexes nothing inside them. A directory's
+-- setting is inherited; NULL clears it (like dirprefs and tolerance).
+CREATE TABLE opaque (
+    vpath      TEXT PRIMARY KEY,
+    value      INTEGER,
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+"""
+
 
 
 def now() -> int:

@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import apps, archives, db, index, nodes, tolerance
+from . import apps, archives, db, index, nodes, opaque, tolerance
 
 BATCH = 2000
 
@@ -130,6 +130,8 @@ def _apply_chunk(conn: sqlite3.Connection, entries: list[dict]) -> int:
                 archives.apply_change(conn, data)
             elif kind == "tolerance":
                 tolerance.apply_change(conn, data)
+            elif kind == "opaque":
+                opaque.apply_change(conn, data)
             elif kind == "app":
                 apps.apply_change(conn, data)
             ref = None
@@ -192,6 +194,11 @@ def _apply_node(conn, me: str, origin: str, d: dict) -> None:
         row = conn.execute("SELECT owner_id FROM nodes WHERE id = ?", (d["id"],)).fetchone()
         if row is not None and row["owner_id"] == origin:
             nodes.delete_rows(conn, d["id"])
+        return
+    if d.get("reset"):          # the owner started the node over: its old copies are gone
+        row = conn.execute("SELECT owner_id FROM nodes WHERE id = ?", (d["id"],)).fetchone()
+        if row is not None and row["owner_id"] == origin:
+            nodes.forget_copies_of(conn, d["id"])
         return
     _ensure_server(conn, origin, d.get("owner_name"))
     row = conn.execute("SELECT * FROM nodes WHERE id = ?", (d["id"],)).fetchone()

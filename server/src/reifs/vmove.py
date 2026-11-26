@@ -29,7 +29,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import archives, db, index, jobs, nodes, paths, peers, priority, schedules, tolerance, vdirs
+from . import archives, db, index, jobs, nodes, opaque, paths, peers, priority, schedules, tolerance, vdirs
 
 MODES = ("merge", "preserve")
 
@@ -295,10 +295,15 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
             vdirs.move(conn, old, new)
             priority.move(conn, old, new)   # and their update priority
             tolerance.move(conn, old, new)  # and whether several versions are fine
+            opaque.move(conn, old, new)     # and whether it is indexed at all
             schedules.rewrite_paths(conn, old, new)   # and the scheduled syncs of it
             for peer in peers.paired_peers(conn):     # schedules live on the server owning the backup
                 index.queue_peer_call(conn, peer["id"], "/api/peer/dir-moved",
                                       {"old": old, "new": new})
+        opaque_roots = set(opaque.roots(conn))
+        for m in plan.moves:   # an opaque directory is a row of the index: its setting follows it
+            if m.old in opaque_roots:
+                opaque.move(conn, m.old, m.new)
         tolerant = tolerance.load(conn)
         for m in plan.moves:   # a file marked tolerant keeps the mark when it is moved
             if m.old in tolerant:

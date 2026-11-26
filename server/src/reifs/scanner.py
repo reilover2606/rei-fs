@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import archives, db, fsops, index, paths, priority
+from . import archives, collections_, db, fsops, index, opaque, paths, priority
 from .config import Config, ScanSection
 from .control import Stopped, StopFn, check
 from .hashing import hash_file
@@ -60,8 +60,10 @@ def reserved_dirs(conn: sqlite3.Connection, cfg: Config, node_id: str) -> tuple[
 
 
 class Ignorer:
-    def __init__(self, scan: ScanSection, reserved: tuple[str, ...] = ()):
+    def __init__(self, scan: ScanSection, reserved: tuple[str, ...] = (),
+                 opaque_dirs: tuple[str, ...] = ()):
         self.reserved = set(reserved)
+        self.opaque = set(opaque_dirs)    # each is ONE row; what is inside is not indexed
         self.hidden_dirs = scan.ignore_hidden_dirs
         self.name_patterns = [p.casefold() for p in scan.ignore if "/" not in p]
         self.path_patterns = [p.casefold() for p in scan.ignore if "/" in p]
@@ -83,7 +85,10 @@ class Ignorer:
         current = ""
         for i, part in enumerate(parts):
             current += "/" + part
-            if self.ignored(part, current, is_dir=i < len(parts) - 1):
+            inside = i < len(parts) - 1
+            if inside and current in self.opaque:
+                return True               # a file inside an opaque directory: not indexed
+            if self.ignored(part, current, is_dir=inside):
                 return True
         return False
 
@@ -165,6 +170,12 @@ class _Walker:
                     if entry.is_symlink() or _is_junction(entry):
                         continue
                     if entry.is_dir(follow_symlinks=False):
+                        if vpath in self.ignorer.opaque:
+                            # one row for the whole directory (the loop reads its fingerprint)
+                            if self.schedule.wants(prefs.prefs.get(vpath, prio)) \
+                                    and not marker_path(entry.path).exists():
+                                yield vpath, entry.path, None, None
+                            continue
                         if self.ignorer.ignored(name, vpath, is_dir=True):
                             continue
                         if marker_path(entry.path).exists():
@@ -229,7 +240,7 @@ def scan_node(
 
     started_at = time.time()
     stats = ScanStats(node=node["name"])
-    ignorer = Ignorer(cfg.scan, reserved_dirs(conn, cfg, node_id))
+    ignorer = Ignorer(cfg.scan, reserved_dirs(conn, cfg, node_id), tuple(opaque.roots(conn)))
     prefs = priority.Prefs(priority.load(conn))
     schedule = priority.Schedule(prefs, classes)
     walker = _Walker(root, ignorer, schedule)
@@ -244,6 +255,7 @@ def scan_node(
     }
     seen: set[str] = set()
     touched: set[int] = set()
+    coll: dict[str, tuple[int, int]] = {}      # opaque directories read: files, bytes
 
     def finish(status: str) -> None:
         with db.transaction(conn):
@@ -267,6 +279,10 @@ def scan_node(
             with db.transaction(conn, "scan: saving results"):
                 for args in batch:
                     _process_file(conn, node_id, scan_id, *args, stats, touched)
+                    if args[0] in coll:
+                        fid = index.file_id(conn, args[0])
+                        if fid is not None:
+                            collections_.record_stats(conn, fid, node_id, *coll.pop(args[0]))
             batch.clear()
             if progress:
                 progress(stats, current)
@@ -278,6 +294,22 @@ def scan_node(
             stats.seen += 1
             seen.add(vpath)
             row = existing.get(vpath)
+            if size is None:        # an opaque directory: one row for all that is in it
+                if new_only and row is not None:
+                    continue
+                if progress:
+                    progress(stats, f"reading {vpath}")
+                fp = collections_.fingerprint(
+                    phys, stop, lambda n, v=vpath: progress and progress(stats, f"reading {v}: {n:,} files"))
+                if row is not None and row["state"] == "present" and row["hash"] == fp.hash \
+                        and not verify:
+                    continue
+                coll[vpath] = (fp.files, fp.bytes)
+                stats.hashed += 1
+                batch.append((vpath, fp.bytes, fp.newest_mtime_ns, row, fp.hash))
+                if len(batch) >= BATCH_FILES:
+                    flush(vpath)
+                continue
             if new_only and row is not None:
                 continue
             if row is not None and not verify and row["size"] == size \
@@ -465,9 +497,10 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
                 index.forget_copy(conn, existing[vpath]["file_id"], node_id)
                 stats.forgotten += 1
 
-    # Rename candidates: copies that appeared since the last completed scan.
+    # Rename candidates: copies that appeared since the last completed scan (only worth
+    # looking for when something vanished: on a first scan that is every file of the node).
     pool: dict[tuple[str, int], _Candidates] = {}
-    for r in conn.execute(
+    for r in () if not vanished else conn.execute(
         "SELECT f.vpath, c.file_id, c.hash, c.size FROM copies c JOIN vfiles f"
         " ON f.id = c.file_id WHERE c.node_id = ? AND c.first_scan > ? AND c.state = 'present'",
         (node_id, node["last_scan_id"] or 0),

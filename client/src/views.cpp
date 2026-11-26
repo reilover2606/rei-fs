@@ -26,11 +26,6 @@ constexpr int kDetailWidth = 56;
 
 bool key(const Event& e, const char* c) { return e.is_character() && e.character() == c; }
 
-std::string strip_offline(const std::string& name) {
-  auto pos = name.find(" (offline)");
-  return pos == std::string::npos ? name : name.substr(0, pos);
-}
-
 constexpr int kLabelWidth = 16;
 
 // Hard-wrap text without spaces (paths) into lines of at most `width` columns.
@@ -830,7 +825,7 @@ class TreeView : public View {
   std::string help() const override {
     return "Enter/→: open  ←: up  t/T: tag  c: copy  m: move to a node  x: pick up  p: put here  f: fetch  S: schedule sync  "
            "v: move to...  n: rename  d: new dir  D: remove empty dir  u: update priority  "
-           "z: pack/unpack  Z: drop archive  V: several versions ok  /: filter this folder  r: refresh";
+           "z: pack/unpack  Z: drop archive  V: several versions ok  O: opaque  /: filter this folder  r: refresh";
   }
   void on_poll() override {
     // After a virtual move the renames run in the background: follow them.
@@ -926,6 +921,9 @@ class TreeView : public View {
       if (e.value("in_archive", false) && !e.value("dir", false))
         labels_.push_back(mark + fit(e.value("name", ""), 40) + " " +
                           fit(human_size(e.value("size", std::int64_t{0})), 10) + " in archive");
+      else if (e.value("opaque", false))
+        labels_.push_back(mark + fit("◌ " + e.value("name", "") + "/", 34) + " " +
+                          fit(std::to_string(e.value("files", 0)) + " files", 11) + " [opaque]");
       else if (e.value("packed", false))
         labels_.push_back(mark + fit("▣ " + e.value("name", "") + "/", 34) + " " +
                           fit(std::to_string(e.value("files", 0)) + " files", 11) + " [packed]");
@@ -977,6 +975,24 @@ class TreeView : public View {
                       text("inside the packed directory " + inside_),
                       text(""), text("read-only: it is listed from the archive's contents") | dim,
                       text("go up to the packed directory: z unpacks it") | dim});
+      return;
+    }
+    if (e->value("opaque", false)) {
+      std::string dir = child_path(e->value("name", ""));
+      Element head = vbox({hard_wrap(dir + "/", kDetailWidth - 1) | bold,
+                           text("opaque: ONE row stands for the whole directory"),
+                           text(std::to_string(e->value("files", 0)) + " file(s) inside, not indexed one by one"),
+                           text("c/m/f/t/n act on all of it; 'deep search' lists its names") | dim,
+                           text("O: index it file by file again") | dim, separator()});
+      detail_ = head;
+      ctx_.run(
+          false, [dir](Api& a) { return a.get("/api/file?path=" + url_encode(dir)); },
+          [this, dir, head](json f) {
+            const json* cur = current();
+            if (!cur || child_path(cur->value("name", "")) != dir) return;
+            detail_ = vbox({head, file_details(f)});
+          },
+          "tree-detail");
       return;
     }
     if (e->value("packed", false)) {
@@ -1037,6 +1053,10 @@ class TreeView : public View {
   void enter() {
     const json* e = current();
     if (!e || !e->value("dir", false)) return;
+    if (e->value("opaque", false)) {
+      ctx_.notify(e->value("name", "") + " is opaque: one row for all of it (c/m/f act on the whole directory; 'deep search' lists its names)");
+      return;
+    }
     path_ = child_path(e->value("name", ""));
     filter_.clear();
     all_entries_ = json::array();
@@ -1076,7 +1096,7 @@ class TreeView : public View {
       return true;
     }
     if (!inside_.empty()) {   // what is listed from an archive cannot be acted on
-      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z", "V"})
+      for (const char* k : {"t", "T", "c", "m", "f", "x", "n", "v", "S", "D", "d", "u", "p", "z", "Z", "V", "O"})
         if (key(e, k)) {
           ctx_.notify("inside the packed directory " + inside_ +
                       ": read-only (go up to it; z there unpacks it)");
@@ -1144,6 +1164,26 @@ class TreeView : public View {
     if (key(e, "x")) {   // pick up / put down this item
       if (!picked_.erase(target)) picked_.insert(target);
       rebuild_labels();
+      return true;
+    }
+    if (key(e, "O") && dir) {   // opaque: the scanner does not look inside
+      ctx_.dialogs->ask_choice(
+          "Opaque setting of " + target + ":\n"
+          "an opaque directory is ONE row of the index for the whole of it (the number of files is "
+          "kept on the side): copying, backing up, moving or tagging it applies to all of it, but "
+          "no file inside has a row, a hash or a decision. It is the way to keep a directory of "
+          "millions of small files light. The files indexed below it now are replaced by the "
+          "row. 'Deep search' still lists the names inside, read from the disks.",
+          {"opaque: one row for the whole directory", "indexed as usual (the default)",
+           "inherit from the parent"},
+          [this, target](int i) {
+            json value = i == 2 ? json(nullptr) : json(i == 0);
+            ctx_.send("/api/opaque", {{"path", target}, {"opaque", value}}, [this, target](json out) {
+              ctx_.notify(target + ": " + (out.value("opaque", false) ? "opaque" : "indexed") +
+                          (out.value("inherited", false) ? " (inherited)" : ""));
+              refresh();
+            });
+          });
       return true;
     }
     if (key(e, "V")) {   // tolerate several versions of this file or everything below this folder
@@ -1305,7 +1345,7 @@ class SearchView : public View {
     tag_input_ = Input(&tag_, "tag", opt);
     auto issues = Checkbox("non-portable", &issues_);
     auto under = Checkbox("under-replicated", &under_);
-    auto deep = Checkbox("deep search (inside packed dirs)", &deep_);
+    auto deep = Checkbox("deep search (packed and opaque dirs)", &deep_);
     auto button = Button("Search", [this] { search(); }, ButtonOption::Ascii());
     MenuOption mopt = MenuOption::Vertical();
     mopt.on_change = [this] { load_detail(); };
@@ -1336,6 +1376,9 @@ class SearchView : public View {
                   (members_.empty() ? ""
                                     : ", " + std::to_string(members_.size()) +
                                           (members_truncated_ ? "+" : "") + " inside packed dirs") +
+                  (opaque_.empty() ? ""
+                                   : ", " + std::to_string(opaque_.size()) + (opaque_partial_ ? "+" : "") +
+                                         " names in opaque dirs") +
                   (truncated_ ? " (first 1000 shown)" : "");
       }
       return vbox({form_el, hint_->Render(),
@@ -1378,13 +1421,18 @@ class SearchView : public View {
     int i = selected_ - ndirs() - static_cast<int>(results_.size());
     return i >= 0 && i < static_cast<int>(members_.size()) ? &members_[i] : nullptr;
   }
+  const json* current_opaque() const {
+    int i = selected_ - ndirs() - static_cast<int>(results_.size()) - static_cast<int>(members_.size());
+    return i >= 0 && i < static_cast<int>(opaque_.size()) ? &opaque_[i] : nullptr;
+  }
   // Path of the selected row (folder or file); "" if there is none.
   std::string current_path() const {
     if (on_dir()) return dirs_[selected_].value("path", "");
     const json* f = current_file();
     if (f) return f->value("path", "");
-    const json* m = current_member();
-    return m ? m->value("vpath", "") : "";
+    if (const json* m = current_member()) return m->value("vpath", "");
+    const json* o = current_opaque();
+    return o ? o->value("vpath", "") : "";
   }
 
   // Only while this tab is the one on screen: taking the focus of a hidden
@@ -1413,6 +1461,8 @@ class SearchView : public View {
       dirs_total_ = out.value("dirs_total", 0);
       members_ = out.value("members", json::array());
       members_truncated_ = out.value("members_truncated", false);
+      opaque_ = out.value("opaque_names", json::array());
+      opaque_partial_ = out.value("opaque_partial", false);
       truncated_ = out.value("truncated", false) || dirs_total_ > ndirs();
       labels_.clear();
       for (const auto& d : dirs_)
@@ -1426,6 +1476,10 @@ class SearchView : public View {
       for (const auto& m : members_)
         labels_.push_back("▣ " + fit(m.value("vpath", ""), 60) + " " +
                           human_size(m.value("size", std::int64_t{0})));
+      for (const auto& o : opaque_)
+        labels_.push_back("◌ " + fit(o.value("vpath", "") + (o.value("dir", false) ? "/" : ""), 60) +
+                          " " + o.value("node", "") +
+                          (o.contains("server") ? "  @" + o.value("server", "") : ""));
       selected_ = std::min(selected_, std::max(0, static_cast<int>(labels_.size()) - 1));
       load_detail();
       if (from_user && typing()) leave_inputs();
@@ -1451,6 +1505,14 @@ class SearchView : public View {
                       text("z (in the Tree): unpack it") | dim});
       return;
     }
+    if (const json* o = current_opaque()) {
+      detail_ = vbox({hard_wrap(o->value("vpath", ""), kDetailWidth - 1) | bold, separator(),
+                      text("inside the opaque directory " + o->value("opaque", "")),
+                      text("on node " + o->value("node", "") + " (read from the disk just now)"),
+                      text("only the name is known: nothing there is indexed"), text(""),
+                      text("Enter: show the opaque directory in the Tree") | dim});
+      return;
+    }
     const json* cur = current_file();
     if (!cur) {
       detail_ = text("");
@@ -1471,6 +1533,13 @@ class SearchView : public View {
   void show_in_tree() {
     std::string path = current_path();
     if (path.empty()) return;
+    if (const json* o = current_opaque()) {   // the opaque directory it is in
+      std::string dir = o->value("opaque", "");
+      auto cut = dir.rfind('/');
+      ctx_.show_in_tree(cut == 0 || cut == std::string::npos ? "/" : dir.substr(0, cut),
+                        dir.substr(cut + 1));
+      return;
+    }
     if (const json* m = current_member()) {   // the packed directory it is in
       std::string dir = m->value("archive", "");
       auto cut = dir.rfind('/');
@@ -1506,8 +1575,8 @@ class SearchView : public View {
     if (!menu_->Focused() || labels_.empty()) return false;
     std::string path = current_path();
     if (path.empty()) return false;
-    if (current_member() && (key(e, "t") || key(e, "T") || key(e, "c") || key(e, "m") ||
-                             key(e, "f"))) {
+    if ((current_member() || current_opaque()) &&
+        (key(e, "t") || key(e, "T") || key(e, "c") || key(e, "m") || key(e, "f"))) {
       ctx_.error("this file is inside a packed directory: act on the directory (Enter shows it "
                  "in the Tree), or unpack it");
       return true;
@@ -1550,6 +1619,8 @@ class SearchView : public View {
   bool members_truncated_ = false;
   int total_ = 0, dirs_total_ = 0;
   json members_ = json::array();   // deep search: files inside packed directories
+  json opaque_ = json::array();    // deep search: names inside opaque directories
+  bool opaque_partial_ = false;
   json results_ = json::array();
   json dirs_ = json::array();
   std::vector<std::string> labels_;
@@ -2121,7 +2192,7 @@ class NodesView : public View {
   Component component() override { return root_; }
   std::string help() const override {
     return "Space: choose  s: scan the chosen (or this) node  S: scan all  w: new files only  v: verify  c: check completeness  m: move root  n: add drive  "
-           "R: rename  p: priority  t: backup target  B: backup first  M: mirrored drive  X: remove  o: adopt";
+           "R: rename  p: priority  t: backup target  B: backup first  M: mirrored drive  Z: reset  X: remove  o: adopt";
   }
 
   void refresh() override {
@@ -2389,7 +2460,7 @@ class NodesView : public View {
     // Scanning keys also work on a server's row (all the nodes it owns); the rest need one node.
     if (name.empty() && !(key(e, " ") || key(e, "s") || key(e, "w") || key(e, "v"))) {
       if (key(e, "R") || key(e, "c") || key(e, "m") || key(e, "p") || key(e, "t") ||
-          key(e, "X") || key(e, "B") || key(e, "M")) {
+          key(e, "X") || key(e, "B") || key(e, "M") || key(e, "Z")) {
         ctx_.error("select a node (a branch), not a server");
         return true;
       }
@@ -2523,6 +2594,20 @@ class NodesView : public View {
                                ctx_.send("/api/nodes/" + url_encode(name), {{"priority", n}},
                                          [this](json) { refresh(); });
                              });
+      return true;
+    }
+    if (key(e, "Z")) {   // start the node over
+      ctx_.dialogs->confirm(
+          "Reset the node " + name + "?\nThe index forgets everything it knows of this node, "
+          "WITHOUT raising a decision for any file that is gone, and the node is scanned again "
+          "from scratch (every file is read). Its files are not touched. Use it after a big "
+          "deletion. The job is in the Jobs tab and can be cancelled there.",
+          [this, name] {
+            ctx_.send("/api/nodes/" + url_encode(name) + "/reset", json::object(), [this, name](json out) {
+              ctx_.notify("resetting " + name + ": job #" + std::to_string(out.value("job_id", 0)) +
+                          " in the Jobs tab");
+            });
+          });
       return true;
     }
     if (key(e, "X")) {   // take the node out of the index (nothing on its drive is touched)

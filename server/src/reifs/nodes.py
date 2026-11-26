@@ -192,6 +192,59 @@ def _delete_in_pieces(conn: sqlite3.Connection, table: str, key: str, where: str
             return
 
 
+def forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=None) -> int:
+    """Forget every copy a node has in the index, TX_ROWS per transaction, with the change-log
+    pointers to them, the decisions and proposals about the node, and the files no other node
+    holds. The node itself, its jobs and its schedules stay."""
+    from .control import check
+
+    forgotten = 0
+    while True:
+        check(stop)
+        fids = [r[0] for r in conn.execute(
+            "SELECT file_id FROM copies WHERE node_id = ? LIMIT ?", (node_id, TX_ROWS))]
+        if not fids:
+            break
+        marks = ",".join("?" * len(fids))
+        with db.transaction(conn, "forgetting the copies of a node"):
+            conn.execute(f"DELETE FROM copies WHERE node_id = ? AND file_id IN ({marks})",
+                         (node_id, *fids))
+            conn.execute(f"DELETE FROM collection_stats WHERE node_id = ? AND file_id IN ({marks})",
+                         (node_id, *fids))
+            conn.execute(f"DELETE FROM changes WHERE ref_node = ? AND ref_file IN ({marks})",
+                         (node_id, *fids))
+            for fid in fids:
+                index.drop_file_if_orphan(conn, fid)
+        forgotten += len(fids)
+        if say:
+            say(f"forgetting what the index knew of the node: {forgotten:,} copies")
+    for table, key, where in (("decisions", "id", "node_id = ?"),
+                              ("wanted", "id", "src_node = ? OR dst_node = ?"),
+                              ("changes", "seq", "ref_node = ?")):
+        check(stop)
+        _delete_in_pieces(conn, table, key, where, (node_id,) * where.count("?"))
+    return forgotten
+
+
+def reset_node(conn: sqlite3.Connection, node: str, say=None, stop=None) -> int:
+    """Start a node of this server over: the index forgets all it knew of the node, with no
+    decisions about what is gone, and announces that to the other servers. The files are not
+    touched; a scan then indexes the node from scratch."""
+    row = get_node(conn, node)
+    me = self_id(conn)
+    if row["owner_id"] != me:
+        raise NodeError(f"node {row['name']!r} belongs to another server; reset it there")
+    with db.transaction(conn, "resetting a node"):
+        index.append_change(conn, "node", {"id": row["id"], "name": row["name"],
+                                           "owner_id": me, "reset": True})
+        conn.execute("UPDATE nodes SET last_scan = NULL, last_scan_id = NULL WHERE id = ?",
+                     (row["id"],))
+        conn.execute("DELETE FROM scan_state WHERE node_id = ?", (row["id"],))
+    n = forget_copies_of(conn, row["id"], say, stop)
+    db.reclaim(conn)
+    return n
+
+
 def delete_rows(conn: sqlite3.Connection, node_id: str) -> int:
     """Forget a node in the database: its copies, decisions, proposals, jobs, schedules and
     the change-log pointers to it go, and files that no node holds any more with them.

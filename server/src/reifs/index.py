@@ -267,6 +267,7 @@ def forget_copy(conn: sqlite3.Connection, fid: int, node_id: str) -> None:
     """Stop tracking a copy (it is physically gone or no longer wanted)."""
     vpath = vpath_of(conn, fid)
     conn.execute("DELETE FROM copies WHERE file_id = ? AND node_id = ?", (fid, node_id))
+    conn.execute("DELETE FROM collection_stats WHERE file_id = ? AND node_id = ?", (fid, node_id))
     conn.execute("DELETE FROM changes WHERE ref_node = ? AND ref_file = ?", (node_id, fid))
     log_change(conn, node_id, vpath, "remove")
     obsolete_decisions(conn, fid, ("missing",), node_id)

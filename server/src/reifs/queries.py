@@ -8,7 +8,7 @@ import time
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import archives, index, paths, tolerance, vdirs
+from . import archives, collections_, index, opaque, paths, tolerance, vdirs
 from .tags import tags_of
 
 DEFAULT_COPIES = 2
@@ -58,6 +58,7 @@ class FileInfo:
     copies: list[CopyInfo] = field(default_factory=list)
     goal: int = DEFAULT_COPIES
     tolerant: bool = False   # several versions are fine: every present copy is current
+    files: int | None = None  # an opaque directory (one row): how many files it holds
 
     @property
     def good_copies(self) -> int:
@@ -77,7 +78,8 @@ def file_info(conn: sqlite3.Connection, fid: int,
     version = index.current_version(conn, fid)
     file_tags = tags_of(conn, fid)
     info = FileInfo(fid, f["vpath"], paths.decode_issues(f["issues"]), file_tags,
-                    goal=policy.goal(file_tags), tolerant=tolerance.is_tolerant(conn, f["vpath"]))
+                    goal=policy.goal(file_tags), tolerant=tolerance.is_tolerant(conn, f["vpath"]),
+                    files=collections_.file_count(conn, fid))
     for c in conn.execute(
         "SELECT c.*, n.name, n.online, n.mirrored FROM copies c JOIN nodes n ON n.id = c.node_id"
         " WHERE c.file_id = ? ORDER BY n.name",
@@ -108,6 +110,7 @@ class DirEntry:
     here: int = 0              # of them, files with a copy on this server's own node
     packed: dict | None = None  # a packed directory: {"archive": vpath, "bytes": n, "file_id": id}
     member_size: int | None = None   # inside a packed directory: a file's size (read-only entry)
+    opaque: bool = False       # a directory the scanner does not look into
 
 
 class Entries(list):
@@ -136,6 +139,13 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
         outer = archives.packed_dir_of(conn, vdir)
         if outer:
             return _list_archive(conn, outer, vdir)
+    if vdir != "/":
+        inside = opaque.source(conn, vdir)
+        if inside[0] and inside[1] == vdir:
+            return Entries()              # an opaque directory is one entry: nothing is indexed in it
+        if inside[0]:
+            return None
+    opaque_here = {d for d in opaque.roots(conn) if paths.parent(d) == vdir}
     packed_here = {r["dir_path"]: r for r in conn.execute(
         "SELECT dir_path, files, bytes, file_id FROM archives WHERE present = 1")
         if paths.parent(r["dir_path"]) == vdir}
@@ -174,7 +184,17 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     if not dirs and not files and not packed_here and vdir != "/" \
             and not vdirs.under(conn, vdir):
         return None
-    out = Entries(DirEntry(name, True, n, here=h) for name, (n, h) in sorted(dirs.items()))
+    for d in opaque_here:               # an opaque directory: one row, shown as a folder
+        ofid = index.file_id(conn, d)
+        n = (collections_.file_count(conn, ofid) or 0) if ofid is not None else 0
+        mine = ofid is not None and conn.execute(
+            "SELECT 1 FROM copies WHERE file_id = ? AND state = 'present' AND node_id IN"
+            " (SELECT id FROM nodes WHERE owner_id = ?)", (ofid, me)).fetchone() is not None
+        dirs[paths.basename(d)] = (n, n if mine else 0)
+    files = [(fid, name) for fid, name in files
+             if paths.join(vdir, name) not in opaque_here]   # its row is the folder above
+    out = Entries(DirEntry(name, True, n, here=h, opaque=paths.join(vdir, name) in opaque_here)
+                  for name, (n, h) in sorted(dirs.items()))
     for dpath, r in sorted(packed_here.items()):
         mine = conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id IN"
                             " (SELECT id FROM nodes WHERE owner_id = ?) AND state = 'present'",

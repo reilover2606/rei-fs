@@ -548,3 +548,34 @@ def test_an_app_token_reaches_the_app_endpoints_and_nothing_else(server):
     client.post("/api/apps/remove", {"name": "demo"})
     client.token = token
     client.get("/api/app/info", expect=401)                  # the token died with the registration
+
+
+def test_opaque_directories_and_reset_over_the_api(server):
+    import time as _t
+    env, client, _ = server
+    login(client)
+    out = client.post("/api/opaque", {"path": "/docs", "opaque": True})
+    assert out["opaque"] and not out["inherited"]
+    end = _t.time() + 20
+    while _t.time() < end:                       # the worker forgets what was indexed below it
+        if env.conn.execute("SELECT COUNT(*) FROM files f JOIN dirs d ON d.id = f.dir_id"
+                            " WHERE d.path = '/docs'").fetchone()[0] == 0:
+            break
+        _t.sleep(0.2)
+    entries = {e["name"]: e for e in client.get("/api/tree?path=/")["entries"]}
+    assert entries["docs"]["opaque"] and entries["docs"]["dir"]
+    assert client.get("/api/find?q=a.txt")["total"] == 0
+    found = client.get("/api/find?q=a.txt&deep=1")
+    assert [n["vpath"] for n in found["opaque_names"]] == ["/docs/a.txt"]
+    client.post("/api/opaque", {"path": "/top.txt", "opaque": True}, expect=400)       # a file
+    # reset: a scan job that forgets the node first
+    jid = client.post("/api/nodes/srv/reset", {})["job_id"]
+    end = _t.time() + 30
+    while _t.time() < end:
+        if env.conn.execute("SELECT status FROM jobs WHERE id = ?", (jid,)).fetchone()[0] == "done":
+            break
+        _t.sleep(0.2)
+    assert env.conn.execute("SELECT status FROM jobs WHERE id = ?", (jid,)).fetchone()[0] == "done"
+    assert env.conn.execute("SELECT COUNT(*) FROM files f JOIN dirs d ON d.id = f.dir_id"
+                            " WHERE d.path = '/docs'").fetchone()[0] == 0          # still opaque
+    assert client.get("/api/file?path=/top.txt")["size"] == 3                       # indexed again

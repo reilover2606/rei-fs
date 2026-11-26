@@ -745,6 +745,53 @@ be atomic in WAL mode, and the gain is for writers that, with the queue, already
 second. It is the next step if `lock_stats` still shows the small writers waiting behind the index
 under real load.
 
+### 5.22 Resetting a node, and opaque directories
+
+**Reset node** (Nodes tab `Z`; `reifs node reset NAME`). After a big deletion the usual way takes
+long three times over: a scan that finds a million files gone, a million decisions raised, and as
+many to answer. A reset skips it: the index forgets everything it knows of the node, in pieces of
+500 rows per transaction, and **no decision is raised** for what is gone (`nodes.reset_node`); the
+decisions and proposals about the node go, the node and its settings stay. The other servers are
+told (a `node` entry with `reset`) and drop their copies of it too. Then the node is scanned from
+scratch. It is a scan job (`params.reset`) in the Jobs tab and can be cancelled there: a
+cancelled reset leaves a node that is partly forgotten, which the next scan simply fills in. The
+files are not touched. A scan only builds its rename candidates when something vanished, so a first
+scan does not load every copy of the node.
+
+**Opaque** (Tree `O`; `reifs opaque PATH yes|no|inherit`; the `opaque` table, replicated like the
+directory priorities). An opaque directory is **one row of the index for the whole directory**
+(`collections_.py`): one `files` row at the directory's own path and one `copies` row per node that
+holds it, as if the directory were a single big file. No file inside has a row, a hash or a
+decision, which is what makes a directory of millions of small files cheap (the packer is limited
+to 200,000 members). Everything that works on files works on the directory as a whole: copying and
+backing it up, moving and renaming it (its setting moves with it), versions, tags, schedules,
+"synchronous", fetching, marking for deletion (the user deletes it, as with any file).
+
+* **What stands in for a file's size, time and hash:** the total size of the files inside; the newest
+  modification time inside; and a *fingerprint* of the whole tree: names, sizes and modification times
+  (to two seconds, which FAT keeps), each read with a `stat`, no file opened, the entries combined
+  in an order-independent way (constant memory). A scan reads it, walking the directory, and writes
+  anything only when the fingerprint changed.
+* **How many files** it holds is not in the schema of files (nearly every row there is one file): it is
+  in `collection_stats(file_id, node_id, files, bytes)`, per node, and shows as the number of files
+  of the folder entry in the tree.
+* **Transfers** copy the directory with `rsync --recursive` and check the fingerprint of the result.
+  Replacing an older copy (overwrite, with the old content still the one judged stale) uses
+  `--delete` inside that directory only, so the older copy becomes equal to the new one; a plain
+  copy never deletes. A directory renamed on a node is renamed whole.
+* The setting is inherited, and the outermost opaque directory counts (inside one nothing is looked at).
+* Setting it replaces what was indexed below it by the one row: a worker task
+  (`opaque.forget_indexed`, 500 files per transaction, no removal logged per file) on the server that
+  set it and on every server that learns the setting, then the next scan makes the row. Turning it off
+  drops the row and the files are scanned one by one again.
+* **Deep search** also reads the disks: for each opaque directory it walks the folder on each of this
+  server's online nodes that has it, and on the paired servers (`/api/peer/opaque-search`), and returns
+  the names (files and folders) that match, up to 1,000 or 20 seconds, saying when it stopped early.
+  Only names: nothing about those files is known. Results show with the opaque directory they are in.
+* Limits: the fingerprint costs a `stat` per file at every scan of the directory (give it a lazy update
+  priority), and two nodes whose file systems keep modification times differently (FAT against
+  NTFS) can see slightly different fingerprints of the same files.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies
