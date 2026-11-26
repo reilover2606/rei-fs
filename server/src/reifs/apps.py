@@ -129,14 +129,19 @@ def new_token() -> str:
 
 
 def register(conn: sqlite3.Connection, cfg: Config, name: str, mode: str,
-             node: str | None = None) -> tuple[dict, str]:
-    """Register an application (a token is returned: it is not kept anywhere in clear)."""
+             node: str | None = None, path: str | None = None) -> tuple[dict, str]:
+    """Register an application (a token is returned: it is not kept anywhere in clear).
+
+    A *storage* application gets ``/apps/<name>``. An *instance* uses its own directory, wherever
+    it sits in the node: ``path`` is that directory as the virtual tree names it (its place
+    relative to the node's folder), and every instance of the application must be at the same
+    path, since that is what makes them the same files."""
     if not NAME_RE.match(name or ""):
         raise AppError("the name is letters, digits, '.', '_' and '-' (at most 64)")
     if mode not in MODES:
         raise AppError(f"mode must be one of: {', '.join(MODES)}")
     target = _pick_node(conn, cfg, node)
-    existing = conn.execute("SELECT mode, node_id FROM apps WHERE name = ? AND present = 1",
+    existing = conn.execute("SELECT mode, node_id, vpath FROM apps WHERE name = ? AND present = 1",
                             (name,)).fetchall()
     if any(r["mode"] != mode for r in existing):
         raise AppError(f"{name!r} is registered as a {existing[0]['mode']} application")
@@ -145,7 +150,7 @@ def register(conn: sqlite3.Connection, cfg: Config, name: str, mode: str,
     if any(r["node_id"] == target["id"] for r in existing):
         raise AppError(f"{name!r} is already registered on {target['name']}")
     root = {loc.node_id: loc.root for loc in nodes.discover(conn, cfg).online}[target["id"]]
-    vdir = vpath_of_app(name)
+    vdir = _directory_of(conn, name, mode, path, existing)
     paths.to_physical(root, vdir).mkdir(parents=True, exist_ok=True)
     token = new_token()
     ts, me = db.now(), index.self_id(conn)
@@ -165,6 +170,49 @@ def register(conn: sqlite3.Connection, cfg: Config, name: str, mode: str,
             priority.set_priority(conn, vdir, priority.FREQUENT)
     info = describe(conn, cfg, get(conn, name, target["name"]))
     return info, token
+
+
+def _directory_of(conn: sqlite3.Connection, name: str, mode: str, path: str | None,
+                  existing: list) -> str:
+    if mode == "storage":
+        return vpath_of_app(name)
+    if path:
+        try:
+            vdir = paths.normalize(path)
+        except paths.VPathError as e:
+            raise AppError(str(e)) from None
+    elif existing:
+        vdir = existing[0]["vpath"]
+    else:
+        raise AppError("an instance application lives in its own directory: give its path "
+                       "(where it sits in the node, e.g. /home/me/.config/myapp)")
+    if vdir == "/":
+        raise AppError("the whole node cannot be an application's directory")
+    if existing and any(r["vpath"] != vdir for r in existing):
+        raise AppError(f"the other instances of {name!r} are at {existing[0]['vpath']}: all of "
+                       "them use the same path (that is what makes them the same files)")
+    for r in conn.execute("SELECT name, vpath FROM apps WHERE present = 1 AND name != ?", (name,)):
+        if vdir == r["vpath"] or vdir.startswith(r["vpath"] + "/") or r["vpath"].startswith(vdir + "/"):
+            raise AppError(f"{vdir} overlaps the directory of {r['name']!r} ({r['vpath']})")
+    return vdir
+
+
+def dirs_by_parent(conn: sqlite3.Connection, vdir: str) -> dict[str, tuple[str, str]]:
+    """The directories directly below ``vdir`` that are an application's: path -> (name, mode)."""
+    return {r["vpath"]: (r["name"], r["mode"]) for r in conn.execute(
+        "SELECT name, mode, vpath FROM apps WHERE present = 1")
+        if paths.parent(r["vpath"]) == vdir}
+
+
+def heads_below(conn: sqlite3.Connection, vdir: str) -> set[str]:
+    """The folders directly below ``vdir`` that lead to an application's directory (so that
+    a directory deep in a node can be reached in the tree while nothing in it is indexed)."""
+    lo = vdir.rstrip("/") + "/"
+    out = set()
+    for (v,) in conn.execute("SELECT vpath FROM apps WHERE present = 1").fetchall():
+        if v.startswith(lo) and paths.parent(v) != vdir:
+            out.add(lo + v[len(lo):].split("/", 1)[0])
+    return out
 
 
 def describe(conn: sqlite3.Connection, cfg: Config, row: sqlite3.Row) -> dict:

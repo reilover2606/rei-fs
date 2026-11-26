@@ -103,32 +103,32 @@ def test_symlinks_cannot_lead_out(env, tmp_path):
 
 def test_instances_of_one_app_are_kept_the_same_on_every_node(env):
     env.add_node("ssd")
-    apps.register(env.conn, env.cfg, "shared", "instance", "srv")
+    apps.register(env.conn, env.cfg, "shared", "instance", "srv", path="/work/shared")
     acc1 = access(env, "shared") if False else apps.Access(env.conn, env.cfg,
                                                            apps.get(env.conn, "shared", "srv"))
     acc1.write("settings.json", b64("{\"v\": 1}"))
     # the second instance is registered later, on an empty node
-    apps.register(env.conn, env.cfg, "shared", "instance", "ssd")
-    assert priority.Prefs(priority.load(env.conn)).effective("/apps/shared") == priority.SYNCHRONOUS
+    apps.register(env.conn, env.cfg, "shared", "instance", "ssd")      # same path: it is the same app
+    assert priority.Prefs(priority.load(env.conn)).effective("/work/shared") == priority.SYNCHRONOUS
     assert synchronous.run(env.conn, env.cfg, full=True) == 1
     runner.run_jobs(env.conn, env.cfg)
-    assert (env.tmp / "ssd" / "apps" / "shared" / "settings.json").read_text() == "{\"v\": 1}"
+    assert (env.tmp / "ssd" / "work" / "shared" / "settings.json").read_text() == "{\"v\": 1}"
     # a change on the other instance travels back
     acc2 = apps.Access(env.conn, env.cfg, apps.get(env.conn, "shared", "ssd"))
     import os
     acc2.write("settings.json", b64("{\"v\": 2}"))
-    os.utime(env.tmp / "ssd" / "apps" / "shared" / "settings.json", (4_000_000_000, 4_000_000_000))
+    os.utime(env.tmp / "ssd" / "work" / "shared" / "settings.json", (4_000_000_000, 4_000_000_000))
     env.scan()
     synchronous.run(env.conn, env.cfg, full=True)
     runner.run_jobs(env.conn, env.cfg)
-    assert (env.root / "apps" / "shared" / "settings.json").read_text() == "{\"v\": 2}"
+    assert (env.root / "work" / "shared" / "settings.json").read_text() == "{\"v\": 2}"
     with pytest.raises(apps.AppError, match="several nodes"):
         apps.get(env.conn, "shared")
 
 
 def test_registrations_are_announced_to_other_servers_without_the_token(env, tmp_path):
     env.add_node("ssd")
-    apps.register(env.conn, env.cfg, "shared", "instance", "ssd")
+    apps.register(env.conn, env.cfg, "shared", "instance", "ssd", path="/work/shared")
     sent = [c for c in sync.export_changes(env.conn, 0)["changes"] if c["kind"] == "app"]
     assert sent and "token" not in str(sent) and sent[0]["data"]["mode"] == "instance"
     other = db.create(tmp_path / "o.db")
@@ -144,3 +144,42 @@ def test_registrations_are_announced_to_other_servers_without_the_token(env, tmp
                if c["kind"] == "app" and not c["data"]["present"]]
     sync.apply_changes(other, [dict(c, ts=db.to_iso(db.now())) for c in removal])
     assert other.execute("SELECT present FROM apps").fetchone()[0] == 0
+
+
+def test_an_instance_uses_its_own_directory_anywhere_in_the_node(env):
+    _, ssd = env.add_node("ssd")
+    write(env.root / "home" / "me" / ".config" / "myapp" / "prefs.ini", "a=1", mtime=1_000_000)
+    with pytest.raises(apps.AppError, match="give its path"):
+        apps.register(env.conn, env.cfg, "myapp", "instance", "srv")
+    info, _ = apps.register(env.conn, env.cfg, "myapp", "instance", "srv", path="/home/me/.config/myapp")
+    assert info["dir"] == "/home/me/.config/myapp"
+    assert (env.root / "home" / "me" / ".config" / "myapp" / "prefs.ini").exists()      # its own files
+    assert not (env.root / "apps").exists()                                           # not under apps/
+    info2, _ = apps.register(env.conn, env.cfg, "myapp", "instance", "ssd")           # same path is taken
+    assert info2["dir"] == "/home/me/.config/myapp"
+    assert (ssd / "home" / "me" / ".config" / "myapp").is_dir()
+    assert priority.Prefs(priority.load(env.conn)).effective("/home/me/.config/myapp") == priority.SYNCHRONOUS
+
+
+def test_the_instances_of_an_app_must_share_one_path_and_apps_may_not_overlap(env):
+    env.add_node("ssd")
+    env.add_node("usb")
+    apps.register(env.conn, env.cfg, "a", "instance", "srv", path="/data/a")
+    with pytest.raises(apps.AppError, match="same path"):
+        apps.register(env.conn, env.cfg, "a", "instance", "ssd", path="/elsewhere/a")
+    with pytest.raises(apps.AppError, match="overlaps"):
+        apps.register(env.conn, env.cfg, "b", "instance", "usb", path="/data/a/sub")
+    with pytest.raises(apps.AppError, match="overlaps"):
+        apps.register(env.conn, env.cfg, "c", "instance", "usb", path="/data")
+    with pytest.raises(apps.AppError, match="whole node"):
+        apps.register(env.conn, env.cfg, "d", "instance", "usb", path="/")
+
+
+def test_an_applications_directory_is_marked_in_the_tree_even_while_empty(env):
+    env.add_node("ssd")
+    apps.register(env.conn, env.cfg, "notes", "storage", "ssd")
+    apps.register(env.conn, env.cfg, "sync", "instance", "srv", path="/deep/in/the/node/sync")
+    top = {e.name: e for e in queries.list_dir(env.conn, "/")}
+    assert top["apps"].app is None                                     # the folder of storage apps: no marker
+    assert [(e.name, e.app) for e in queries.list_dir(env.conn, "/apps")] == [("notes", ("notes", "storage"))]
+    assert [(e.name, e.app) for e in queries.list_dir(env.conn, "/deep/in/the/node")] == [("sync", ("sync", "instance"))]

@@ -530,6 +530,13 @@ def test_an_app_token_reaches_the_app_endpoints_and_nothing_else(server):
     out = client.post("/api/apps", {"name": "demo", "mode": "storage", "node": "ssd"})
     token = out["token"]
     assert out["dir"] == "/apps/demo" and any(a["name"] == "demo" for a in client.get("/api/apps")["apps"])
+    marked = client.get("/api/tree?path=/apps")["entries"]                  # marked in the tree
+    assert [(e["name"], e["app"]) for e in marked] == [("demo", {"name": "demo", "mode": "storage"})]
+    inst = client.post("/api/apps", {"name": "mine", "mode": "instance", "node": "ssd",
+                                     "path": "/deep/inside/mine"})
+    assert inst["dir"] == "/deep/inside/mine"
+    assert client.get("/api/tree?path=/deep/inside")["entries"][0]["app"]["mode"] == "instance"
+    client.post("/api/apps", {"name": "other", "mode": "instance", "node": "ssd"}, expect=400)  # no path
     client.token = token
     info = client.get("/api/app/info")
     assert info["name"] == "demo" and info["mode"] == "storage"

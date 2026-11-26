@@ -634,9 +634,16 @@ token), so every server knows the groups.
 
 * *storage*: `/apps/<name>` on a node of this server (named, or chosen among the online ones with
   room) to fill with whatever the app wants. An ordinary directory of the tree: scanned (frequent
-  unless set otherwise), backed up, replicated.
-* *instance*: the same name registered on several nodes forms a group; `/apps/<name>` is made
-  synchronous, and a node registered while still empty receives the files at once.
+  unless set otherwise), backed up, replicated. `/apps/` is only for these.
+* *instance*: the application keeps using **its own directory, wherever it sits in the node**
+  (`--path /home/me/.config/myapp`: the place relative to the node's folder, which is also its path in
+  the virtual tree). The same name registered on several nodes forms a group, and every instance
+  must be at the same path (that is what makes them the same files; a different path is
+  refused, as is a directory that overlaps another application's). The directory is made
+  synchronous (replacing a priority set on it), and a node registered while still empty (its
+  directory is created) receives the files at once.
+* **In the tree** an application's directory carries a marker (`[app: name]`), also while nothing in
+  it is indexed yet, and the folders leading to it are listed so that it can be reached.
 
 The app may use the HTTP endpoints or, running on the node's machine, read and write the directory
 itself (its path is in `info`) and call `sync` to have it looked at now:

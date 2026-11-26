@@ -229,7 +229,7 @@ def cmd_app(args) -> None:
         if not args.name:
             raise CliError(f"usage: reifs app {act} NAME")
         if act == "add":
-            info, token = apps.register(conn, cfg, args.name, args.mode, args.node)
+            info, token = apps.register(conn, cfg, args.name, args.mode, args.node, args.path)
             print(f"Registered {info['name']!r} ({info['mode']}) on node {info['node']}.")
             print(f"  directory: {info['dir']}" + (f"   on disk: {info['path']}" if info["path"] else ""))
             if len(info["instances"]) > 1:
@@ -1241,6 +1241,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="storage: a directory to fill; instance: its files are kept the same on "
                         "every node it is registered on")
     s.add_argument("--node", help="the node (default for a new one: any online node of this server)")
+    s.add_argument("--path", help="instance: the application's own directory, as it sits in the node "
+                                  "(the same for every instance); a storage app is at /apps/NAME")
     s.set_defaults(func=cmd_app)
 
     s = sub.add_parser("archive", help="pack a directory into one squashfs archive, or unpack one")
