@@ -92,3 +92,42 @@ def test_removing_a_big_node_is_done_in_pieces(env, monkeypatch):
     assert len(seen) >= 4                                   # 10 copies, 3 at a time, and the rest
     assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert env.conn.execute("SELECT COUNT(*) FROM copies").fetchone()[0] == 0
+
+
+def test_a_big_forgetting_takes_the_hash_indexes_out_and_builds_them_again(env, monkeypatch):
+    monkeypatch.setattr(nodes, "BIG_FORGET", 5)
+    monkeypatch.setattr(nodes, "TX_ROWS", 4)
+    _, ssd = env.add_node("ssd")
+    for i in range(12):
+        write(ssd / "d" / f"f{i}.txt", str(i), mtime=1_000_000)
+    env.scan()
+    names = lambda: {r[0] for r in env.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('copies_hash', 'files_vhash')")}
+    assert names() == {"copies_hash", "files_vhash"}
+    seen = []
+    orig = db._drop_hash_indexes
+    monkeypatch.setattr(db, "_drop_hash_indexes", lambda c: (orig(c), seen.append(names())))
+    assert nodes.reset_node(env.conn, "ssd") == 12
+    assert seen == [set()]                                   # they were out while it worked
+    assert names() == {"copies_hash", "files_vhash"}         # and are back
+    assert db.get_meta(env.conn, "dropped_indexes") is None
+    assert env.conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+
+
+def test_indexes_left_out_by_a_crash_are_built_again(env):
+    with db.transaction(env.conn):
+        db.set_meta(env.conn, "dropped_indexes", __import__("json").dumps(
+            [r[0] for r in env.conn.execute("SELECT sql FROM sqlite_master WHERE name = 'copies_hash'")]))
+        env.conn.execute("DROP INDEX copies_hash")
+    assert db.repair_dropped_indexes(env.conn)
+    assert env.conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'copies_hash'").fetchone()
+    assert not db.repair_dropped_indexes(env.conn)
+
+
+def test_case_collisions_made_during_the_window_are_checked_afterwards(env):
+    with db.without_hash_indexes(env.conn):
+        with db.transaction(env.conn):
+            index.ensure_file(env.conn, "/Same.txt")
+            index.ensure_file(env.conn, "/same.txt")        # differs only in case
+            assert env.conn.execute("SELECT COUNT(*) FROM vfiles WHERE issues LIKE '%case%'").fetchone()[0] == 0
+    assert env.conn.execute("SELECT COUNT(*) FROM vfiles WHERE issues LIKE '%case%'").fetchone()[0] == 2

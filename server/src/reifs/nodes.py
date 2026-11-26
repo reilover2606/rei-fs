@@ -192,7 +192,22 @@ def _delete_in_pieces(conn: sqlite3.Connection, table: str, key: str, where: str
             return
 
 
+BIG_FORGET = 100_000     # copies from which the hash indexes are taken out of the way
+
+
 def forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=None) -> int:
+    """``_forget_copies_of``, with the indexes ordered by a hash out of the way when there are
+    many copies (on a spinning disk the difference is hours)."""
+    n = conn.execute("SELECT COUNT(*) FROM copies WHERE node_id = ?", (node_id,)).fetchone()[0]
+    if n < BIG_FORGET:
+        return _forget_copies_of(conn, node_id, say, stop)
+    if say:
+        say(f"forgetting {n:,} copies: the indexes ordered by a hash are taken out for it")
+    with db.without_hash_indexes(conn):
+        return _forget_copies_of(conn, node_id, say, stop)
+
+
+def _forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=None) -> int:
     """Forget every copy a node has in the index, TX_ROWS per transaction, with the change-log
     pointers to them, the decisions and proposals about the node, and the files no other node
     holds. The node itself, its jobs and its schedules stay."""
@@ -249,23 +264,7 @@ def delete_rows(conn: sqlite3.Connection, node_id: str) -> int:
     the change-log pointers to it go, and files that no node holds any more with them.
     Done in pieces of TX_ROWS rows (each its own transaction, unless the caller already holds
     one). Nothing is touched on any disk."""
-    forgotten = 0
-    while True:
-        fids = [r[0] for r in conn.execute(
-            "SELECT file_id FROM copies WHERE node_id = ? LIMIT ?", (node_id, TX_ROWS))]
-        if not fids:
-            break
-        marks = ",".join("?" * len(fids))
-        with db.transaction(conn, "removing a node"):
-            conn.execute(f"DELETE FROM copies WHERE node_id = ? AND file_id IN ({marks})",
-                         (node_id, *fids))
-            conn.execute(f"DELETE FROM changes WHERE ref_node = ? AND ref_file IN ({marks})",
-                         (node_id, *fids))
-            for fid in fids:
-                index.drop_file_if_orphan(conn, fid)
-        forgotten += len(fids)
-    _delete_in_pieces(conn, "decisions", "id", "node_id = ?", (node_id,))
-    _delete_in_pieces(conn, "wanted", "id", "src_node = ? OR dst_node = ?", (node_id, node_id))
+    forgotten = forget_copies_of(conn, node_id)      # copies, decisions, proposals, pointers
     _delete_in_pieces(conn, "job_items", "id", "dst_node = ?", (node_id,))
     _delete_in_pieces(conn, "changes", "seq", "ref_node = ?", (node_id,))
     with db.transaction(conn, "removing a node"):

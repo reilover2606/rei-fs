@@ -63,18 +63,29 @@ def disk(path: Path, seconds: float = 4.0) -> dict:
     return {"random_reads_per_s": iops, "sequential_mb_s": mbs}
 
 
-def sqlite_deletes(folder: Path, rows: int, cache_mb: int | None) -> dict:
-    """Insert then delete ``rows`` rows of a table shaped like ``copies`` (a key, and two indexes
-    one of them ordered by a hash), 500 per transaction, in a scratch database in ``folder``."""
+def sqlite_deletes(folder: Path, rows: int, cache_mb: int | None, drop_hash_index: bool = False) -> dict:
+    """Insert ``rows`` rows of a table shaped like ``copies`` (a key, and two indexes, one of them
+    ordered by a hash), 500 per transaction, in a scratch database in ``folder``; then, with the
+    file cache of the operating system emptied (a database bigger than memory is read from the
+    disk), delete a part of them 500 at a time. ``drop_hash_index``: without the index that is
+    ordered by the hash (what a big reset now does)."""
     path = folder / "speedtest.db"
-    for p in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
-        p.unlink(missing_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None)
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
+
+    def clean() -> None:
+        for p in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+            p.unlink(missing_ok=True)
+
+    def connect() -> sqlite3.Connection:
+        c = sqlite3.connect(path, isolation_level=None)
+        c.execute("PRAGMA journal_mode = WAL")
+        c.execute("PRAGMA synchronous = NORMAL")
         if cache_mb is not None:
-            conn.execute(f"PRAGMA cache_size = -{cache_mb * 1024}")
+            c.execute(f"PRAGMA cache_size = -{cache_mb * 1024}")
+        return c
+
+    clean()
+    conn = connect()
+    try:
         conn.executescript("""CREATE TABLE c(file_id INTEGER, node TEXT, size INTEGER, hash BLOB,
             PRIMARY KEY (file_id, node)) WITHOUT ROWID;
             CREATE INDEX c_hash ON c(hash, size); CREATE INDEX c_node ON c(node, size);""")
@@ -87,44 +98,54 @@ def sqlite_deletes(folder: Path, rows: int, cache_mb: int | None) -> dict:
             conn.execute("COMMIT")
         ins = rows / (time.monotonic() - t)
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        size = path.stat().st_size
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            _drop_cache(fd)                 # what a big database is: not in memory
+        finally:
+            os.close(fd)
+        conn = connect()
+        if drop_hash_index:
+            conn.execute("DROP INDEX c_hash")
+        part = min(rows, 20_000)
         t = time.monotonic()
-        while True:
+        done = 0
+        while done < part:
             conn.execute("BEGIN")
             n = conn.execute("DELETE FROM c WHERE file_id IN (SELECT file_id FROM c WHERE node = 'n'"
                              " LIMIT 500)").rowcount
             conn.execute("COMMIT")
+            done += n
             if n < 500:
                 break
-        dele = rows / (time.monotonic() - t)
-        return {"insert_per_s": ins, "delete_per_s": dele, "size_mb": path.stat().st_size / 1e6}
+        return {"insert_per_s": ins, "delete_per_s": done / (time.monotonic() - t),
+                "size_mb": size / 1e6}
     finally:
         conn.close()
-        for p in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
-            p.unlink(missing_ok=True)
+        clean()
 
 
 def run(db_path: Path, quick: bool = False, out=print, cache_mb: int = 128) -> None:
     folder = db_path.parent
-    out(f"Testing the disk of {folder} ({'quick' if quick else 'about a minute'})...")
+    out(f"Testing the disk of {folder} ({'quick' if quick else 'a minute or two'})...")
     d = disk(db_path, 2.0 if quick else 4.0)
-    out(f"  random 4 KiB reads: {d['random_reads_per_s']:,.0f} per second")
+    out(f"  random 4 KiB reads: {d['random_reads_per_s']:,.0f} per second"
+        f"  (a spinning disk gives 100-200 over a big file; this reads a {'database' if db_path.stat().st_size >= 256 << 20 else '256 MB scratch'} file)")
     out(f"  sequential reads:   {d['sequential_mb_s']:,.0f} MB/s")
-    rows = 40_000 if quick else 200_000
+    rows = 60_000 if quick else 300_000
     a = sqlite_deletes(folder, rows, None)
     b = sqlite_deletes(folder, rows, cache_mb)
-    out(f"  SQLite, {rows:,} rows in a table like the copies (database {a['size_mb']:.0f} MB):")
-    out(f"    default cache (2 MB):     insert {a['insert_per_s']:,.0f}/s, delete {a['delete_per_s']:,.0f}/s")
-    out(f"    {cache_mb} MB cache:           insert {b['insert_per_s']:,.0f}/s, delete {b['delete_per_s']:,.0f}/s")
+    c = sqlite_deletes(folder, rows, cache_mb, drop_hash_index=True)
+    out(f"  SQLite, {rows:,} rows in a table like the copies ({a['size_mb']:.0f} MB), deleting with the "
+        "file cache emptied:")
+    out(f"    default cache (2 MB):                  {a['delete_per_s']:>9,.0f} rows/s")
+    out(f"    {cache_mb} MB cache:                        {b['delete_per_s']:>9,.0f} rows/s")
+    out(f"    {cache_mb} MB cache, hash index dropped:    {c['delete_per_s']:>9,.0f} rows/s"
+        "   (what a big reset does now)")
     out("")
-    iops = d["random_reads_per_s"]
-    if iops < 1000:
-        out(f"Verdict: slow for this work ({iops:,.0f} random reads/s is a spinning disk or network "
-            "storage). Forgetting or changing rows of a database bigger than the cache costs a seek or "
-            "two for each: expect the speed of the 'delete' line above at best, and less on a big "
-            "database. The cache helps (see [database] cache_mb) and so does keeping the database on an "
-            "SSD (the database folder is the server's home folder).")
-    elif iops < 10000:
-        out(f"Verdict: middling ({iops:,.0f} random reads/s, a SATA SSD or a busy disk). A bigger "
-            "cache helps for databases larger than memory.")
-    else:
-        out(f"Verdict: fast ({iops:,.0f} random reads/s): the disk is not what makes big jobs slow.")
+    for label, rate in (("as it was", a["delete_per_s"]), ("with the cache", b["delete_per_s"]),
+                        ("without the hash index", c["delete_per_s"])):
+        out(f"  forgetting 2,000,000 copies, {label}: about {2_000_000 / max(rate, 1) / 3600:.1f} hours")
+    out("(a database much bigger than this test is slower still: more of it is out of the caches)")
