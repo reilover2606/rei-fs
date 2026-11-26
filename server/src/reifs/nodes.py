@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
+import time
 import string
 import sys
 import uuid
@@ -13,6 +15,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import db, index, transfer
+
+log = logging.getLogger("reifs.nodes")
 from .config import Config
 
 MARKER_DIR = ".rei-fs"
@@ -214,6 +218,7 @@ def _forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=Non
     from .control import check
 
     forgotten = 0
+    started = time.monotonic()
     while True:
         check(stop)
         fids = [r[0] for r in conn.execute(
@@ -221,7 +226,9 @@ def _forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=Non
         if not fids:
             break
         marks = ",".join("?" * len(fids))
-        with db.transaction(conn, "forgetting the copies of a node"):
+        piece = time.monotonic()
+        tx = db.transaction(conn, "forgetting the copies of a node")
+        with tx:
             conn.execute(f"DELETE FROM copies WHERE node_id = ? AND file_id IN ({marks})",
                          (node_id, *fids))
             conn.execute(f"DELETE FROM collection_stats WHERE node_id = ? AND file_id IN ({marks})",
@@ -230,8 +237,15 @@ def _forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=Non
                          (node_id, *fids))
             index.drop_orphans(conn, fids)
         forgotten += len(fids)
+        took = time.monotonic() - piece
         if say:
-            say(f"forgetting what the index knew of the node: {forgotten:,} copies")
+            # How fast it goes, and whether the time is the work or the wait for the lock.
+            say(f"forgetting what the index knew of the node: {forgotten:,} copies, "
+                f"{forgotten / max(time.monotonic() - started, 0.001):,.0f}/s "
+                f"(last piece: {took - tx.waited:.1f} s of work, {tx.waited:.1f} s waiting)")
+        if (forgotten // TX_ROWS) % 40 == 0:
+            log.info("forgetting the copies of %s: %d done, last piece %.1f s (%.1f s waiting)",
+                     node_id[:8], forgotten, took, tx.waited)
     for table, key, where in (("decisions", "id", "node_id = ?"),
                               ("wanted", "id", "src_node = ? OR dst_node = ?"),
                               ("changes", "seq", "ref_node = ?")):

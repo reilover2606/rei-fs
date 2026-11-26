@@ -16,6 +16,14 @@ import time
 from pathlib import Path
 
 
+def _pread(fd: int, n: int, offset: int) -> bytes:
+    """``os.pread``, which Windows does not have."""
+    if hasattr(os, "pread"):
+        return os.pread(fd, n, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, n)
+
+
 def _drop_cache(fd: int) -> None:
     try:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -38,19 +46,19 @@ def disk(path: Path, seconds: float = 4.0) -> dict:
         path = scratch
     try:
         size = path.stat().st_size
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:
             _drop_cache(fd)
             n, end = 0, time.monotonic() + seconds
             while time.monotonic() < end:
-                os.pread(fd, 4096, random.randrange(0, size - 4096) & ~4095)
+                _pread(fd, 4096, random.randrange(0, size - 4096) & ~4095)
                 n += 1
             iops = n / seconds
             _drop_cache(fd)
             t = time.monotonic()
             got = 0
             while got < 128 << 20 and time.monotonic() - t < seconds * 2:
-                data = os.pread(fd, 1 << 20, got % max(size - (1 << 20), 1))
+                data = _pread(fd, 1 << 20, got % max(size - (1 << 20), 1))
                 if not data:
                     break
                 got += len(data)
@@ -100,7 +108,7 @@ def sqlite_deletes(folder: Path, rows: int, cache_mb: int | None, drop_hash_inde
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.close()
         size = path.stat().st_size
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:
             os.fsync(fd)
             _drop_cache(fd)                 # what a big database is: not in memory
