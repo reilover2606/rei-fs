@@ -41,7 +41,9 @@ def audit_node(conn: sqlite3.Connection, cfg: Config, node_id: str, root: Path,
     from .scanner import reserved_dirs
 
     reserved = reserved_dirs(conn, cfg, node_id)
-    ignorer = Ignorer(cfg.scan, reserved)
+    from . import opaque
+
+    ignorer = Ignorer(cfg.scan, reserved, tuple(opaque.roots(conn)))
     indexed = {r["vpath"]: r for r in conn.execute(
         "SELECT f.vpath, c.size, c.state FROM copies c JOIN vfiles f ON f.id = c.file_id"
         " WHERE c.node_id = ?", (node_id,))}
@@ -82,7 +84,14 @@ def audit_node(conn: sqlite3.Connection, cfg: Config, node_id: str, root: Path,
                 elif entry.is_dir(follow_symlinks=False):
                     if name == MARKER_DIR:
                         continue
-                    if vpath in reserved:
+                    if vpath in ignorer.opaque:     # one row for all that is in it
+                        on_disk += 1
+                        row = indexed.get(vpath)
+                        if row is not None and row["state"] == "present":
+                            seen.add(vpath)
+                        else:
+                            not_indexed.add("an opaque directory not scanned yet", vpath)
+                    elif vpath in reserved:
                         classify_tree(entry.path, vpath, "the fetch folder (downloads; not part "
                                                          "of the virtual tree)")
                     elif ignorer.hidden_dirs and name.startswith("."):

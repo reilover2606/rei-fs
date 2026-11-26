@@ -74,6 +74,7 @@ def file_json(info: queries.FileInfo, full: bool = True) -> dict:
         "good_copies": info.good_copies,
         "goal": info.goal,
         "tolerant": info.tolerant,
+        "files": info.files,
         "tags": info.tags,
         "issues": sorted(info.issues),
         "flags": flags,

@@ -1,10 +1,12 @@
-"""Opaque directories: the scanner indexes nothing inside them (design section 5.22).
+"""Opaque directories: one row of the index for the whole directory (design section 5.22).
 
 For a directory of millions of small files that nobody needs tracked one by one (a decompiled
-program, a build tree, a cache) the index is better left out of it altogether: no rows, no
-hashes, no backups of its files, no decisions when they change. The directory shows in the
-tree as one entry; a *deep* search still finds names inside it, by reading the disk of the
-nodes it is on at that moment (names only).
+program, a build tree, a cache) the index holds ONE row, as if the directory were a single
+file (see ``collections_``): no row, hash or decision for any file inside. Everything that
+works on files works on the directory as a whole: copying and backing it up, moving and
+renaming it, versions, tags, schedules, "synchronous". The number of files in it is kept on the
+side. In the tree it shows as one folder entry; a *deep* search still finds names inside it, by
+reading the disk of the nodes it is on at that moment (names only).
 
 The setting is made on a directory and inherited by what is below it; the nearest setting
 decides (a setting of 0 switches an inherited one off), but inside an opaque directory nothing
@@ -91,7 +93,7 @@ def set_opaque(conn: sqlite3.Connection, vpath: str, value: bool | None) -> dict
         raise OpaqueError(str(e)) from None
     if vpath == "/":
         raise OpaqueError("the whole tree cannot be opaque")
-    if index.file_id(conn, vpath) is not None:
+    if index.file_id(conn, vpath) is not None and not is_opaque(conn, vpath):
         raise OpaqueError(f"{vpath} is a file; opaque is a setting of directories")
     with db.transaction(conn, "setting opaque"):
         _put(conn, vpath, None if value is None else int(value))
@@ -119,8 +121,22 @@ def apply_change(conn: sqlite3.Connection, d: dict) -> None:
 TX_ROWS = 500
 
 
+def stale_collections(conn: sqlite3.Connection) -> list[int]:
+    """Rows that stand for a directory that is not opaque any more (the setting was removed)."""
+    live = set(roots(conn))
+    out = []
+    for fid, in conn.execute("SELECT DISTINCT file_id FROM collection_stats").fetchall():
+        row = conn.execute("SELECT vpath FROM vfiles WHERE id = ?", (fid,)).fetchone()
+        if row is None or row["vpath"] not in live:
+            out.append(fid)
+    return out
+
+
 def indexed_below(conn: sqlite3.Connection) -> bool:
-    """Does the index still hold files below an opaque directory?"""
+    """Is there anything to tidy: files indexed below an opaque directory, or the row of a
+    directory that is not opaque any more?"""
+    if stale_collections(conn):
+        return True
     for root in roots(conn):
         cond, args = paths.subtree_sql(root, "d.path")
         if conn.execute("SELECT 1 FROM files f JOIN dirs d ON d.id = f.dir_id"
@@ -137,6 +153,9 @@ def forget_indexed(conn: sqlite3.Connection, say=None, stop=None) -> int:
     from .control import check
 
     total = 0
+    for fid in stale_collections(conn):      # no longer opaque: the directory is scanned as usual
+        with db.transaction(conn, "forgetting the row of a directory that is not opaque"):
+            conn.execute("DELETE FROM files WHERE id = ?", (fid,))
     for root in roots(conn):
         cond, args = paths.subtree_sql(root, "d.path")
         while True:

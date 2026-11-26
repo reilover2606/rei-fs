@@ -74,7 +74,7 @@ ProgressFn = Callable[[int], None]  # bytes transferred so far in this batch
 
 
 def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file: Path,
-                  remote=None) -> list[str]:
+                  remote=None, delete: bool = False) -> list[str]:
     """rsync command line; ``remote`` (peers.RemoteSource) pulls from a peer's daemon."""
     style = cfg.rsync.path_style
     scratch = Path(dst_root) / SCRATCH
@@ -89,6 +89,12 @@ def build_command(cfg: Config, src_root: Path | None, dst_root: Path, list_file:
     return [
         cfg.rsync.path,
         "--times",
+        # A listed directory (an opaque one, which is a single row) is copied with all it
+        # holds; for plain files it changes nothing.
+        "--recursive",
+        # An older copy of such a directory is made equal to the new one: what the new one does
+        # not have goes, inside the listed directories only.
+        *(["--delete"] if delete else []),
         "--ignore-times",
         "--omit-dir-times",
         "--no-whole-file",
@@ -150,7 +156,7 @@ POLL_SECONDS = 0.5
 
 def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: list[str],
               progress: ProgressFn | None = None, remote=None,
-              stop: StopFn | None = None) -> BatchResult:
+              stop: StopFn | None = None, delete: bool = False) -> BatchResult:
     """Copy ``rel_paths`` (``/``-separated, relative to the roots).
 
     With ``remote`` (a peers.RemoteSource or SshSource) the files are pulled
@@ -175,7 +181,7 @@ def run_batch(cfg: Config, src_root: Path | None, dst_root: Path, rel_paths: lis
             sub = getattr(remote, "subpath", "") if remote is not None else ""
             names = [f"{sub}/./{p}" if sub else p for p in rel_paths]
             f.write(b"\0".join(n.encode("utf-8") for n in names) + b"\0")
-        cmd = build_command(cfg, src_root, dst_root, list_file, remote)
+        cmd = build_command(cfg, src_root, dst_root, list_file, remote, delete)
         env = None
         if remote is not None and getattr(remote, "password", None) is not None:
             env = dict(os.environ, RSYNC_PASSWORD=remote.password)       # rsync daemon

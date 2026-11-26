@@ -300,6 +300,10 @@ def apply_plan(conn: sqlite3.Connection, plan: Plan, description: str) -> Result
             for peer in peers.paired_peers(conn):     # schedules live on the server owning the backup
                 index.queue_peer_call(conn, peer["id"], "/api/peer/dir-moved",
                                       {"old": old, "new": new})
+        opaque_roots = set(opaque.roots(conn))
+        for m in plan.moves:   # an opaque directory is a row of the index: its setting follows it
+            if m.old in opaque_roots:
+                opaque.move(conn, m.old, m.new)
         tolerant = tolerance.load(conn)
         for m in plan.moves:   # a file marked tolerant keeps the mark when it is moved
             if m.old in tolerant:

@@ -209,6 +209,8 @@ def forget_copies_of(conn: sqlite3.Connection, node_id: str, say=None, stop=None
         with db.transaction(conn, "forgetting the copies of a node"):
             conn.execute(f"DELETE FROM copies WHERE node_id = ? AND file_id IN ({marks})",
                          (node_id, *fids))
+            conn.execute(f"DELETE FROM collection_stats WHERE node_id = ? AND file_id IN ({marks})",
+                         (node_id, *fids))
             conn.execute(f"DELETE FROM changes WHERE ref_node = ? AND ref_file IN ({marks})",
                          (node_id, *fids))
             for fid in fids:

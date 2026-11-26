@@ -759,19 +759,38 @@ files are not touched. A scan only builds its rename candidates when something v
 scan does not load every copy of the node.
 
 **Opaque** (Tree `O`; `reifs opaque PATH yes|no|inherit`; the `opaque` table, replicated like the
-directory priorities). The scanner indexes nothing inside an opaque directory: no rows, no hashes, no
-backups of its files, no decisions. It is the way to keep a directory of millions of small files
-out of the index (the packer is limited to 200,000 members). In the tree it is one entry, marked
-opaque, that cannot be entered. The setting is inherited, and the outermost opaque directory counts
-(inside one nothing is looked at, so a setting there does nothing).
+directory priorities). An opaque directory is **one row of the index for the whole directory**
+(`collections_.py`): one `files` row at the directory's own path and one `copies` row per node that
+holds it, as if the directory were a single big file. No file inside has a row, a hash or a
+decision, which is what makes a directory of millions of small files cheap (the packer is limited
+to 200,000 members). Everything that works on files works on the directory as a whole: copying and
+backing it up, moving and renaming it (its setting moves with it), versions, tags, schedules,
+"synchronous", fetching, marking for deletion (the user deletes it, as with any file).
 
-* Setting it forgets what the index holds below it: a worker task (`opaque.forget_indexed`, 500 files
-  per transaction, no removal logged per file) on the server that set it and on every server that
-  learns the setting, so a directory of a million files is not a million log entries.
+* **What stands in for a file's size, time and hash:** the total size of the files inside; the newest
+  modification time inside; and a *fingerprint* of the whole tree: names, sizes and modification times
+  (to two seconds, which FAT keeps), each read with a `stat`, no file opened, the entries combined
+  in an order-independent way (constant memory). A scan reads it, walking the directory, and writes
+  anything only when the fingerprint changed.
+* **How many files** it holds is not in the schema of files (nearly every row there is one file): it is
+  in `collection_stats(file_id, node_id, files, bytes)`, per node, and shows as the number of files
+  of the folder entry in the tree.
+* **Transfers** copy the directory with `rsync --recursive` and check the fingerprint of the result.
+  Replacing an older copy (overwrite, with the old content still the one judged stale) uses
+  `--delete` inside that directory only, so the older copy becomes equal to the new one; a plain
+  copy never deletes. A directory renamed on a node is renamed whole.
+* The setting is inherited, and the outermost opaque directory counts (inside one nothing is looked at).
+* Setting it replaces what was indexed below it by the one row: a worker task
+  (`opaque.forget_indexed`, 500 files per transaction, no removal logged per file) on the server that
+  set it and on every server that learns the setting, then the next scan makes the row. Turning it off
+  drops the row and the files are scanned one by one again.
 * **Deep search** also reads the disks: for each opaque directory it walks the folder on each of this
   server's online nodes that has it, and on the paired servers (`/api/peer/opaque-search`), and returns
   the names (files and folders) that match, up to 1,000 or 20 seconds, saying when it stopped early.
   Only names: nothing about those files is known. Results show with the opaque directory they are in.
+* Limits: the fingerprint costs a `stat` per file at every scan of the directory (give it a lazy update
+  priority), and two nodes whose file systems keep modification times differently (FAT against
+  NTFS) can see slightly different fingerprints of the same files.
 
 ## 6. Replication (milestone 5)
 

@@ -923,7 +923,7 @@ class TreeView : public View {
                           fit(human_size(e.value("size", std::int64_t{0})), 10) + " in archive");
       else if (e.value("opaque", false))
         labels_.push_back(mark + fit("◌ " + e.value("name", "") + "/", 34) + " " +
-                          fit("not indexed", 11) + " [opaque]");
+                          fit(std::to_string(e.value("files", 0)) + " files", 11) + " [opaque]");
       else if (e.value("packed", false))
         labels_.push_back(mark + fit("▣ " + e.value("name", "") + "/", 34) + " " +
                           fit(std::to_string(e.value("files", 0)) + " files", 11) + " [packed]");
@@ -978,12 +978,21 @@ class TreeView : public View {
       return;
     }
     if (e->value("opaque", false)) {
-      detail_ = vbox({hard_wrap(child_path(e->value("name", "")) + "/", kDetailWidth - 1) | bold,
-                      separator(),
-                      text("opaque: the scanner indexes nothing inside it"),
-                      text("(no rows, no hashes, no backups of its files)"), text(""),
-                      text("'deep search' lists the names inside it, read from the disks") | dim,
-                      text("O: make it indexed again  u: update priority of the folder") | dim});
+      std::string dir = child_path(e->value("name", ""));
+      Element head = vbox({hard_wrap(dir + "/", kDetailWidth - 1) | bold,
+                           text("opaque: ONE row stands for the whole directory"),
+                           text(std::to_string(e->value("files", 0)) + " file(s) inside, not indexed one by one"),
+                           text("c/m/f/t/n act on all of it; 'deep search' lists its names") | dim,
+                           text("O: index it file by file again") | dim, separator()});
+      detail_ = head;
+      ctx_.run(
+          false, [dir](Api& a) { return a.get("/api/file?path=" + url_encode(dir)); },
+          [this, dir, head](json f) {
+            const json* cur = current();
+            if (!cur || child_path(cur->value("name", "")) != dir) return;
+            detail_ = vbox({head, file_details(f)});
+          },
+          "tree-detail");
       return;
     }
     if (e->value("packed", false)) {
@@ -1045,7 +1054,7 @@ class TreeView : public View {
     const json* e = current();
     if (!e || !e->value("dir", false)) return;
     if (e->value("opaque", false)) {
-      ctx_.notify(e->value("name", "") + " is opaque: nothing in it is indexed ('deep search' lists its names)");
+      ctx_.notify(e->value("name", "") + " is opaque: one row for all of it (c/m/f act on the whole directory; 'deep search' lists its names)");
       return;
     }
     path_ = child_path(e->value("name", ""));
@@ -1160,11 +1169,12 @@ class TreeView : public View {
     if (key(e, "O") && dir) {   // opaque: the scanner does not look inside
       ctx_.dialogs->ask_choice(
           "Opaque setting of " + target + ":\n"
-          "an opaque directory is not indexed at all (no rows, hashes, decisions or backups of "
-          "what is in it), which is the way to keep a directory of millions of small files out "
-          "of the index. What is indexed below it now is forgotten. 'Deep search' still lists "
-          "the names inside, read from the disks.",
-          {"opaque: do not index what is inside", "indexed as usual (the default)",
+          "an opaque directory is ONE row of the index for the whole of it (the number of files is "
+          "kept on the side): copying, backing up, moving or tagging it applies to all of it, but "
+          "no file inside has a row, a hash or a decision. It is the way to keep a directory of "
+          "millions of small files light. The files indexed below it now are replaced by the "
+          "row. 'Deep search' still lists the names inside, read from the disks.",
+          {"opaque: one row for the whole directory", "indexed as usual (the default)",
            "inherit from the parent"},
           [this, target](int i) {
             json value = i == 2 ? json(nullptr) : json(i == 0);

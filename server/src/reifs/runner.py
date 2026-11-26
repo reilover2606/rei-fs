@@ -28,7 +28,7 @@ from typing import Callable
 
 import uuid
 
-from . import archives, db, fsops, index, jobs, paths, peers, relay, scanner, transfer
+from . import archives, collections_, db, fsops, index, jobs, paths, peers, relay, scanner, transfer
 from . import nodes as nodes_mod
 from .config import Config
 from .control import StopFn, Stopped, check
@@ -75,6 +75,7 @@ class Prepared:
     src_stat: tuple[int, int] | None
     remote: peers.RemoteSource | peers.SshSource | None = None  # on a paired server
     relayed: tuple[str, str] | None = None   # (server, request id) of a staged file to release
+    collection: bool = False       # an opaque directory: one row, many files
 
 
 def run_jobs(conn: sqlite3.Connection, cfg: Config, job_ids: list[int] | None = None,
@@ -182,7 +183,8 @@ class _Runner:
                 if prep is None:
                     continue
                 key = (prep.src_node, item["dst_node"], str(prep.dst_root),
-                       getattr(prep.remote, "subpath", ""))
+                       getattr(prep.remote, "subpath", ""),
+                       prep.collection and item["op"] == "overwrite")
                 batch = batches.setdefault(key, [])
                 batch.append(prep)
                 if len(batch) >= max_files or sum(p.size for p in batch) >= max_bytes:
@@ -228,8 +230,10 @@ class _Runner:
                 row = conn.execute("SELECT size FROM copies WHERE file_id = ? AND node_id = ?"
                                    " AND state = 'present'", (fid, item["dst_node"])).fetchone()
             try:
-                st = os.stat(paths.to_physical(root, item["vpath"]))
-                ok = row is None or st.st_size == row["size"]
+                st = collections_.describe(paths.to_physical(root, item["vpath"]),
+                                           collections_.is_collection(conn, item["vpath"]),
+                                           with_hash=False)
+                ok = row is None or st.size == row["size"]
             except OSError:
                 ok = False
             if not ok:
@@ -395,26 +399,29 @@ class _Runner:
         if relayed:
             src_root = None
         src_stat = None
+        coll = collections_.is_collection(conn, vpath)      # a directory standing for its files
         if src_root is not None:
             src_phys = paths.to_physical(src_root, vpath)
             try:
-                st = os.stat(src_phys)
+                st = collections_.describe(src_phys, coll, with_hash=False, stop=self.stop)
             except FileNotFoundError:
                 self._transient(item, rep, f"source missing on {self._name(source['node_id'])}"
                                            " (rescan that node)")
                 return None
-            src_stat = (st.st_size, st.st_mtime_ns)
+            src_stat = (st.size, st.mtime_ns)
         if src_root is not None and src_stat != (source["size"], source["mtime_ns"]):
             # Changed since the last scan: index the new content first.
             try:
-                src_hash = hash_file(src_phys)
+                now = collections_.describe(src_phys, coll, stop=self.stop)
+                src_hash = now.hash
             except OSError as e:
                 self._transient(item, rep, f"cannot read source: {e.strerror or e}")
                 return None
-            size = st.st_size
+            size = now.size
             with db.transaction(conn):
-                index.record_copy(conn, fid, source["node_id"], st.st_size, st.st_mtime_ns,
-                                  src_hash)
+                index.record_copy(conn, fid, source["node_id"], now.size, now.mtime_ns, src_hash)
+                if now.files is not None:
+                    collections_.record_stats(conn, fid, source["node_id"], now.files, now.size)
             version = index.current_version(conn, fid)
             if version is None or version.hash != src_hash:
                 self._skip(item, rep, "source changed and is no longer the current version")
@@ -422,20 +429,24 @@ class _Runner:
 
         dst_phys = paths.to_physical(dst_root, vpath)
         if os.path.lexists(dst_phys):
-            if os.path.islink(dst_phys) or not os.path.isfile(dst_phys):
-                self._skip(item, rep, "destination exists and is not a regular file")
+            if os.path.islink(dst_phys) or not (os.path.isdir(dst_phys) if coll
+                                                else os.path.isfile(dst_phys)):
+                self._skip(item, rep, "destination exists and is not a "
+                                      + ("directory" if coll else "regular file"))
                 return None
             try:
-                dst_st = os.stat(dst_phys)
-                dst_hash = self._dst_hash(fid, dst, dst_phys, dst_st)
+                dst_st = (collections_.describe(dst_phys, True, stop=self.stop) if coll
+                          else self._dst_stat(fid, dst, dst_phys))
+                dst_hash = dst_st.hash
             except OSError as e:
                 self._transient(item, rep, f"cannot read destination: {e.strerror or e}")
                 return None
             if dst_hash == src_hash:
                 with db.transaction(conn):
                     if not fetch:
-                        index.record_copy(conn, fid, dst, dst_st.st_size, dst_st.st_mtime_ns,
-                                          dst_hash)
+                        index.record_copy(conn, fid, dst, dst_st.size, dst_st.mtime_ns, dst_hash)
+                        if dst_st.files is not None:
+                            collections_.record_stats(conn, fid, dst, dst_st.files, dst_st.size)
                     self._finish(item, source["node_id"], rep, 0,
                                  "already fetched" if fetch else "already present",
                                  expected_hash=src_hash)
@@ -483,7 +494,7 @@ class _Runner:
         with db.transaction(conn):
             self._set(item, "running")
         return Prepared(item, fid, source["node_id"], src_root, dst_root, src_hash, size,
-                        src_stat, remote, relayed[1] if relayed else None)
+                        src_stat, remote, relayed[1] if relayed else None, coll)
 
     # --- sources behind another server (relay.py) ------------------------------------
 
@@ -565,12 +576,14 @@ class _Runner:
         self._wait(item, rep, f"server {name} is fetching it for us ({st.get('state')})")
         return None
 
-    def _dst_hash(self, fid: int, node_id: str, phys: Path, st: os.stat_result) -> str:
+    def _dst_stat(self, fid: int, node_id: str, phys: Path) -> "collections_.Described":
+        """Size, mtime and hash of a destination file, the recorded hash if it is unchanged."""
+        st = os.stat(phys)
         row = self.conn.execute("SELECT size, mtime_ns, hash FROM copies WHERE file_id = ?"
                                 " AND node_id = ? AND state = 'present'", (fid, node_id)).fetchone()
         if row and (row["size"], row["mtime_ns"]) == (st.st_size, st.st_mtime_ns):
-            return row["hash"]
-        return hash_file(phys)
+            return collections_.Described(st.st_size, st.st_mtime_ns, row["hash"])
+        return collections_.Described(st.st_size, st.st_mtime_ns, hash_file(phys))
 
     def _flush(self, batch: list[Prepared], rep: JobReport) -> None:
         first = batch[0]
@@ -584,7 +597,10 @@ class _Runner:
 
         result = transfer.run_batch(self.cfg, first.src_root, first.dst_root,
                                     [p.item["vpath"].lstrip("/") for p in batch], on_bytes,
-                                    remote=first.remote, stop=self.stop)
+                                    remote=first.remote, stop=self.stop,
+                                    # an older copy of an opaque directory becomes equal to the new
+                                    delete=any(p.collection and p.item["op"] == "overwrite"
+                                               for p in batch))
         error = None
         if result.returncode != 0:
             lines = [ln for ln in result.stderr.splitlines() if ln.strip()]
@@ -594,14 +610,16 @@ class _Runner:
             self.reserved[dst] = max(0, self.reserved.get(dst, 0) - p.size)
             dst_phys = paths.to_physical(p.dst_root, p.item["vpath"])
             try:
-                st = os.stat(dst_phys)
-                got = hash_file(dst_phys)
+                d = collections_.describe(dst_phys, p.collection, stop=self.stop)
+                got = d.hash
             except OSError:
                 got = None
             if got == p.src_hash:
                 with db.transaction(self.conn):
                     if not p.item["fetch"]:
-                        index.record_copy(self.conn, p.fid, dst, st.st_size, st.st_mtime_ns, got)
+                        index.record_copy(self.conn, p.fid, dst, d.size, d.mtime_ns, got)
+                        if d.files is not None:
+                            collections_.record_stats(self.conn, p.fid, dst, d.files, d.size)
                     self._finish(p.item, p.src_node, rep, p.size,
                                  f"fetched to {dst_phys}" if p.item["fetch"] == 1 else None,
                                  expected_hash=p.src_hash)
@@ -616,8 +634,9 @@ class _Runner:
                 changed = False  # its owner rescans it; the sync brings the news
             else:
                 try:
-                    sst = os.stat(paths.to_physical(p.src_root, p.item["vpath"]))
-                    changed = (sst.st_size, sst.st_mtime_ns) != p.src_stat
+                    sst = collections_.describe(paths.to_physical(p.src_root, p.item["vpath"]),
+                                                p.collection, with_hash=False, stop=self.stop)
+                    changed = (sst.size, sst.mtime_ns) != p.src_stat
                 except OSError:
                     changed = True
             if changed:
@@ -740,12 +759,15 @@ class _Runner:
         if os.path.lexists(dst):
             self._skip(item, rep, f"{new} already exists on {self._name(node)}")
             return
+        # An opaque directory is renamed whole. Its setting already moved when the rename was
+        # planned, so it is the new path that says so by the time the job runs.
+        coll = collections_.is_collection(conn, old) or collections_.is_collection(conn, new)
         try:
-            st = os.stat(src)
+            st = collections_.describe(src, coll, with_hash=False, stop=self.stop)
         except FileNotFoundError:
             self._transient(item, rep, "file not found (rescan the node)")
             return
-        if (st.st_size, st.st_mtime_ns) != (copy["size"], copy["mtime_ns"]):
+        if (st.size, st.mtime_ns) != (copy["size"], copy["mtime_ns"]):
             self._skip(item, rep, "file changed since the rename was proposed")
             return
         reason = self._illegal(new, node)
@@ -764,7 +786,11 @@ class _Runner:
         with db.transaction(conn):
             new_fid = index.ensure_file(conn, new)
             index.copy_tags(conn, fid, new_fid)
-            index.record_copy(conn, new_fid, node, st.st_size, st.st_mtime_ns, copy["hash"])
+            index.record_copy(conn, new_fid, node, st.size, st.mtime_ns, copy["hash"])
+            if coll:
+                n = collections_.file_count(conn, fid)
+                if n is not None:
+                    collections_.record_stats(conn, new_fid, node, n, st.size)
             index.forget_copy(conn, fid, node)
             self._finish(item, None, rep, 0, f"renamed to {new}")
         fsops.prune(root, paths.parent(old))

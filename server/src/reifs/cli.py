@@ -193,10 +193,11 @@ def cmd_opaque(args) -> None:
         res = opaque.set_opaque(conn, args.vpath, value)
     except opaque.OpaqueError as e:
         raise CliError(str(e)) from None
-    state = ("opaque: the scanner indexes nothing inside it" if res["opaque"] else "indexed as usual")
+    state = ("opaque: one row for the whole directory" if res["opaque"] else "indexed as usual")
     print(f"{res['path']}: {state}" + ("" if not res["inherited"] else f" (from {res['set_on']})"))
     if res["opaque"]:
-        print("What is indexed below it now is forgotten by the running server (or at its next start).")
+        print("The files indexed below it now are replaced by one row (done by the running server, "
+              "then the next scan counts them).")
 
 
 def cmd_tolerate(args) -> None:
