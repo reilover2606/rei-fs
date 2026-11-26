@@ -154,6 +154,10 @@ class DatabaseSection:
     # many hours, if at least min_free_percent of the file (and 32 MiB) is free pages. 0 = never.
     vacuum_hours: int = 6
     min_free_percent: int = 10
+    # Memory the server's background worker (scans, jobs, resets) lets SQLite keep of the
+    # database. Big jobs touch pages all over a big database; with this much of it in memory
+    # they do not each cost a disk seek. The default of SQLite is 2 MB.
+    cache_mb: int = 128
 
 
 @dataclass
@@ -307,6 +311,10 @@ max_attempts = {self.transfers.max_attempts}
 # disk, a little at a time while the server works. 0 = never (reifs db vacuum does it by hand).
 vacuum_hours = {self.database.vacuum_hours}
 min_free_percent = {self.database.min_free_percent}
+# Memory for the page cache of the background worker (SQLite's own default is 2 MB). A reset or a
+# first scan of a database bigger than the cache is much faster with more (reifs db speed shows
+# what your disk does).
+cache_mb = {self.database.cache_mb}
 
 [replication]
 # Good copies every file should have, on different nodes.

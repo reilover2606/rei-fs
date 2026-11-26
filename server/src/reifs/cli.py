@@ -941,6 +941,11 @@ def cmd_ssh(args) -> None:
 
 def cmd_db(args) -> None:
     cfg, conn = open_server(args.home)
+    if args.action == "speed":
+        from . import speedtest
+
+        speedtest.run(cfg.db_path, args.quick, cache_mb=cfg.database.cache_mb)
+        return
     if args.action == "stats":
         sizes = db.table_sizes(conn)
         total = sum(s for _, s in sizes) if sizes else 0
@@ -1259,8 +1264,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only directories due for an automatic scan (by update priority)")
     s.set_defaults(func=cmd_scan)
 
-    s = sub.add_parser("db", help="the database: its size (stats) and compacting it (vacuum)")
-    s.add_argument("action", choices=["stats", "vacuum"])
+    s = sub.add_parser("db", help="the database: its size (stats), compacting it (vacuum), and "
+                                  "how fast its disk is (speed)")
+    s.add_argument("action", choices=["stats", "vacuum", "speed"])
+    s.add_argument("--quick", action="store_true", help="speed: a shorter test")
     s.add_argument("--force", action="store_true",
                    help="vacuum even though other processes have the database open")
     s.set_defaults(func=cmd_db)

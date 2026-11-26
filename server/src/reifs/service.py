@@ -148,6 +148,8 @@ class Worker:
 
     def _main(self) -> None:
         conn = db.open_existing(self.cfg.db_path)
+        if self.cfg.database.cache_mb > 0:     # scans, jobs and resets run on this connection
+            conn.execute(f"PRAGMA cache_size = -{self.cfg.database.cache_mb * 1024}")
         # -inf: everything runs once right away. (Not 0.0: monotonic time
         # counts from boot, so on a machine booted less than an hour ago the
         # first hourly scan would otherwise wait.)

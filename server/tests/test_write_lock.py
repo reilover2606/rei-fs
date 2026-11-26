@@ -88,3 +88,13 @@ def test_free_room_is_given_back_only_when_it_is_worth_it(tmp_path):
     assert db.reclaim(c, chunk=100) > 0 and len(seen) > 2                  # in steps
     assert c.execute("PRAGMA freelist_count").fetchone()[0] == 0
     assert db.lock_stats() and any("free space back" in r["who"] for r in db.lock_stats())
+
+
+def test_the_speed_test_runs_and_leaves_nothing_behind(tmp_path):
+    from reifs import speedtest
+    (tmp_path / "x.db").write_bytes(b"0" * 5000)
+    lines = []
+    speedtest.run(tmp_path / "x.db", quick=True, out=lines.append, cache_mb=8)
+    text = "\n".join(lines)
+    assert "random 4 KiB reads" in text and "delete" in text and "Verdict" in text
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["x.db"]
