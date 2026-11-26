@@ -74,6 +74,9 @@ class ScanSection:
     # Synchronous directories are looked at this often (seconds) and changes in them are
     # propagated at once; 0 uses synchronous_minutes.
     synchronous_seconds: int = 5
+    # Files are read and hashed by this many threads at once (a first scan, or after a reset,
+    # reads every byte). 1 = one at a time: better for a spinning disk.
+    hash_threads: int = 4
     frequent_minutes: int = 10
     archival_minutes: int = 0
     # A scan that finds at least this many files vanished from (or moved out of)
@@ -253,6 +256,9 @@ synchronous_minutes = {self.scan.synchronous_minutes}
 # Synchronous directories are scanned this often, in seconds, and what changes in them is
 # copied to the other nodes holding them at once (0: use synchronous_minutes).
 synchronous_seconds = {self.scan.synchronous_seconds}
+# How many files are read and hashed at once. More is faster on SSDs and network drives
+# (a first scan reads everything); use 1 for a spinning disk.
+hash_threads = {self.scan.hash_threads}
 frequent_minutes = {self.scan.frequent_minutes}
 archival_minutes = {self.scan.archival_minutes}
 # Files that vanish or move together (a deleted or moved folder) are decided as one.

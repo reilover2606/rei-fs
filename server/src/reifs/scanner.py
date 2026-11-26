@@ -23,6 +23,7 @@ import sqlite3
 import logging
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
@@ -35,6 +36,7 @@ from .nodes import MARKER_DIR, NodeError, marker_path, read_marker
 
 BATCH_FILES = 500
 log = logging.getLogger("reifs.scanner")
+PARALLEL_MIN = 256 * 1024   # smaller files are hashed in line: handing them to a thread costs more
 VERSION_CHUNK = 500
 RECONCILE_CHUNK = 500       # vanished (or no longer indexed) copies handled per transaction         # files whose versions are compared per transaction
 BATCH_SECONDS = 1.0
@@ -288,6 +290,23 @@ def scan_node(
                 progress(stats, current)
         last_flush = last_report = time.monotonic()
 
+    threads = max(1, int(cfg.scan.hash_threads))
+    pool = ThreadPoolExecutor(threads, thread_name_prefix="reifs-hash") if threads > 1 else None
+    pending: deque = deque()          # (future, vpath, size, mtime_ns, row): hashes being read
+
+    def drain(limit: int) -> None:
+        """Take the finished hashes, in the order the files were met, until at most ``limit``
+        are still pending."""
+        while len(pending) > limit:
+            fut, vp, sz, mt, rw = pending.popleft()
+            try:
+                digest = fut.result()
+            except OSError as e:
+                walker._error(vp, f"cannot hash: {e.strerror or e}")
+                continue
+            stats.hashed += 1
+            batch.append((vp, sz, mt, rw, digest))
+
     try:
         for vpath, phys, size, mtime_ns in walker.walk():
             check(stop)
@@ -320,25 +339,34 @@ def scan_node(
             else:
                 if progress and size >= BIG_FILE:   # a long silent read: say so
                     progress(stats, f"hashing {vpath} ({size / 2**20:,.0f} MiB)")
-                try:
-                    h = hash_file(phys)
-                except OSError as e:
-                    walker._error(vpath, f"cannot hash: {e.strerror or e}")
-                    continue
-                stats.hashed += 1
-                batch.append((vpath, size, mtime_ns, row, h))
+                if pool is not None and size >= PARALLEL_MIN:   # read by several threads at once
+                    pending.append((pool.submit(hash_file, phys), vpath, size, mtime_ns, row))
+                    drain(threads * 16)
+                else:
+                    try:
+                        h = hash_file(phys)
+                    except OSError as e:
+                        walker._error(vpath, f"cannot hash: {e.strerror or e}")
+                        continue
+                    stats.hashed += 1
+                    batch.append((vpath, size, mtime_ns, row, h))
             if len(batch) >= BATCH_FILES or (batch and time.monotonic() - last_flush > BATCH_SECONDS):
                 flush(vpath)
             elif progress and time.monotonic() - last_report > REPORT_SECONDS:
                 progress(stats, vpath)
+        drain(0)
         flush()
     except BaseException as exc:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
         try:
             flush()                      # keep the progress made so far
         except sqlite3.Error:
             pass
         finish("aborted" if isinstance(exc, (KeyboardInterrupt, Stopped)) else "failed")
         raise
+    if pool is not None:
+        pool.shutdown()
 
     if new_only:
         with db.transaction(conn, "scan: saving results"):

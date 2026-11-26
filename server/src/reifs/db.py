@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -1209,6 +1209,14 @@ CREATE UNIQUE INDEX apps_token ON apps(token_hash) WHERE token_hash IS NOT NULL;
 """
 
 MIGRATIONS[20] = _migration_20
+
+MIGRATIONS[23] = """
+-- Forgetting a node, removing it, or resetting it looked for its decisions and proposals by
+-- node: with a million of them, one full scan of the table per piece of 500.
+CREATE INDEX decisions_node ON decisions(node_id) WHERE node_id IS NOT NULL;
+CREATE INDEX wanted_src ON wanted(src_node) WHERE src_node IS NOT NULL;
+CREATE INDEX wanted_dst ON wanted(dst_node) WHERE dst_node IS NOT NULL;
+"""
 
 MIGRATIONS[22] = """
 -- An opaque directory is ONE file row (design 5.22), whose content is the whole directory: the

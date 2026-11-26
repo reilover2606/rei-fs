@@ -392,3 +392,19 @@ def test_search_finds_folders_too(env):
     assert queries.search(env.conn, "holiday", tag="keep")[1] == [("/holiday", 1)]
     assert queries.search(env.conn, "beach", tag="keep")[1] == [("/holiday/beach", 1)]
     assert queries.search(env.conn, "work", tag="keep")[1] == []   # nothing tagged below it
+
+
+def test_big_files_are_hashed_by_several_threads_with_the_same_result(env, monkeypatch):
+    from reifs import scanner
+    monkeypatch.setattr(scanner, "PARALLEL_MIN", 1000)
+    for i in range(12):
+        write(env.root / "big" / f"f{i}.bin", "x" * 3000 + str(i), mtime=1_000_000)
+    env.cfg.scan.hash_threads = 4
+    env.scan()
+    parallel = {r[0]: r[1] for r in env.conn.execute("SELECT f.vpath, c.hash FROM copies c JOIN vfiles f ON f.id = c.file_id")}
+    assert len(parallel) == 12
+    env.conn.execute("DELETE FROM copies")
+    env.cfg.scan.hash_threads = 1
+    env.scan()
+    one = {r[0]: r[1] for r in env.conn.execute("SELECT f.vpath, c.hash FROM copies c JOIN vfiles f ON f.id = c.file_id")}
+    assert parallel == one
