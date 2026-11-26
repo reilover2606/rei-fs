@@ -932,7 +932,8 @@ class TreeView : public View {
                           fit(std::to_string(e.value("files", 0)) + " files", 11) +
                           (e.value("priority", 2) != 2
                                ? std::string(" [") + priority_name(e.value("priority", 2)) + "]"
-                               : ""));
+                               : "") +
+                          (e.contains("app") ? " [app: " + e["app"].value("name", "") + "]" : ""));
       else
         labels_.push_back(mark + file_label(e, 40));
     }
@@ -1025,6 +1026,10 @@ class TreeView : public View {
                       text(std::string("update priority: ") + priority_name(e->value("priority", 2)) +
                            (e->value("set_here", false) ? "" : " (inherited)")),
                       here_line(*e),
+                      text(e->contains("app")
+                               ? "application: " + (*e)["app"].value("name", "") + " (" +
+                                     (*e)["app"].value("mode", "") + ")"
+                               : std::string("")),
                       text(std::string("versions: ") + (e->value("tolerant", false)
                                ? "several are fine (no conflicts asked)" : "conflicts are decided")),
                       text(""), text("t: tag every file below  c/m: copy/move it all") | dim,
@@ -2992,9 +2997,9 @@ class AppsView : public View {
     menu_ = Menu(&labels_, &selected_, MenuOption::Vertical());
     root_ = Renderer(menu_, [this] {
       return vbox({paragraph(" Applications use rei-fs for their files through the API. A storage "
-                             "app gets a directory on a node to fill. The instances of an app "
-                             "registered on several nodes keep their directory the same "
-                             "everywhere (it is made synchronous).") | dim,
+                             "app gets /apps/<name> on a node to fill. An instance uses its own "
+                             "directory, wherever it sits in the node, and the instances of an app "
+                             "on several nodes keep it the same everywhere (it is made synchronous).") | dim,
                    with_detail(list_panel(std::to_string(items_.size()) + " registration(s)",
                                           menu_, labels_.size(), "none yet: n registers one"),
                                detail()) | flex});
@@ -3083,33 +3088,50 @@ class AppsView : public View {
            "instance: its files are kept the same on every node it is registered on"},
           [this, name](int m) {
             std::string mode = m == 0 ? "storage" : "instance";
-            std::vector<std::string> labels = {"any node (one is chosen)"};
-            std::vector<json> choices = {json(nullptr)};
-            for (const auto& n : nodes_) {
-              if (!n.value("online", false)) continue;
-              labels.push_back(n.value("name", "") + "  (" + n.value("owner", "") + ")");
-              choices.push_back(n);
-            }
-            ctx_.dialogs->ask_choice(
-                "On which node?", labels, [this, name, mode, choices](int i) {
-                  json body = {{"name", name}, {"mode", mode}};
-                  if (!choices[i].is_null()) {
-                    body["node"] = choices[i].value("name", "");
-                    // A node of another server is registered there.
-                    if (choices[i].value("owner", "") != "self")
-                      body["server"] = choices[i].value("owner_id", "");
-                  }
-                  ctx_.send("/api/apps", body, [this, name](json out) {
-                    ctx_.dialogs->info(
-                        "Registered " + name,
-                        "node: " + out.value("node", "") + "\ndirectory: " + out.value("dir", "") +
-                            (out["path"].is_string() ? "\non disk: " + out.value("path", "") : "") +
-                            "\n\ntoken (shown once, keep it):\n" + out.value("token", ""));
-                    refresh();
+            if (mode == "instance") {   // it lives in its own directory, wherever that is
+              std::string known;
+              for (const auto& a : items_)
+                if (a.value("name", "") == name) known = a.value("dir", "");
+              ctx_.dialogs->ask_text(
+                  "Where does " + name + " keep its files in the node? (its own directory as it sits in "
+                  "the node's folder, the same for every instance; e.g. /home/me/.config/" + name + ")",
+                  known, [this, name](const std::string& dir) {
+                    if (!dir.empty()) choose_node(name, "instance", dir);
                   });
-                });
+              return;
+            }
+            choose_node(name, mode, "");
           });
     });
+  }
+
+  void choose_node(const std::string& name, const std::string& mode, const std::string& dir) {
+    std::vector<std::string> labels = {"any node (one is chosen)"};
+    std::vector<json> choices = {json(nullptr)};
+    for (const auto& n : nodes_) {
+      if (!n.value("online", false)) continue;
+      labels.push_back(n.value("name", "") + "  (" + n.value("owner", "") + ")");
+      choices.push_back(n);
+    }
+    ctx_.dialogs->ask_choice(
+        "On which node?", labels, [this, name, mode, dir, choices](int i) {
+          json body = {{"name", name}, {"mode", mode}};
+          if (!dir.empty()) body["path"] = dir;
+          if (!choices[i].is_null()) {
+            body["node"] = choices[i].value("name", "");
+            // A node of another server is registered there.
+            if (choices[i].value("owner", "") != "self")
+              body["server"] = choices[i].value("owner_id", "");
+          }
+          ctx_.send("/api/apps", body, [this, name](json out) {
+            ctx_.dialogs->info(
+                "Registered " + name,
+                "node: " + out.value("node", "") + "\ndirectory: " + out.value("dir", "") +
+                    (out["path"].is_string() ? "\non disk: " + out.value("path", "") : "") +
+                    "\n\ntoken (shown once, keep it):\n" + out.value("token", ""));
+            refresh();
+          });
+        });
   }
 
   Context& ctx_;

@@ -8,7 +8,7 @@ import time
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import archives, collections_, index, opaque, paths, tolerance, vdirs
+from . import apps, archives, collections_, index, opaque, paths, tolerance, vdirs
 from .tags import tags_of
 
 DEFAULT_COPIES = 2
@@ -111,6 +111,7 @@ class DirEntry:
     packed: dict | None = None  # a packed directory: {"archive": vpath, "bytes": n, "file_id": id}
     member_size: int | None = None   # inside a packed directory: a file's size (read-only entry)
     opaque: bool = False       # a directory the scanner does not look into
+    app: tuple[str, str] | None = None   # (name, mode): the directory of an application
 
 
 class Entries(list):
@@ -146,6 +147,7 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
         if inside[0]:
             return None
     opaque_here = {d for d in opaque.roots(conn) if paths.parent(d) == vdir}
+    apps_here = apps.dirs_by_parent(conn, vdir)
     packed_here = {r["dir_path"]: r for r in conn.execute(
         "SELECT dir_path, files, bytes, file_id FROM archives WHERE present = 1")
         if paths.parent(r["dir_path"]) == vdir}
@@ -181,7 +183,9 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     for d in vdirs.under(conn, vdir, include_self=False):
         head = d[len(lo):].partition("/")[0]
         dirs.setdefault(head, (0, 0))
-    if not dirs and not files and not packed_here and vdir != "/" \
+    for d in list(apps_here) + list(apps.heads_below(conn, vdir)):   # even while nothing is indexed
+        dirs.setdefault(paths.basename(d), (0, 0))
+    if not dirs and not files and not packed_here and not opaque_here and vdir != "/" \
             and not vdirs.under(conn, vdir):
         return None
     for d in opaque_here:               # an opaque directory: one row, shown as a folder
@@ -193,7 +197,8 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
         dirs[paths.basename(d)] = (n, n if mine else 0)
     files = [(fid, name) for fid, name in files
              if paths.join(vdir, name) not in opaque_here]   # its row is the folder above
-    out = Entries(DirEntry(name, True, n, here=h, opaque=paths.join(vdir, name) in opaque_here)
+    out = Entries(DirEntry(name, True, n, here=h, opaque=paths.join(vdir, name) in opaque_here,
+                           app=apps_here.get(paths.join(vdir, name)))
                   for name, (n, h) in sorted(dirs.items()))
     for dpath, r in sorted(packed_here.items()):
         mine = conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id IN"

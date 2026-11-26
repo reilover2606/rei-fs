@@ -611,7 +611,8 @@ class Api:
     def apps_add(self, conn, q, body, **_):
         try:
             info, token = apps.register(conn, self.cfg, str(body.get("name", "")).strip(),
-                                        str(body.get("mode", "")), body.get("node") or None)
+                                        str(body.get("mode", "")), body.get("node") or None,
+                                        body.get("path") or None)
         except (apps.AppError, nodes.NodeError, priority.PriorityError) as e:
             raise ApiError(400, str(e)) from None
         if info["mode"] == "instance" and self.worker:
@@ -813,6 +814,8 @@ class Api:
                     d.update(packed=True, archive=e.packed["archive"], bytes=e.packed["bytes"])
                 if e.opaque:
                     d["opaque"] = True
+                if e.app:
+                    d["app"] = {"name": e.app[0], "mode": e.app[1]}
                 out.append(d)
             else:
                 f = file_json(e.file, full=False)
