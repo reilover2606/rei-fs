@@ -8,7 +8,7 @@ import time
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import archives, index, paths, tolerance, vdirs
+from . import archives, index, opaque, paths, tolerance, vdirs
 from .tags import tags_of
 
 DEFAULT_COPIES = 2
@@ -108,6 +108,7 @@ class DirEntry:
     here: int = 0              # of them, files with a copy on this server's own node
     packed: dict | None = None  # a packed directory: {"archive": vpath, "bytes": n, "file_id": id}
     member_size: int | None = None   # inside a packed directory: a file's size (read-only entry)
+    opaque: bool = False       # a directory the scanner does not look into
 
 
 class Entries(list):
@@ -136,6 +137,13 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
         outer = archives.packed_dir_of(conn, vdir)
         if outer:
             return _list_archive(conn, outer, vdir)
+    if vdir != "/":
+        inside = opaque.source(conn, vdir)
+        if inside[0] and inside[1] == vdir:
+            return Entries()              # an opaque directory is one entry: nothing is indexed in it
+        if inside[0]:
+            return None
+    opaque_here = {d for d in opaque.roots(conn) if paths.parent(d) == vdir}
     packed_here = {r["dir_path"]: r for r in conn.execute(
         "SELECT dir_path, files, bytes, file_id FROM archives WHERE present = 1")
         if paths.parent(r["dir_path"]) == vdir}
@@ -174,7 +182,10 @@ def list_dir(conn: sqlite3.Connection, vdir: str,
     if not dirs and not files and not packed_here and vdir != "/" \
             and not vdirs.under(conn, vdir):
         return None
-    out = Entries(DirEntry(name, True, n, here=h) for name, (n, h) in sorted(dirs.items()))
+    for d in opaque_here:               # shown even when nothing is indexed below it any more
+        dirs.setdefault(paths.basename(d), (0, 0))
+    out = Entries(DirEntry(name, True, n, here=h, opaque=paths.join(vdir, name) in opaque_here)
+                  for name, (n, h) in sorted(dirs.items()))
     for dpath, r in sorted(packed_here.items()):
         mine = conn.execute("SELECT 1 FROM copies WHERE file_id = ? AND node_id IN"
                             " (SELECT id FROM nodes WHERE owner_id = ?) AND state = 'present'",

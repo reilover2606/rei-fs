@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 from concurrent.futures import ThreadPoolExecutor
 
-from . import (__version__, apps, archives, audit, auth, tolerance, relay, db, decisions, index, jobs, nodes, paths, peers,
+from . import (__version__, apps, archives, audit, auth, opaque, tolerance, relay, db, decisions, index, jobs, nodes, paths, peers,
                priority, queries, replication, schedules, ssh, sync, tags, tls, vdirs, vmove)
 from .config import Config
 from .locking import LockError, ServerLock
@@ -187,12 +187,16 @@ class Api:
         r("POST", r"/api/nodes", self.add_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/adopt", self.adopt_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/remove", self.remove_node)
+        r("POST", r"/api/nodes/(?P<node>[^/]+)/reset", self.reset_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)/root", self.move_node_root)
         r("GET", r"/api/nodes/(?P<node>[^/]+)/audit", self.audit_node)
         r("POST", r"/api/nodes/(?P<node>[^/]+)", self.update_node)
         r("POST", r"/api/scan", self.scan)
         r("POST", r"/api/holders", self.holders)
         r("GET", r"/api/locks", self.locks)
+        r("GET", r"/api/opaque", self.opaque_get)
+        r("POST", r"/api/opaque", self.opaque_set)
+        r("GET", r"/api/peer/opaque-search", self.peer_opaque_search, "peer")
         r("GET", r"/api/tolerance", self.tolerance_get)
         r("POST", r"/api/tolerance", self.tolerance_set)
         r("GET", r"/api/apps", self.apps_list)
@@ -466,6 +470,22 @@ class Api:
             self.syncer.request_poke()
         return {"ok": True, "path": str(root)}
 
+    def reset_node(self, conn, q, body, node, **_):
+        """Forget all the index knows of a node and scan it from scratch (a cancelable job)."""
+        row = nodes.get_node(conn, unquote(node))
+        if row["owner_id"] != nodes.self_id(conn):
+            return peers.forward(conn, row["owner_id"], "POST", f"/api/nodes/{row['id']}/reset", body)
+        if jobs.active_tool_item(conn, "scan", "/", row["id"]) is not None:
+            raise ApiError(409, f"a scan of {row['name']} is already queued: cancel it first")
+        if row["id"] not in {loc.node_id for loc in nodes.discover(conn, self.cfg).online}:
+            raise ApiError(409, f"node {row['name']} is offline")
+        with db.transaction(conn):
+            job_id = jobs.create_tool_job(
+                conn, "scan", f"reset {row['name']}: forget what is known, then scan from scratch",
+                [("scan", "/", row["id"], {"reset": True, "full": True})])
+        self._need_worker().request_jobs()
+        return {"ok": True, "job_id": job_id, "name": row["name"]}
+
     def remove_node(self, conn, q, body, node, **_):
         try:
             out = nodes.remove_node(conn, unquote(node), force=bool(body.get("force")))
@@ -521,6 +541,29 @@ class Api:
                 self._need_worker().request_jobs()
             return {"ok": True, "queued": True, "job_id": job_id}
         return {"ok": True, "queued": True}
+
+    def opaque_get(self, conn, q, body, **_):
+        try:
+            return opaque.get(conn, q.get("path", "/"))
+        except paths.VPathError as e:
+            raise ApiError(400, str(e)) from None
+
+    def opaque_set(self, conn, q, body, **_):
+        value = body.get("opaque")
+        if value is not None:
+            value = bool(value)
+        try:
+            out = opaque.set_opaque(conn, str(body.get("path", "")), value)
+        except opaque.OpaqueError as e:
+            raise ApiError(400, str(e)) from None
+        if self.worker:
+            self.worker.request_housekeeping()
+        self._poke()
+        return out
+
+    def peer_opaque_search(self, conn, q, body, **_):
+        hits, partial = opaque.search_names(conn, self.cfg, q.get("q") or None, FIND_LIMIT, 8.0)
+        return {"names": hits, "partial": partial}
 
     def tolerance_get(self, conn, q, body, **_):
         try:
@@ -767,6 +810,8 @@ class Api:
                      "tolerant": tolerance.is_tolerant(conn, child)}
                 if e.packed:
                     d.update(packed=True, archive=e.packed["archive"], bytes=e.packed["bytes"])
+                if e.opaque:
+                    d["opaque"] = True
                 out.append(d)
             else:
                 f = file_json(e.file, full=False)
@@ -800,6 +845,22 @@ class Api:
             found = archives.search_members(conn, q.get("q") or None, FIND_LIMIT + 1)
             out["members_truncated"] = len(found) > FIND_LIMIT
             out["members"] = found[:FIND_LIMIT]
+            # ... and by name inside the opaque directories (read from the disks, here and on the
+            # paired servers: nothing is indexed there)
+            names, partial = opaque.search_names(conn, self.cfg, q.get("q") or None, FIND_LIMIT)
+            for p in peers.paired_peers(conn):
+                if not p["online"] or len(names) >= FIND_LIMIT:
+                    continue
+                try:
+                    got = peers.forward(conn, p["id"], "GET",
+                                        "/api/peer/opaque-search?" + urlencode({"q": q.get("q") or ""}),
+                                        None, timeout=12)
+                    names += [dict(n, server=p["name"]) for n in got.get("names", [])]
+                    partial = partial or bool(got.get("partial"))
+                except (peers.PeerError, OSError):
+                    partial = True
+            out["opaque_names"] = names[:FIND_LIMIT]
+            out["opaque_partial"] = partial or len(names) > FIND_LIMIT
         return out
 
     # --- tags -----------------------------------------------------------------------------

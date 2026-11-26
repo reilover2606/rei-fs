@@ -745,6 +745,34 @@ be atomic in WAL mode, and the gain is for writers that, with the queue, already
 second. It is the next step if `lock_stats` still shows the small writers waiting behind the index
 under real load.
 
+### 5.22 Resetting a node, and opaque directories
+
+**Reset node** (Nodes tab `Z`; `reifs node reset NAME`). After a big deletion the usual way takes
+long three times over: a scan that finds a million files gone, a million decisions raised, and as
+many to answer. A reset skips it: the index forgets everything it knows of the node, in pieces of
+500 rows per transaction, and **no decision is raised** for what is gone (`nodes.reset_node`); the
+decisions and proposals about the node go, the node and its settings stay. The other servers are
+told (a `node` entry with `reset`) and drop their copies of it too. Then the node is scanned from
+scratch. It is a scan job (`params.reset`) in the Jobs tab and can be cancelled there: a
+cancelled reset leaves a node that is partly forgotten, which the next scan simply fills in. The
+files are not touched. A scan only builds its rename candidates when something vanished, so a first
+scan does not load every copy of the node.
+
+**Opaque** (Tree `O`; `reifs opaque PATH yes|no|inherit`; the `opaque` table, replicated like the
+directory priorities). The scanner indexes nothing inside an opaque directory: no rows, no hashes, no
+backups of its files, no decisions. It is the way to keep a directory of millions of small files
+out of the index (the packer is limited to 200,000 members). In the tree it is one entry, marked
+opaque, that cannot be entered. The setting is inherited, and the outermost opaque directory counts
+(inside one nothing is looked at, so a setting there does nothing).
+
+* Setting it forgets what the index holds below it: a worker task (`opaque.forget_indexed`, 500 files
+  per transaction, no removal logged per file) on the server that set it and on every server that
+  learns the setting, so a directory of a million files is not a million log entries.
+* **Deep search** also reads the disks: for each opaque directory it walks the folder on each of this
+  server's online nodes that has it, and on the paired servers (`/api/peer/opaque-search`), and returns
+  the names (files and folders) that match, up to 1,000 or 20 seconds, saying when it stopped early.
+  Only names: nothing about those files is known. Results show with the opaque directory they are in.
+
 ## 6. Replication (milestone 5)
 
 **Copy goal.** Every file should have `[replication] copies` good copies

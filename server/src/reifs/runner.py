@@ -29,6 +29,7 @@ from typing import Callable
 import uuid
 
 from . import archives, db, fsops, index, jobs, paths, peers, relay, scanner, transfer
+from . import nodes as nodes_mod
 from .config import Config
 from .control import StopFn, Stopped, check
 from .hashing import hash_file
@@ -695,6 +696,8 @@ class _Runner:
                 msg = f"{res['removed']:,} originals removed" + (
                     f", {res['left']:,} left (they differ from the archive)" if res["left"] else "")
             else:
+                if params.get("reset"):
+                    nodes_mod.reset_node(conn, node_id, say, stop)     # from scratch
                 def scan_progress(s, current: str) -> None:
                     say(f"{s.node}: {s.seen:,} files seen, {s.hashed:,} hashed"
                         + (f", {current}" if current else ""))

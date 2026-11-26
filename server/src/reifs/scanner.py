@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from . import archives, db, fsops, index, paths, priority
+from . import archives, db, fsops, index, opaque, paths, priority
 from .config import Config, ScanSection
 from .control import Stopped, StopFn, check
 from .hashing import hash_file
@@ -47,7 +47,8 @@ def reserved_dirs(conn: sqlite3.Connection, cfg: Config, node_id: str) -> tuple[
     """Folders at the root of a node that are not part of the virtual tree: the "fetch"
     folder of this server's own node, where fetched files are put. Unless the node
     already tracks files there (a folder of the user's with that name): those stay."""
-    packed = tuple(archives.packed_dirs(conn))   # kept as an archive: not tracked loose
+    # kept as an archive (not tracked loose), or marked opaque (nothing inside is indexed)
+    packed = tuple(archives.packed_dirs(conn)) + tuple(opaque.roots(conn))
     row = conn.execute("SELECT kind FROM nodes WHERE id = ?", (node_id,)).fetchone()
     name = cfg.storage.fetch_dir.strip("/")
     if row is None or row["kind"] != "server" or not name:
@@ -465,9 +466,10 @@ def _reconcile_vanished(conn, node, existing, vanished, to_forget, stats, touche
                 index.forget_copy(conn, existing[vpath]["file_id"], node_id)
                 stats.forgotten += 1
 
-    # Rename candidates: copies that appeared since the last completed scan.
+    # Rename candidates: copies that appeared since the last completed scan (only worth
+    # looking for when something vanished: on a first scan that is every file of the node).
     pool: dict[tuple[str, int], _Candidates] = {}
-    for r in conn.execute(
+    for r in () if not vanished else conn.execute(
         "SELECT f.vpath, c.file_id, c.hash, c.size FROM copies c JOIN vfiles f"
         " ON f.id = c.file_id WHERE c.node_id = ? AND c.first_scan > ? AND c.state = 'present'",
         (node_id, node["last_scan_id"] or 0),

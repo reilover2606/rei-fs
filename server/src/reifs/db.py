@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # Version 1 schema; later versions are applied as MIGRATIONS.
 SCHEMA = """
@@ -680,6 +680,17 @@ CREATE UNIQUE INDEX apps_token ON apps(token_hash) WHERE token_hash IS NOT NULL;
 """
 
 MIGRATIONS[20] = _migration_20
+
+MIGRATIONS[21] = """
+-- Opaque directories (design 5.22): the scanner indexes nothing inside them. A directory's
+-- setting is inherited; NULL clears it (like dirprefs and tolerance).
+CREATE TABLE opaque (
+    vpath      TEXT PRIMARY KEY,
+    value      INTEGER,
+    updated    INTEGER NOT NULL,
+    updated_by TEXT NOT NULL
+);
+"""
 
 
 def now() -> int:

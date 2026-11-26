@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from . import (archives, db, index, peers, priority, relay, replication, runner, scanner,
+from . import (archives, db, opaque, index, peers, priority, relay, replication, runner, scanner,
                schedules, sync, synchronous)
 from .config import Config
 from .control import Stopped
@@ -101,6 +101,10 @@ class Worker:
 
     def request_plan(self) -> None:
         self._enqueue(("plan",))
+
+    def request_housekeeping(self) -> None:
+        """Forget what the index holds below opaque directories, and old member lists."""
+        self._enqueue(("housekeeping",))
 
     def request_sync(self, full: bool = False) -> None:
         """Bring the copies of synchronous files up to date (a full pass looks at all of them)."""
@@ -208,6 +212,8 @@ class Worker:
                         if conn.execute("SELECT 1 FROM archive_todo LIMIT 1").fetchone():
                             if archives.followup(conn, self.cfg):
                                 self.request_jobs()
+                        if opaque.indexed_below(conn):     # a directory was made opaque
+                            self.request_housekeeping()
                         if conn.execute("SELECT 1 FROM archives a JOIN archive_members m"
                                         " ON m.archive_id = a.id WHERE a.present = 0 LIMIT 1"
                                         ).fetchone():
@@ -275,6 +281,20 @@ class Worker:
 
     def _run(self, conn, task: tuple) -> None:
         kind = task[0]
+        if kind == "housekeeping":
+            try:
+                if opaque.indexed_below(conn):
+                    self._set(state="tidying", detail="forgetting what is below opaque directories",
+                              since=db.now())
+                    opaque.forget_indexed(conn, say=self._progress, stop=self.stop_requested.is_set)
+                archives.purge_members(conn)
+            except Stopped:
+                pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("housekeeping failed: %s", e)
+            finally:
+                self._set(state="idle", detail="", since=db.now())
+            return
         if kind == "sync":        # frequent and quiet: no activity, no result line
             try:
                 if synchronous.run(conn, self.cfg, full=task[1]):
