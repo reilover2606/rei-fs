@@ -443,3 +443,19 @@ def test_the_wait_between_automatic_scans_grows_with_how_long_they_take():
     assert scan_check_interval(5, 0.05) == 5
     assert scan_check_interval(5, 3) == 12
     assert scan_check_interval(30, 60) == 240
+
+
+def test_the_narrow_queries_start_from_the_directory_not_from_every_copy(env):
+    """Reading a directory's copies (and looking for the fetch folder's) began with all of
+    the node's copies and looked each one up: at half a million files that was most of an
+    idle server's CPU."""
+    from reifs import paths, scanner
+    write(env.root / "live" / "a.txt", "a", mtime=1_000_000)
+    env.scan()
+    node = env.conn.execute("SELECT id FROM nodes").fetchone()[0]
+    cond, args = paths.subtree_sql("/live", "d.path")
+    plan = " ".join(r[3] for r in env.conn.execute(
+        "EXPLAIN QUERY PLAN " + scanner._DIR_COPY_COLUMNS + cond, (node, *args)))
+    assert "copies_node" not in plan and "d USING" in plan
+    assert [r["vpath"] for r in env.conn.execute(scanner._DIR_COPY_COLUMNS + cond,
+                                                 (node, *args))] == ["/live/a.txt"]

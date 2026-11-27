@@ -378,7 +378,11 @@ class Worker:
                         self.request_jobs()
                         self.request_sync()
                     self.request_plan()
-                    if self.syncer is not None:
+                    if self.syncer is not None and (task[3] or any(
+                            r.stats.added or r.stats.changed or r.stats.missing
+                            for r in results)):
+                        # Peers pull when something changed; the quiet automatic scan every
+                        # few seconds must not wake the sync thread and its peers each time.
                         self.syncer.request_poke()
                 else:
                     reports = runner.run_jobs(conn, self.cfg, None, self._progress, stop)
