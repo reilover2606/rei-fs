@@ -408,3 +408,38 @@ def test_big_files_are_hashed_by_several_threads_with_the_same_result(env, monke
     env.scan()
     one = {r[0]: r[1] for r in env.conn.execute("SELECT f.vpath, c.hash FROM copies c JOIN vfiles f ON f.id = c.file_id")}
     assert parallel == one
+
+
+def test_an_automatic_scan_of_a_few_directories_does_not_read_the_whole_index(env):
+    """With millions of files indexed, a scan of one small synchronous directory every few
+    seconds read and sifted every copy of the node each time (a core busy for ever)."""
+    from reifs import priority, scanner
+    for i in range(300):
+        write(env.root / "big" / f"d{i % 10}" / f"f{i}.txt", str(i), mtime=1_000_000)
+    write(env.root / "live" / "a.txt", "a", mtime=1_000_000)
+    env.scan()
+    priority.set_priority(env.conn, "/live", priority.SYNCHRONOUS)
+    prefs = priority.Prefs(priority.load(env.conn))
+    node = env.conn.execute("SELECT id FROM nodes").fetchone()[0]
+    sched = priority.Schedule(prefs, {0})
+    known = scanner._known_copies(env.conn, node, {0}, prefs, sched)
+    assert sorted(known) == ["/live/a.txt"]                      # not the 300 files elsewhere
+    # a nearer setting inside it is respected, and a file with a setting of its own is read
+    priority.set_priority(env.conn, "/live/sub", priority.ARCHIVAL)
+    priority.set_priority(env.conn, "/big/d1/f1.txt", priority.SYNCHRONOUS)
+    write(env.root / "live" / "sub" / "b.txt", "b", mtime=1_000_000)
+    env.scan()
+    prefs = priority.Prefs(priority.load(env.conn))
+    known = scanner._known_copies(env.conn, node, {0}, prefs, priority.Schedule(prefs, {0}))
+    assert sorted(known) == ["/big/d1/f1.txt", "/live/a.txt"]
+    # everything is read when the default priority is among those scanned (or for a full scan)
+    # (299: the file with a priority of its own is not among those of the default priority)
+    assert len(scanner._known_copies(env.conn, node, {2}, prefs, priority.Schedule(prefs, {2}))) == 299
+    assert len(scanner._known_copies(env.conn, node, None, prefs, priority.Schedule(prefs, None))) > 300
+
+
+def test_the_wait_between_automatic_scans_grows_with_how_long_they_take():
+    from reifs.service import scan_check_interval
+    assert scan_check_interval(5, 0.05) == 5
+    assert scan_check_interval(5, 3) == 12
+    assert scan_check_interval(30, 60) == 240

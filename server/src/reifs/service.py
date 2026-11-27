@@ -45,6 +45,13 @@ RETRY_SECONDS = 5      # while a paired server is unreachable
 TICK_SECONDS = 2       # how often the pairing state is checked for changes
 
 
+def scan_check_interval(base: float, last_scan_seconds: float) -> float:
+    """How long to leave between looks for directories due for an automatic scan: the usual
+    time, but never so short that scanning is most of what the server does (a scan that takes
+    a second is looked for at most every four seconds, one that takes a minute every four)."""
+    return max(base, 4.0 * last_scan_seconds)
+
+
 @dataclass
 class Activity:
     state: str = "idle"          # idle | scanning | running jobs
@@ -60,6 +67,7 @@ class Worker:
         self.syncer = syncer
         self.tasks: queue.Queue = queue.Queue()
         self._plan_seconds = 0.0   # how long the last planning took
+        self._auto_scan_seconds = 0.0   # how long the last automatic scan took
         self._schedule_now = False  # a node came back: look at the schedules at once
         self.stop_requested = threading.Event()
         self.shutdown = threading.Event()
@@ -183,8 +191,9 @@ class Worker:
                     live = (self.cfg.scan.synchronous_seconds > 0
                             and synchronous.any_synchronous(conn))
                     # Synchronous directories are looked at every few seconds, the rest every 30.
-                    if self.cfg.scan.interval_minutes > 0 and now - last_scan >= (
-                            self.cfg.scan.synchronous_seconds if live else SCAN_CHECK_SECONDS):
+                    if self.cfg.scan.interval_minutes > 0 and now - last_scan >= scan_check_interval(
+                            self.cfg.scan.synchronous_seconds if live else SCAN_CHECK_SECONDS,
+                            self._auto_scan_seconds):
                         last_scan = now
                         if self._scan_due(conn, online):
                             self.request_scan(full=False)
@@ -351,6 +360,7 @@ class Worker:
         try:
             with ServerLock(self.cfg.home):
                 if kind == "scan":
+                    began = time.monotonic()
                     _, results = scanner.scan_all(
                         conn, self.cfg, list(task[1]) or None, verify=task[2],
                         progress=self._scan_progress, stop=stop, full=task[3],
@@ -358,6 +368,8 @@ class Worker:
                     summary = "; ".join(
                         f"{r.node_name}: +{r.stats.added} ~{r.stats.changed} "
                         f"-{r.stats.missing}" for r in results)
+                    if not task[3]:
+                        self._auto_scan_seconds = time.monotonic() - began
                     if task[3] or any(r.stats.added or r.stats.changed or r.stats.missing
                                       for r in results):   # quiet automatic scans stay quiet
                         self._set(last_result=f"scan done ({summary or 'no online node'})",
