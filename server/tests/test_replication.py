@@ -273,3 +273,26 @@ def test_free_space_is_announced(cluster):  # noqa: F811
     payload = json.loads(a.conn.execute("SELECT data FROM changes WHERE kind = 'node'"
                                         " ORDER BY seq DESC LIMIT 1").fetchone()[0])
     assert "free_bytes" in payload
+
+
+def test_planning_runs_by_itself_only_when_configured_to(env):
+    from reifs.service import Worker
+    assert env.cfg.replication.auto_plan is False             # off by default
+    w = Worker(env.cfg)
+    w.request_plan()                                          # the automatic kind (after a scan, ...)
+    assert w.tasks.qsize() == 0
+    w.request_plan(manual=True)                               # asked for (the hotkey)
+    assert w.tasks.qsize() == 1
+    w2 = Worker(env.cfg)
+    env.cfg.replication.auto_plan = True
+    w2.request_plan()
+    assert w2.tasks.qsize() == 1
+
+
+def test_the_setting_is_in_the_config_file_and_read_back(env):
+    from reifs.config import Config
+    env.cfg.save()
+    assert "auto_plan = false" in env.cfg.config_path.read_text()
+    env.cfg.replication.auto_plan = True
+    env.cfg.save()
+    assert Config.load(env.cfg.home).replication.auto_plan is True

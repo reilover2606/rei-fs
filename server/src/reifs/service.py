@@ -99,8 +99,11 @@ class Worker:
     def request_jobs(self) -> None:
         self._enqueue(("jobs",))
 
-    def request_plan(self) -> None:
-        self._enqueue(("plan",))
+    def request_plan(self, manual: bool = False) -> None:
+        """Plan backups. Asked for by a person (``manual``) it always runs; the automatic
+        requests (after a scan, every few minutes) only when ``[replication] auto_plan`` is on."""
+        if manual or self.cfg.replication.auto_plan:
+            self._enqueue(("plan",))
 
     def request_housekeeping(self, reclaim: bool = False) -> None:
         """Forget what the index holds below opaque directories, and old member lists;

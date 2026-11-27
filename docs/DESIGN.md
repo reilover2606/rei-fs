@@ -752,6 +752,14 @@ be atomic in WAL mode, and the gain is for writers that, with the queue, already
 second. It is the next step if `lock_stats` still shows the small writers waiting behind the index
 under real load.
 
+### 5.22c Planning backups on request
+
+Planning reads the whole index, which on a big one is seconds to minutes of work, so it no longer
+runs by itself: `[replication] auto_plan` is **false** by default. It runs when asked: the Wanted tab,
+key `p` (`POST /api/replication/plan`), or `reifs replicate plan`. With `auto_plan = true` the
+old behaviour returns (after each scan, and every few minutes while the index changes). The
+proposals, and `auto_replicate` approving them, are unchanged.
+
 ### 5.22a When the database is compacted
 
 * **Periodically (new):** every `[database] vacuum_hours` (6; 0 = never) the worker looks at the
