@@ -129,6 +129,35 @@ def _is_junction(entry: os.DirEntry) -> bool:
     return bool(fn and fn())
 
 
+_COPY_COLUMNS = ("SELECT f.vpath, c.file_id, c.size, c.mtime_ns, c.hash, c.state, c.marked_delete"
+                 " FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?")
+
+
+def _known_copies(conn: sqlite3.Connection, node_id: str, classes: set[int] | None,
+                  prefs: priority.Prefs, schedule: priority.Schedule) -> dict[str, sqlite3.Row]:
+    """The index's copies on a node that this scan looks at, by path.
+
+    A scan of everything reads them all. An automatic scan of some update priorities (a
+    synchronous directory every few seconds) must not: with millions of files indexed it
+    would read and sift all of them to look at a few, and keep a core busy for ever. It
+    reads the directories (and files) whose own setting is one of those priorities, below
+    which everything is that priority unless a nearer setting says otherwise."""
+    if classes is None or prefs.effective("/") in classes:
+        rows = conn.execute(_COPY_COLUMNS, (node_id,))
+    else:
+        rows = []
+        for vpath, prio in prefs.prefs.items():
+            if prio not in classes:
+                continue
+            fid = index.file_id(conn, vpath)
+            if fid is not None:                                  # a file with a setting of its own
+                rows += conn.execute(_COPY_COLUMNS + " AND c.file_id = ?", (node_id, fid)).fetchall()
+            cond, args = paths.subtree_sql(vpath, "f.dir_path")
+            rows += conn.execute(_COPY_COLUMNS + f" AND {cond}", (node_id, *args)).fetchall()
+    return {r["vpath"]: r for r in rows
+            if classes is None or schedule.covers_file(r["vpath"])}   # only what this scan visits
+
+
 class _Walker:
     def __init__(self, root: Path, ignorer: Ignorer, schedule: priority.Schedule | None = None,
                  skipped: list[str] | None = None):
@@ -246,15 +275,7 @@ def scan_node(
     prefs = priority.Prefs(priority.load(conn))
     schedule = priority.Schedule(prefs, classes)
     walker = _Walker(root, ignorer, schedule)
-    existing: dict[str, sqlite3.Row] = {
-        r["vpath"]: r
-        for r in conn.execute(
-            "SELECT f.vpath, c.file_id, c.size, c.mtime_ns, c.hash, c.state, c.marked_delete"
-            " FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?",
-            (node_id,),
-        )
-        if classes is None or schedule.covers_file(r["vpath"])   # only what this scan visits
-    }
+    existing = _known_copies(conn, node_id, classes, prefs, schedule)
     seen: set[str] = set()
     touched: set[int] = set()
     coll: dict[str, tuple[int, int]] = {}      # opaque directories read: files, bytes
