@@ -54,9 +54,11 @@ def reserved_dirs(conn: sqlite3.Connection, cfg: Config, node_id: str) -> tuple[
     name = cfg.storage.fetch_dir.strip("/")
     if row is None or row["kind"] != "server" or not name:
         return packed
-    cond, args = paths.subtree_sql("/" + name, "f.dir_path")
-    if conn.execute("SELECT 1 FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?"
-                    f" AND {cond} LIMIT 1", (node_id, *args)).fetchone():
+    cond, args = paths.subtree_sql("/" + name, "d.path")
+    # Directory first: starting from the node's copies reads every one of them to find none.
+    if conn.execute("SELECT 1 FROM dirs d CROSS JOIN files f ON f.dir_id = d.id"
+                    " CROSS JOIN copies c ON c.file_id = f.id AND c.node_id = ?"
+                    f" WHERE {cond} LIMIT 1", (node_id, *args)).fetchone():
         return packed
     return ("/" + name, *packed)
 
@@ -131,6 +133,12 @@ def _is_junction(entry: os.DirEntry) -> bool:
 
 _COPY_COLUMNS = ("SELECT f.vpath, c.file_id, c.size, c.mtime_ns, c.hash, c.state, c.marked_delete"
                  " FROM copies c JOIN vfiles f ON f.id = c.file_id WHERE c.node_id = ?")
+# The same for the files below one directory: it starts from the directories (an index range),
+# not from every copy of the node, which with half a million files is most of a scan's cost.
+_DIR_COPY_COLUMNS = ("SELECT d.path || '/' || f.name AS vpath, c.file_id, c.size, c.mtime_ns,"
+                     " c.hash, c.state, c.marked_delete FROM dirs d CROSS JOIN files f"
+                     " ON f.dir_id = d.id CROSS JOIN copies c ON c.file_id = f.id"
+                     " AND c.node_id = ? WHERE ")
 
 
 def _known_copies(conn: sqlite3.Connection, node_id: str, classes: set[int] | None,
@@ -152,8 +160,8 @@ def _known_copies(conn: sqlite3.Connection, node_id: str, classes: set[int] | No
             fid = index.file_id(conn, vpath)
             if fid is not None:                                  # a file with a setting of its own
                 rows += conn.execute(_COPY_COLUMNS + " AND c.file_id = ?", (node_id, fid)).fetchall()
-            cond, args = paths.subtree_sql(vpath, "f.dir_path")
-            rows += conn.execute(_COPY_COLUMNS + f" AND {cond}", (node_id, *args)).fetchall()
+            cond, args = paths.subtree_sql(vpath, "d.path")
+            rows += conn.execute(_DIR_COPY_COLUMNS + cond, (node_id, *args)).fetchall()
     return {r["vpath"]: r for r in rows
             if classes is None or schedule.covers_file(r["vpath"])}   # only what this scan visits
 

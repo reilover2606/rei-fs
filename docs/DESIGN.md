@@ -626,6 +626,13 @@ present, older copy whose content is still the one judged stale is overwritten; 
 not brought back and nothing is ever deleted. Each server makes jobs for the nodes it owns. A
 tolerant path (5.17) is left alone. A full pass runs every five minutes and when a node comes back.
 
+The frequent scan must stay cheap on a node with half a million files that holds none of the
+synchronous paths (it still runs every five seconds there, since the setting replicates). It reads
+only the copies below the paths of the due priorities, and it does so from the *directories* (an
+index range of `dirs.path`, then their files, then their copies): starting from the node's copies
+and looking each one's directory up read all of them every time and kept a core busy. The sync
+thread is poked after a scan only if the scan changed something.
+
 **Applications** (`apps.py`; Apps tab, `-`; `reifs app add|list|remove|token`). A registration is a
 name, a mode and a node; it returns a *token* (kept only as a hash) that the application sends as
 `Authorization: Bearer reifsapp_...`. The token reaches the `/api/app/...` endpoints and nothing else
