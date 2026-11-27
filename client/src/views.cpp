@@ -1871,7 +1871,7 @@ class WantedView : public View {
   std::string title() const override { return "Wanted"; }
   Component component() override { return root_; }
   std::string help() const override {
-    return "Space: select  a/x: approve/reject selected  A/X: approve/reject all  r: refresh";
+    return "p: plan backups now  Space: select  a/x: approve/reject selected  A/X: approve/reject all  r: refresh";
   }
 
   void refresh() override {
@@ -1964,6 +1964,12 @@ class WantedView : public View {
   }
 
   bool on_event(const Event& e) {
+    if (key(e, "p")) {   // plan backups now (planning does not run by itself unless configured to)
+      ctx_.send("/api/replication/plan", json::object(), [this](json) {
+        ctx_.notify("planning backups: proposals appear here when it is done");
+      });
+      return true;
+    }
     if (key(e, " ")) {
       if (selected_ >= 0 && selected_ < static_cast<int>(items_.size())) {
         std::string k = key_of(items_[selected_]);

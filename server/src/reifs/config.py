@@ -125,6 +125,9 @@ class ReplicationSection:
     # most max_examined files are looked at per run (millions of files may be below goal).
     max_proposals: int = 10000
     max_examined: int = 100000
+    # Plan backups by itself (after scans, and every few minutes while the index changes).
+    # Off: planning runs when asked (the Wanted tab, key p; reifs replicate plan).
+    auto_plan: bool = False
 
 
 @dataclass
@@ -326,6 +329,10 @@ tag_copies = {tbl(self.replication.tag_copies)}
 # and at most max_examined files are looked at per run.
 max_proposals = {self.replication.max_proposals}
 max_examined = {self.replication.max_examined}
+# Plan backups by itself, after scans and every few minutes while the index changes? Planning
+# reads the whole index, which is a lot of work on a big one. false: it runs only when you ask
+# (the Wanted tab, key p).
+auto_plan = {b(self.replication.auto_plan)}
 
 [ssh]
 # Let paired servers pull from this machine over SSH instead of the rsync

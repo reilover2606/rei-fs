@@ -1183,7 +1183,7 @@ class Api:
                 "tag_copies": self.cfg.replication.tag_copies}
 
     def replication_plan(self, conn, q, body, **_):
-        self._need_worker().request_plan()
+        self._need_worker().request_plan(manual=True)
         return {"ok": True, "queued": True}
 
     # --- deletion marks ------------------------------------------------------------
